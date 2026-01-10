@@ -18,9 +18,9 @@ The K16 is a homebrew CPU designed around ROM-based lookup tables for both ALU o
 ### Hybrid ROM-Based ALU
 
 The ALU uses 4× SST39SF040 flash ROMs (512KB each) split into nibble-wide slices. Each ROM receives:
-- 4-bit ALU-A input (data bus)
-- 4-bit ALU-B input (registers or PC)
-- 7-bit instruction opcode
+- 4-bit ALU-A input (D0-D3, T16, T8-5, $0000, $0002, $FFFE, $FFFF)
+- 4-bit ALU-B input (XY[Mem], X0-X3, Y0-Y3, PCHi, PCLo, T8-5)
+- 7-bit instruction opcode (Opcode + Mode)
 - 4-bit microcode step counter
 
 ROM outputs feed into 4× 74x283 TTL adders for carry propagation. This hybrid approach gives the speed benefits of hardware addition while allowing arbitrary ALU functions through ROM programming—essentially a 4-bit ALU can perform any 4-input/4-output function by simply reprogramming the lookup table.
