@@ -126,7 +126,7 @@ POP D, XY3          ; Pop all data registers
 ## Design Philosophy
 
 The K16 prioritizes:
-1. **Minimal chip count** (~40 TTL + 6 ROMs) without sacrificing capability
+1. **Minimal chip count** (~60 TTL + 6 ROMs) without sacrificing capability
 2. **Flexibility** via ROM-based microcode—personality changes without rewiring
 3. **Modern amenities** like 24-bit addressing and priority interrupts
 4. **Practical performance** targeting the 68000 class
