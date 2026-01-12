@@ -1,0 +1,281 @@
+;==============================================================================
+; K16 Dual Timer Interrupt Test with Vector Table Dispatch
+; 
+; CPU: 10KHz
+; Timer 1: 60Hz on IRQ7 (highest priority) - seconds counter
+; Timer 2: 10Hz on IRQ6 (lower priority) - tick counter
+;
+; Uses JMPT for efficient interrupt dispatch via vector table
+;
+; Displays:
+;   T:0000 (seconds, updates every second)
+;   t:0000 (ticks, updates 10x per second)
+;==============================================================================
+
+        .ORG    $0000
+        
+        .EQU    STACK, $220000
+        .EQU    TERMINAL, $E00000
+        .EQU    BACKSPACE, $08
+
+START:
+        ; Setup stack
+        LOADI   X3, #<STACK
+        LOADI   Y3, #>STACK
+
+        ; Setup terminal
+        LOADI   X0, #<TERMINAL
+        LOADI   Y0, #>TERMINAL
+
+        ; Setup interrupt vector (common ISR entry point)
+        LOADI   D0, #>ISR               ; page
+        STORED  D0, [XY3+#0]
+        LOADI   D0, #<ISR               ; address
+        STORED  D0, [XY3+#2]
+
+        ; Initialize counters
+        LOADI   D1, #$0000              ; interrupt counter for 60Hz (60 = 1 sec)
+        LOADI   D2, #$0000              ; seconds counter (16-bit)
+        LOADI   D3, #$0000              ; tick counter (16-bit, 10Hz)
+
+        ; Print startup message "T:0000 t:0000"
+        LOADI   D0, #$54                ; 'T'
+        STOREB  D0, [XY0]
+        LOADI   D0, #$3A                ; ':'
+        STOREB  D0, [XY0]
+        LOADI   D0, #$30                ; '0'
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        LOADI   D0, #$20                ; ' '
+        STOREB  D0, [XY0]
+        LOADI   D0, #$74                ; 't'
+        STOREB  D0, [XY0]
+        LOADI   D0, #$3A                ; ':'
+        STOREB  D0, [XY0]
+        LOADI   D0, #$30                ; '0'
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+
+        ; Enable interrupts
+        EINT
+
+        ; Main loop - just spin
+MAIN:
+        BRA     MAIN
+
+;==============================================================================
+; Interrupt Service Routine - Common Entry Point
+; Uses JMPT to dispatch to appropriate handler based on interrupt level
+;==============================================================================
+        .ORG    $2000
+
+ISR:
+        ; Save registers
+        PUSH    D0, XY3
+
+        ; Get interrupt level from saved SR on stack
+        ; After PUSH D0, SR is at [X3+2]
+        LOADD   D0, [XY3+#2]
+        AND     D0, #$0070              ; mask bits 6:4 -> $00,$10,$20...$70
+        SHR     D0                      ; -> $00,$08,$10,$18,$20,$28,$30,$38
+        SHR     D0                      ; -> $00,$04,$08,$0C,$10,$14,$18,$1C
+        SHR     D0                      ; -> $00,$02,$04,$06,$08,$0A,$0C,$0E
+        ; D0 is now word offset (0,2,4,6,8,10,12,14) - no SHL needed!
+
+        ; Setup vector table pointer
+        LOADI   X1, #<VECTOR_TABLE
+        LOADI   Y1, #>VECTOR_TABLE
+
+        ; Jump to handler via table
+        JMPT    XY1, D0
+
+;------------------------------------------------------------------------------
+; Interrupt Vector Table
+; Index 0 = IRQ7 (highest), Index 7 = IRQ0 (lowest)
+;------------------------------------------------------------------------------
+VECTOR_TABLE:
+        .WORD   HANDLE_IRQ7             ; level 0 -> IRQ7 (60Hz timer)
+        .WORD   HANDLE_IRQ6             ; level 1 -> IRQ6 (10Hz timer)
+        .WORD   HANDLE_UNUSED           ; level 2 -> IRQ5
+        .WORD   HANDLE_UNUSED           ; level 3 -> IRQ4
+        .WORD   HANDLE_UNUSED           ; level 4 -> IRQ3
+        .WORD   HANDLE_UNUSED           ; level 5 -> IRQ2
+        .WORD   HANDLE_UNUSED           ; level 6 -> IRQ1
+        .WORD   HANDLE_UNUSED           ; level 7 -> IRQ0
+
+;------------------------------------------------------------------------------
+; IRQ7 Handler (60Hz) - Seconds counter
+;------------------------------------------------------------------------------
+HANDLE_IRQ7:
+        ; Increment interrupt counter
+        ADD     D1, #1
+
+        ; Check if 60 interrupts (1 second)
+        CMP     D1, #60
+        BNE     ISR_DONE
+
+        ; Reset interrupt counter
+        LOADI   D1, #$0000
+
+        ; Increment seconds counter
+        ADD     D2, #1
+
+        ; Position cursor: backspace 11 chars to overwrite T:xxxx
+        LOADI   D0, #BACKSPACE
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+
+        ; Display D2 as 4 hex digits
+        PUSH    D1, XY3
+        LOADI   D0, #$0000
+        ADD     D0, D2
+        CALL    PRINT_HEX4
+        POP     D1, XY3
+
+        ; Print " t:" then tick value
+        LOADI   D0, #$20                ; ' '
+        STOREB  D0, [XY0]
+        LOADI   D0, #$74                ; 't'
+        STOREB  D0, [XY0]
+        LOADI   D0, #$3A                ; ':'
+        STOREB  D0, [XY0]
+
+        ; Display D3 (tick counter)
+        PUSH    D1, XY3
+        LOADI   D0, #$0000
+        ADD     D0, D3
+        CALL    PRINT_HEX4
+        POP     D1, XY3
+
+        BRA     ISR_DONE
+
+;------------------------------------------------------------------------------
+; IRQ6 Handler (10Hz) - Tick counter
+;------------------------------------------------------------------------------
+HANDLE_IRQ6:
+        ; Increment tick counter
+        ADD     D3, #1
+
+        ; Backspace 4 to overwrite tick display
+        LOADI   D0, #BACKSPACE
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+        STOREB  D0, [XY0]
+
+        ; Display D3 as 4 hex digits
+        PUSH    D1, XY3
+        LOADI   D0, #$0000
+        ADD     D0, D3
+        CALL    PRINT_HEX4
+        POP     D1, XY3
+
+        BRA     ISR_DONE
+
+;------------------------------------------------------------------------------
+; Unused IRQ Handler - just return
+;------------------------------------------------------------------------------
+HANDLE_UNUSED:
+        BRA     ISR_DONE
+
+;------------------------------------------------------------------------------
+; Common ISR exit
+;------------------------------------------------------------------------------
+ISR_DONE:
+        POP     D0, XY3
+        RTI
+
+;==============================================================================
+; PRINT_HEX4 - Print D0 as 4 hex digits
+; Destroys D0, D1
+;==============================================================================
+PRINT_HEX4:
+        PUSH    D2, XY3
+        LOADI   D1, #$0000
+        ADD     D1, D0                  ; save original in D1
+
+        ; Digit 3 (bits 15:12)
+        LOADI   D0, #$0000
+        ADD     D0, D1
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        AND     D0, #$000F
+        CMP     D0, #10
+        BLT     PH_D3
+        ADD     D0, #7
+PH_D3:
+        ADD     D0, #$30
+        STOREB  D0, [XY0]
+
+        ; Digit 2 (bits 11:8)
+        LOADI   D0, #$0000
+        ADD     D0, D1
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        AND     D0, #$000F
+        CMP     D0, #10
+        BLT     PH_D2
+        ADD     D0, #7
+PH_D2:
+        ADD     D0, #$30
+        STOREB  D0, [XY0]
+
+        ; Digit 1 (bits 7:4)
+        LOADI   D0, #$0000
+        ADD     D0, D1
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        SHR     D0
+        AND     D0, #$000F
+        CMP     D0, #10
+        BLT     PH_D1
+        ADD     D0, #7
+PH_D1:
+        ADD     D0, #$30
+        STOREB  D0, [XY0]
+
+        ; Digit 0 (bits 3:0)
+        LOADI   D0, #$0000
+        ADD     D0, D1
+        AND     D0, #$000F
+        CMP     D0, #10
+        BLT     PH_D0
+        ADD     D0, #7
+PH_D0:
+        ADD     D0, #$30
+        STOREB  D0, [XY0]
+
+        POP     D2, XY3
+        RET
+
+        
