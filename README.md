@@ -94,7 +94,7 @@ POP D, XY3          ; Pop all data registers
 | Shift/Rotate | SHL, SHR, ASR, ROL, ROR, SWAPB, HIGH, LOW, SHL4, SHR4, ASR4, ASR8, MULB, RECIP, LOOKUP |
 | Address | LEA (24-bit effective address calculation) |
 | Compare | CMP |
-| Conditional Set | SEQ, SNE, SCS, SCC, SMI, SPL, SAL (branchless conditionals) |
+| Conditional Set | SEQ, SNE, SCS/SHS, SCC/SLO, SLT, SGT, SGE, SLE (branchless conditionals) |
 | Branch | BEQ, BNE, BCS/BHS, BCC/BLO, BLT, BGT, BGE, BLE, BRA |
 | Jump | JMP, JMP24, JMP16, JMPT, JMPXY |
 | Subroutine | CALL, CALL24, CALL16, CALLR, RET |
