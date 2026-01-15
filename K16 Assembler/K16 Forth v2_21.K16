@@ -1,0 +1,4442 @@
+; ============================================================================
+; K16 Forth v2.21 - Timer interrupt support (IRQ7)
+; ============================================================================
+; ISA features used:
+;   - MOVE PC, D0: Indirect jump for fast NEXT
+;   - LOADP/STOREP Dn, Y3, [#imm16]: Zero page variable access via Y3
+;   - STOREXY XYn, [XYm]: 24-bit pointer store
+;   - SWAP Dn, Xm: Cross-type register exchange
+;   - LOADXY/JMPXY: 24-bit pointer operations
+;
+; Register conventions:
+;   XY0 - Scratch / CFA holder after NEXT
+;   XY1 - IP (Instruction Pointer) - 24-bit
+;   XY2 - Data stack pointer - 24-bit  
+;   XY3 - Return stack pointer - 24-bit (Y3=$20 for zero page access)
+;
+; Zero Page variables ($0100-$017F) accessed via LOADP/STOREP with Y3
+; Thread cell format (24-bit, 4 bytes): [Y word][X word]
+; ============================================================================
+
+.ORG $0000
+
+                BRA         MAIN
+
+; ============================================================================
+; CONFIGURATION  
+; ============================================================================
+
+.EQU TERMINAL,      $E00000
+.EQU KEYBOARD,      $C00000
+.EQU RAM_PAGE,      $20
+.EQU TIB_OFFSET,    $0800
+.EQU WORD_BUF_OFF,  $0880
+.EQU TRUE,          $FFFF
+.EQU FALSE,         $0000
+
+; Stack at top of page $20 (64K segment)
+; Y2=Y3=$20 for both (enables zero page access via Y3)
+; Data stack: X2=$FFFE, grows down (4K space)
+; Return stack: X3=$EFFE, grows down (4K space)
+.EQU DSTACK_TOP,    $20FFFE         ; Data stack top
+.EQU RSTACK_TOP,    $20EFFE         ; Return stack top
+
+; ============================================================================
+; ZERO PAGE VARIABLES (accessed via LOADP/STOREP with Y3)
+; Y3 = $20 (RAM page), so LOADP D0, Y3, [#$0100] accesses $200100
+; ============================================================================
+
+.EQU ZP_LATEST,     $0100           ; 24-bit: Y@$0100, X@$0102
+.EQU ZP_HERE,       $0104           ; 24-bit: Y@$0104, X@$0106
+.EQU ZP_STATE,      $0108           ; Compile state (0=interp, 1=compile)
+.EQU ZP_TOIN,       $010A           ; >IN parse position
+.EQU ZP_NUMTIB,     $010C           ; #TIB character count
+.EQU ZP_BASE,       $010E           ; Number base
+.EQU ZP_SAVED_LATEST, $0110         ; 24-bit: saved LATEST for error recovery
+.EQU ZP_DUMPPAGE,   $0116           ; Current page for DUMP etc.
+.EQU ZP_EXEC_RET,   $0118           ; exec_prim return address
+.EQU ZP_TICKS,      $011A           ; System tick counter (IRQ7, 60Hz)
+.EQU ZP_CALL_BUF,   $0120           ; Call buffer (8 bytes: $0120-$0127)
+; $0128-$017F available for future use
+
+; Interrupt vector at $200000-$200003 (page + address)
+.EQU INT_VECTOR,    $0000           ; Y3:$0000 = $200000
+
+; ============================================================================
+; STRING CONSTANTS
+; ============================================================================
+
+BANNER:         .TEXT       "K/OS - Forth v2.21\nInterrupts Enabled\n\0"
+STR_PROMPT:     .TEXT       "> \0"
+STR_OK:         .TEXT       " ok\n\0"
+STR_ERROR:      .TEXT       " ?\n\0"
+
+; ============================================================================
+; INNER INTERPRETER - Optimized with MOVE PC, D0
+; ============================================================================
+; XY0 = CFA after loading from thread (available to DOCOL/DOVAR/DOCON)
+; D0 = code address for jump
+; ============================================================================
+
+NEXT:
+                ; Indirect Threaded Code (no INTERP_MODE check - primitives preserve IP)
+                ; Load CFA from thread - XY0 holds CFA for DOCOL/DOVAR/DOCON
+                LOADXY      XY0, [XY1]          ; XY0 = CFA (24-bit)
+                INC         XY1, #4             ; IP += 4 (24-bit with page crossing!)
+                
+                ; Dereference CFA and jump via MOVE PC
+                LOADD       D0, [XY0]           ; D0 = [CFA] = code address
+                MOVE        PC, D0              ; Jump! (XY0 still has CFA)
+
+; ============================================================================
+; DOCOL / EXIT - Colon word support  
+; ============================================================================
+; After NEXT: XY0 = CFA, body starts at CFA+2
+
+DOCOL:
+                ; Push IP to return stack
+                PUSH        XY1, XY3
+                
+                ; IP = CFA + 2 (XY0 already has CFA from NEXT)
+                LEA         XY1, XY0+#2         ; IP = CFA + 2 (24-bit)
+                BRA         NEXT
+
+EXIT:
+                POP         XY1, XY3            ; Restore IP
+                BRA         NEXT
+
+; ============================================================================
+; STACK PRIMITIVES
+; ============================================================================
+
+DUP:            ; ( x -- x x )
+                LOADD       D0, [XY2]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+DROP:           ; ( x -- )
+                ADD         X2, #2
+                BRA         NEXT
+
+SWAP_PRIM:      ; ( a b -- b a )
+                LOADD       D0, [XY2]           ; b (TOS)
+                LOADD       D1, [XY2 + #2]      ; a (under TOS)
+                STORED      D1, [XY2]           ; store a at TOS
+                STORED      D0, [XY2 + #2]      ; store b under
+                BRA         NEXT
+
+OVER:           ; ( a b -- a b a )
+                LOADD       D0, [XY2 + #2]      ; a (under TOS)
+                PUSH        D0, XY2
+                BRA         NEXT
+
+ROT:            ; ( a b c -- b c a )
+                LOADD       D0, [XY2]           ; c
+                LOADD       D1, [XY2 + #2]      ; b
+                LOADD       D2, [XY2 + #4]      ; a
+                STORED      D1, [XY2 + #4]      ; b -> bottom
+                STORED      D0, [XY2 + #2]      ; c -> middle
+                STORED      D2, [XY2]           ; a -> top
+                BRA         NEXT
+
+MINUSROT:       ; -ROT ( a b c -- c a b )
+                LOADD       D0, [XY2]           ; c
+                LOADD       D1, [XY2 + #2]      ; b
+                LOADD       D2, [XY2 + #4]      ; a
+                STORED      D0, [XY2 + #4]      ; c -> bottom
+                STORED      D2, [XY2 + #2]      ; a -> middle
+                STORED      D1, [XY2]           ; b -> top
+                BRA         NEXT
+
+NIP:            ; ( a b -- b )
+                LOADD       D0, [XY2]           ; b (TOS)
+                STORED      D0, [XY2 + #2]      ; overwrite a with b
+                ADD         X2, #2              ; drop one slot
+                BRA         NEXT
+
+TUCK:           ; ( a b -- b a b )
+                LOADD       D0, [XY2]           ; b
+                LOADD       D1, [XY2 + #2]      ; a
+                STORED      D0, [XY2 + #2]      ; b overwrites a's slot
+                STORED      D1, [XY2]           ; a at TOS (will become middle)
+                PUSH        D0, XY2             ; b at new TOS
+                BRA         NEXT
+
+QDUP:           ; ?DUP ( x -- x x | 0 )
+                LOADD       D0, [XY2]
+                CMP         D0, #0
+                BEQ         .qdup_done
+                PUSH        D0, XY2
+.qdup_done:     BRA         NEXT
+
+TWODUP:         ; 2DUP ( a b -- a b a b )
+                LOADD       D0, [XY2]           ; b
+                LOADD       D1, [XY2 + #2]      ; a
+                PUSH        D1, XY2
+                PUSH        D0, XY2
+                BRA         NEXT
+
+TWODROP:        ; 2DROP ( a b -- )
+                ADD         X2, #4
+                BRA         NEXT
+
+TWOSWAP:        ; 2SWAP ( a b c d -- c d a b )
+                LOADD       D0, [XY2]           ; d
+                LOADD       D1, [XY2 + #2]      ; c
+                LOADD       D2, [XY2 + #4]      ; b
+                LOADD       D3, [XY2 + #6]      ; a
+                STORED      D2, [XY2]           ; b -> TOS
+                STORED      D3, [XY2 + #2]      ; a
+                STORED      D0, [XY2 + #4]      ; d
+                STORED      D1, [XY2 + #6]      ; c -> bottom
+                BRA         NEXT
+
+TWOOVER:        ; 2OVER ( a b c d -- a b c d a b )
+                LOADD       D0, [XY2 + #6]      ; a
+                LOADD       D1, [XY2 + #4]      ; b
+                PUSH        D0, XY2
+                PUSH        D1, XY2
+                BRA         NEXT
+
+PICK:           ; ( xu...x0 u -- xu...x0 xu )
+                POP         D0, XY2             ; u
+                SHL         D0                  ; u * 2
+                ADD         D0, X2              ; addr = SP + offset
+                SWAP        D0, X0              ; X0 = addr (using SWAP instruction!)
+                LOADI       Y0, #>DSTACK_TOP
+                LOADD       D0, [XY0]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+DEPTH:          ; ( -- n )
+                LOADI       D0, #<DSTACK_TOP
+                SUB         D0, X2              ; Two-operand: D0 = D0 - X2
+                SHR         D0
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; --- Return Stack ---
+
+TOR:            ; >R ( x -- ) R:( -- x )
+                POP         D0, XY2
+                PUSH        D0, XY3
+                BRA         NEXT
+
+RFROM:          ; R> ( -- x ) R:( x -- )
+                POP         D0, XY3
+                PUSH        D0, XY2
+                BRA         NEXT
+
+RFETCH:         ; R@ ( -- x )
+                LOADD       D0, [XY3]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ============================================================================
+; ARITHMETIC - All two-operand ALU
+; ============================================================================
+
+PLUS:           ; + ( n1 n2 -- sum )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                ADD         D1, D0              ; D1 = D1 + D0
+                STORED      D1, [XY2]
+                BRA         NEXT
+
+MINUS:          ; - ( n1 n2 -- diff )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                SUB         D1, D0              ; D1 = D1 - D0
+                STORED      D1, [XY2]
+                BRA         NEXT
+
+STAR:           ; * ( n1 n2 -- product )
+                ; Optimized 16x16->16 multiply using MULB lookup
+                POP         D1, XY2             ; n2
+                POP         D0, XY2             ; n1
+                CALL        mul_16x16
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ============================================================================
+; mul_16x16 - 16x16->16 bit multiply using MULB
+; ============================================================================
+; Input:  D0 = n1, D1 = n2
+; Output: D0 = product (low 16 bits)
+; Trashes: D1, D2, D3
+;
+; Method: result = (n1L*n2L) + ((n1H*n2L + n1L*n2H) << 8)
+; ============================================================================
+
+mul_16x16:
+                ; Extract bytes
+                MOVE        D2, D0
+                HIGH        D2                  ; D2 = n1H
+                AND         D0, #$FF            ; D0 = n1L
+                MOVE        D3, D1
+                HIGH        D3                  ; D3 = n2H
+                AND         D1, #$FF            ; D1 = n2L
+                
+                ; Save n1L, n2L, n1H (need each twice except n2H once)
+                PUSH        D0, XY3             ; save n1L
+                PUSH        D1, XY3             ; save n2L
+                PUSH        D2, XY3             ; save n1H
+                ; Stack: [0]=n1H, [2]=n2L, [4]=n1L
+                ; D0=n1L, D1=n2L, D2=n1H, D3=n2H
+                
+                ; PP0 = n1L * n2L
+                SHL4        D1
+                SHL4        D1                  ; D1 = n2L << 8
+                OR          D0, D1              ; D0 = (n2L<<8) | n1L
+                MULB        D0                  ; D0 = PP0
+                PUSH        D0, XY3             ; save PP0
+                ; Stack: [0]=PP0, [2]=n1H, [4]=n2L, [6]=n1L
+                
+                ; PP1 = n1H * n2L
+                LOADD       D0, [XY3 + #2]      ; n1H
+                LOADD       D1, [XY3 + #4]      ; n2L
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP1 = n1H * n2L
+                MOVE        D2, D0              ; D2 = PP1
+                
+                ; PP2 = n1L * n2H (D3 still has n2H)
+                LOADD       D0, [XY3 + #6]      ; n1L
+                SHL4        D3
+                SHL4        D3                  ; D3 = n2H << 8
+                OR          D0, D3              ; D0 = (n2H<<8) | n1L
+                MULB        D0                  ; D0 = PP2 = n1L * n2H
+                
+                ; middle = PP1 + PP2
+                ADD         D0, D2              ; D0 = middle (PP1 + PP2)
+                ; Shift middle left 8 bits (only low byte matters for 16-bit result)
+                SHL4        D0
+                SHL4        D0                  ; D0 = middle << 8
+                
+                ; result = PP0 + (middle << 8)
+                POP         D1, XY3             ; D1 = PP0
+                ADD         D0, D1              ; D0 = final result
+                
+                ; Cleanup stack (n1H, n2L, n1L = 6 bytes)
+                ADD         X3, #6
+                RET
+
+
+; ============================================================================
+; mul_16x16_32 - 16x16->32 bit multiply using MULB
+; ============================================================================
+; Input:  D0 = n1, D1 = n2
+; Output: D0 = lo16, D1 = hi16
+; Trashes: D2, D3
+;
+; For div10, we need full 32-bit result to get correct quotient.
+; Uses same partial product method but keeps all 32 bits.
+; ============================================================================
+
+mul_16x16_32:
+                ; Extract bytes
+                MOVE        D2, D0
+                HIGH        D2                  ; D2 = n1H
+                AND         D0, #$FF            ; D0 = n1L
+                MOVE        D3, D1
+                HIGH        D3                  ; D3 = n2H
+                AND         D1, #$FF            ; D1 = n2L
+                
+                ; Push all 4 operands with fixed layout
+                PUSH        D3, XY3             ; [SP+0] = n2H
+                PUSH        D2, XY3             ; [SP+0] = n1H, [SP+2] = n2H
+                PUSH        D1, XY3             ; [SP+0] = n2L, [SP+2] = n1H, [SP+4] = n2H
+                PUSH        D0, XY3             ; [SP+0] = n1L, [SP+2] = n2L, [SP+4] = n1H, [SP+6] = n2H
+                
+                ; PP0 = n1L * n2L (D0=n1L, D1=n2L still valid)
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP0
+                PUSH        D0, XY3             ; [SP+0] = PP0
+                ; Stack: PP0=0, n1L=2, n2L=4, n1H=6, n2H=8
+                
+                ; PP1 = n1H * n2L
+                LOADD       D0, [XY3 + #6]      ; n1H
+                LOADD       D1, [XY3 + #4]      ; n2L
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP1
+                MOVE        D2, D0              ; D2 = PP1
+                
+                ; PP2 = n1L * n2H
+                LOADD       D0, [XY3 + #2]      ; n1L
+                LOADD       D1, [XY3 + #8]      ; n2H
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP2
+                
+                ; middle = PP1 + PP2
+                ADD         D0, D2              ; D0 = middle
+                SCS         D1                  ; D1 = carry (0 or $FFFF)
+                AND         D1, #1              ; D1 = middle_carry
+                MOVE        D2, D0              ; D2 = middle
+                
+                ; PP3 = n1H * n2H
+                LOADD       D0, [XY3 + #6]      ; n1H
+                LOADD       D3, [XY3 + #8]      ; n2H
+                SHL4        D3
+                SHL4        D3
+                OR          D0, D3
+                MULB        D0                  ; D0 = PP3
+                
+                ; Now combine: D0=PP3, D1=carry, D2=middle
+                ; Split middle
+                MOVE        D3, D2
+                AND         D3, #$FF            ; D3 = middle_lo
+                HIGH        D2                  ; D2 = middle_hi
+                
+                ; hi16 = PP3 + middle_hi + (carry << 8)
+                ADD         D0, D2              ; D0 = PP3 + middle_hi
+                SHL4        D1
+                SHL4        D1                  ; D1 = carry << 8
+                ADD         D0, D1              ; D0 = partial hi16
+                MOVE        D1, D0              ; D1 = hi16 (save)
+                
+                ; lo16 = PP0 + (middle_lo << 8)
+                SHL4        D3
+                SHL4        D3                  ; D3 = middle_lo << 8
+                POP         D0, XY3             ; D0 = PP0
+                ADD         D0, D3              ; D0 = lo16
+                SCS         D2                  ; D2 = lo_carry
+                AND         D2, #1
+                ADD         D1, D2              ; hi16 += lo_carry
+                
+                ; D0 = lo16, D1 = hi16
+                ; Cleanup 4 operands (8 bytes)
+                ADD         X3, #8
+                RET
+
+; ============================================================================
+; div10 - Divide by 10 using reciprocal multiply
+; ============================================================================
+; Input:  D0 = dividend (0-65535)
+; Output: D0 = quotient, D1 = remainder
+; Trashes: D2, D3
+;
+; Method: q = hi16(n * 52429) >> 3
+;         r = n - q * 10
+; ============================================================================
+
+div10:
+                PUSH        D0, XY3             ; save n
+                LOADI       D1, #52429          ; magic multiplier $CCCD
+                CALL        mul_16x16_32        ; D0=lo16, D1=hi16
+                
+                ; quotient = hi16 >> 3
+                MOVE        D0, D1              ; D0 = hi16
+                SHR         D0
+                SHR         D0
+                SHR         D0                  ; D0 = quotient
+                
+                ; remainder = n - quotient * 10
+                MOVE        D2, D0              ; D2 = quotient (save)
+                ; q*10 = q*8 + q*2 = (q<<3) + (q<<1)
+                MOVE        D1, D0
+                SHL         D1                  ; D1 = q*2
+                SHL         D0
+                SHL         D0
+                SHL         D0                  ; D0 = q*8
+                ADD         D0, D1              ; D0 = q*10
+                
+                POP         D1, XY3             ; D1 = original n
+                SUB         D1, D0              ; D1 = remainder
+                MOVE        D0, D2              ; D0 = quotient
+                RET
+
+
+ONEPLUS:        ; 1+ ( n -- n+1 )
+                LOADD       D0, [XY2]
+                ADD         D0, #1
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+ONEMINUS:       ; 1- ( n -- n-1 )
+                LOADD       D0, [XY2]
+                SUB         D0, #1
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+TWOSTAR:        ; 2* ( n -- n*2 )
+                LOADD       D0, [XY2]
+                SHL         D0
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+TWOSLASH:       ; 2/ ( n -- n/2 )
+                LOADD       D0, [XY2]
+                ASR         D0
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+NEGATE:         ; NEGATE ( n -- -n )
+                LOADD       D0, [XY2]
+                NOT         D0                  ; D0 = ~D0
+                ADD         D0, #1
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+ABSS:           ; ABS ( n -- |n| )
+                LOADD       D0, [XY2]
+                CMP         D0, #$8000
+                BCC         .abs_done
+                NOT         D0
+                ADD         D0, #1
+                STORED      D0, [XY2]
+.abs_done:      BRA         NEXT
+
+MIN:            ; MIN ( n1 n2 -- min )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                CMP         D1, D0
+                BGE         .min_use_d0
+                BRA         NEXT
+.min_use_d0:    STORED      D0, [XY2]
+                BRA         NEXT
+
+MAX:            ; MAX ( n1 n2 -- max )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                CMP         D1, D0
+                BGE         NEXT
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+; ============================================================================
+; LOGIC - Two-operand
+; ============================================================================
+
+ANDD:           ; AND ( n1 n2 -- n1&n2 )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                AND         D1, D0
+                STORED      D1, [XY2]
+                BRA         NEXT
+
+ORR:            ; OR ( n1 n2 -- n1|n2 )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                OR          D1, D0
+                STORED      D1, [XY2]
+                BRA         NEXT
+
+XORR:           ; XOR ( n1 n2 -- n1^n2 )
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                XOR         D1, D0
+                STORED      D1, [XY2]
+                BRA         NEXT
+
+INVERT:         ; INVERT ( n -- ~n )
+                LOADD       D0, [XY2]
+                NOT         D0
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+; ============================================================================
+; COMPARISON
+; ============================================================================
+
+ZEQU:           ; 0= ( n -- flag ) - branchless with SEQ
+                LOADD       D0, [XY2]
+                CMP         D0, #0
+                SEQ         D0                  ; D0 = $FFFF if zero, else $0000
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+ZLESS:          ; 0< ( n -- flag ) - branchless with SLT
+                LOADD       D0, [XY2]
+                CMP         D0, #0
+                SLT         D0                  ; D0 = $FFFF if negative, else $0000
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+EQU:            ; = ( n1 n2 -- flag ) - branchless with SEQ
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                CMP         D1, D0
+                SEQ         D0                  ; D0 = $FFFF if equal, else $0000
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+LESS:           ; < ( n1 n2 -- flag ) signed - branchless with SLT
+                POP         D0, XY2             ; n2
+                LOADD       D1, [XY2]           ; n1
+                CMP         D1, D0
+                SLT         D0                  ; D0 = $FFFF if n1 < n2
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+GREATER:        ; > ( n1 n2 -- flag ) signed - branchless with SGT
+                POP         D0, XY2             ; n2
+                LOADD       D1, [XY2]           ; n1
+                CMP         D1, D0
+                SGT         D0                  ; D0 = $FFFF if n1 > n2
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+ULESS:          ; U< ( u1 u2 -- flag ) unsigned - branchless with SCC
+                POP         D0, XY2             ; u2
+                LOADD       D1, [XY2]           ; u1
+                CMP         D1, D0              ; u1 - u2
+                SCC         D0                  ; D0 = $FFFF if carry clear (u1 < u2)
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+NOTEQ:          ; <> ( n1 n2 -- flag ) - branchless with SNE
+                POP         D0, XY2
+                LOADD       D1, [XY2]
+                CMP         D1, D0
+                SNE         D0                  ; D0 = $FFFF if not equal, else $0000
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+LESSEQ:         ; <= ( n1 n2 -- flag ) signed - branchless with SLE
+                POP         D0, XY2             ; n2
+                LOADD       D1, [XY2]           ; n1
+                CMP         D1, D0
+                SLE         D0                  ; D0 = $FFFF if n1 <= n2
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+GREATEQ:        ; >= ( n1 n2 -- flag ) signed - branchless with SGE
+                POP         D0, XY2             ; n2
+                LOADD       D1, [XY2]           ; n1
+                CMP         D1, D0
+                SGE         D0                  ; D0 = $FFFF if n1 >= n2
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+ZGREAT:         ; 0> ( n -- flag ) - branchless with SGT
+                LOADD       D0, [XY2]
+                CMP         D0, #0
+                SGT         D0                  ; D0 = $FFFF if > 0
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+UGREAT:         ; U> ( u1 u2 -- flag ) unsigned - branchless
+                POP         D0, XY2             ; u2
+                LOADD       D1, [XY2]           ; u1
+                CMP         D0, D1              ; Compare u2 with u1 (swapped!)
+                SCC         D0                  ; D0 = $FFFF if u2 < u1 (i.e., u1 > u2)
+                STORED      D0, [XY2]
+                BRA         NEXT
+
+; ============================================================================
+; MEMORY - Using SWAP for register exchange
+; ============================================================================
+
+FETCH:          ; @ ( addr -- n )
+                POP         D0, XY2
+                SWAP        D0, X0              ; Exchange D0 <-> X0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+STORE:          ; ! ( n addr -- )
+                POP         D0, XY2             ; addr
+                POP         D1, XY2             ; n
+                SWAP        D0, X0
+                LOADI       Y0, #RAM_PAGE
+                STORED      D1, [XY0]
+                BRA         NEXT
+
+CFETCH:         ; C@ ( addr -- c )
+                POP         D0, XY2
+                SWAP        D0, X0
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+CSTORE:         ; C! ( c addr -- )
+                POP         D0, XY2
+                POP         D1, XY2
+                SWAP        D0, X0
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D1, [XY0]
+                BRA         NEXT
+
+PLUSSTORE:      ; +! ( n addr -- )
+                POP         D0, XY2             ; addr
+                POP         D1, XY2             ; n
+                SWAP        D0, X0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D2, [XY0]
+                ADD         D2, D1              ; Two-operand!
+                STORED      D2, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; I/O
+; ============================================================================
+
+EMIT:           ; ( c -- )
+                POP         D0, XY2
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+KEY:            ; ( -- c )
+                LOADI       X0, #<KEYBOARD
+                LOADI       Y0, #>KEYBOARD
+.key_wait:      LOADD       D0, [XY0]           ; 16-bit read!
+                CMP         D0, #0
+                BEQ         .key_wait
+                AND         D0, #$FF            ; Mask to get ASCII
+                PUSH        D0, XY2
+                BRA         NEXT
+
+CR:             ; ( -- )
+                LOADI       D0, #$0A
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+SPACE:          ; ( -- )
+                LOADI       D0, #$20
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+SPACES:         ; ( n -- ) print n spaces
+                POP         D1, XY2             ; count
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$20
+.spaces_loop:   CMP         D1, #0
+                BGT         .spaces_cont        ; > 0 -> continue
+                BRA         NEXT                ; <= 0 -> done
+.spaces_cont:   STOREB      D0, [XY0]
+                SUB         D1, #1
+                BRA         .spaces_loop
+
+TYPE:           ; ( addr n -- ) print n chars from addr
+                POP         D1, XY2             ; count
+                POP         D0, XY2             ; addr
+                ; Use D2/D3 for terminal address to avoid clobbering XY1 (IP)
+                LOADI       D2, #<TERMINAL
+                LOADI       D3, #>TERMINAL
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+.type_loop:     CMP         D1, #0
+                BGT         .type_cont          ; > 0 -> continue
+                BRA         NEXT                ; <= 0 -> done
+.type_cont:     LOADB       D0, [XY0]
+                ; Store to terminal via D2/D3
+                SWAP        D2, X0
+                SWAP        D3, Y0
+                STOREB      D0, [XY0]
+                SWAP        D2, X0
+                SWAP        D3, Y0
+                ADD         X0, #1
+                SUB         D1, #1
+                BRA         .type_loop
+
+TICKS_WORD:     ; TICKS ( -- n ) return system tick counter
+                LOADP       D0, Y3, [#ZP_TICKS]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+EINT_WORD:      ; EINT ( -- ) enable interrupts
+                EINT
+                BRA         NEXT
+
+DINT_WORD:      ; DINT ( -- ) disable interrupts
+                DINT
+                BRA         NEXT
+
+DOTS:           ; .S ( -- ) print stack non-destructively
+                ; Calculate depth
+                LOADI       D0, #<DSTACK_TOP
+                SUB         D0, X2              ; D0 = top - current = bytes used
+                SHR         D0                  ; D0 = words on stack
+                
+                ; Print <n>
+                PUSH        D0, XY3             ; save depth
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3C            ; '<'
+                STOREB      D0, [XY0]
+                POP         D0, XY3
+                PUSH        D0, XY3             ; keep depth saved
+                CALL        print_decimal
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3E            ; '>'
+                STOREB      D0, [XY0]
+                LOADI       D0, #$20            ; ' '
+                STOREB      D0, [XY0]
+                
+                ; Print stack items bottom to top
+                POP         D1, XY3             ; depth (count)
+                CMP         D1, #0
+                BEQ         .dots_done
+                
+                ; Start at bottom of stack
+                LOADI       X0, #<DSTACK_TOP
+                LOADI       Y0, #>DSTACK_TOP
+                ; Move to bottom item: top - (depth * 2)
+                MOVE        D0, D1
+                SHL         D0                  ; D0 = depth * 2
+                SUB         X0, D0              ; X0 points to bottom item
+                
+.dots_loop:     CMP         D1, #0
+                BEQ         .dots_done
+                PUSH        D1, XY3             ; save count
+                PUSH        XY0, XY3            ; save pointer
+                
+                LOADD       D0, [XY0]           ; get stack item
+                CALL        print_decimal
+                
+                ; Print space
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$20
+                STOREB      D0, [XY0]
+                
+                POP         XY0, XY3            ; restore pointer
+                ADD         X0, #2              ; next item
+                POP         D1, XY3             ; restore count
+                SUB         D1, #1
+                BRA         .dots_loop
+                
+.dots_done:     BRA         NEXT
+
+CLS:            ; ( -- ) Clear screen
+                LOADI       D0, #$0C
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+HEX:            ; ( -- ) Set base to 16
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #16
+                STOREP      D0, Y3, [#ZP_BASE]
+                BRA         NEXT
+
+DECIMAL:        ; ( -- ) Set base to 10
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #10
+                STOREP      D0, Y3, [#ZP_BASE]
+                BRA         NEXT
+
+; ============================================================================
+; COLON - Start a new definition
+; ============================================================================
+; : name ... ;
+; Creates dictionary header, sets STATE=1
+
+COLON:
+                ; Parse the name
+                CALL        parse_word
+                CMP         D3, #0
+                BEQ         .colon_err          ; no name given
+                
+                ; D2 = word buf addr, D3 = len
+                ; Save for later
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                
+                ; Setup Y0 = RAM page for LOADP/STOREP
+                LOADI       Y0, #RAM_PAGE
+                
+                ; Get current LATEST (24-bit: Y@LATEST, X@LATEST+2)
+                LOADP       D0, Y3, [#ZP_LATEST]       ; D0 = LATEST Y (page)
+                LOADP       D1, Y3, [#ZP_LATEST+2]     ; D1 = LATEST X (offset)
+                
+                ; Save to ZP_SAVED_LATEST (for error recovery)
+                STOREP      D0, Y3, [#ZP_SAVED_LATEST]
+                STOREP      D1, Y3, [#ZP_SAVED_LATEST+2]
+                
+                ; Save old LATEST on stack for building link
+                PUSH        D0, XY3             ; old Y
+                PUSH        D1, XY3             ; old X
+                
+                ; Get HERE (24-bit)
+                LOADP       D0, Y3, [#ZP_HERE]         ; D0 = HERE Y (page)
+                LOADP       D1, Y3, [#ZP_HERE+2]       ; D1 = HERE X (offset)
+                
+                ; Set LATEST = HERE (new word starts here)
+                PUSH        D0, XY3             ; save HERE Y
+                PUSH        D1, XY3             ; save HERE X
+                STOREP      D0, Y3, [#ZP_LATEST]
+                STOREP      D1, Y3, [#ZP_LATEST+2]
+                
+                ; Now build header at HERE
+                ; +0: Link Y (old LATEST Y)
+                ; +2: Link X (old LATEST X)
+                ; +4: Flags+Len
+                ; +6: Name
+                ; +aligned: CFA (points to DOCOL)
+                
+                POP         D1, XY3             ; HERE X
+                POP         D0, XY3             ; HERE Y
+                MOVE        X0, D1
+                MOVE        Y0, D0              ; XY0 = HERE (in RAM)
+                
+                ; Store link using D regs (avoid clobbering XY1/IP)
+                POP         D0, XY3             ; old LATEST X
+                POP         D1, XY3             ; old LATEST Y
+                STORED      D1, [XY0]           ; Store Y (page) first
+                ADD         X0, #2
+                STORED      D0, [XY0]           ; Store X (offset)
+                ADD         X0, #2              ; Skip link (4 bytes total)
+                
+                ; Store flags+len (just len for now, no flags)
+                POP         D3, XY3             ; len
+                POP         D2, XY3             ; word buf addr
+                STORED      D3, [XY0]
+                ADD         X0, #2
+                
+                ; Copy name - use D2 as source ptr, D3 as count (avoid XY1)
+                ; D2 = word buf addr (already have it), D3 = len (already have it)
+                MOVE        D1, D3              ; D1 = count
+                
+.colon_copy:
+                CMP         D1, #0
+                BEQ         .colon_copy_done
+                ; Read byte from source (D2 = src addr in RAM)
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                ADD         D2, #1              ; src++
+                POP         Y0, XY3
+                POP         X0, XY3
+                ; Write byte to dest
+                STOREB      D0, [XY0]
+                ADD         X0, #1              ; dest++
+                SUB         D1, #1              ; count--
+                BRA         .colon_copy
+                
+.colon_copy_done:
+                
+                ; Align to even
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                
+                ; Store CFA (points to DOCOL)
+                LOADI       D0, #DOCOL
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Update HERE using STOREP (X0 = new HERE offset)
+                MOVE        D0, X0              ; Save new X
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D1, #RAM_PAGE       ; Page stays same
+                STOREP      D1, Y3, [#ZP_HERE]
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                ; Set STATE = 1 (compile mode)
+                LOADI       D0, #1
+                STOREP      D0, Y3, [#ZP_STATE]
+                
+                BRA         NEXT
+                
+.colon_err:
+                ; Print error
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3F
+                STOREB      D0, [XY0]
+                LOADI       D0, #$0A
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; SEMICOLON - End a definition (IMMEDIATE)
+; ============================================================================
+
+SEMICOLON:
+                ; Compile EXIT
+                LOADI       D1, #CFA_EXIT
+                LOADI       D3, #0              ; ROM page
+                CALL        compile_cfa
+                
+                ; Set STATE = 0 (interpret mode) using STOREP
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_STATE]
+                
+                BRA         NEXT
+
+; ============================================================================
+; IF / ELSE / THEN - Compile-time conditionals (IMMEDIATE)
+; ============================================================================
+; IF compiles: [CFA_ZBRANCH][offset placeholder]
+; ELSE compiles: [CFA_BRANCH][offset placeholder], patches IF's offset
+; THEN patches the placeholder left by IF or ELSE
+
+IFTHEN:         ; IF ( -- addr ) compile-time
+                ; Compile ZBRANCH CFA
+                LOADI       D1, #CFA_ZBRANCH
+                LOADI       D3, #0              ; ROM page
+                CALL        compile_cfa
+                
+                ; Get HERE (will be address of offset)
+                LOADP       D0, Y3, [#ZP_HERE+2]           ; current HERE offset
+                PUSH        D0, XY2             ; leave on stack for THEN/ELSE
+                
+                ; Compile placeholder offset as 4-byte cell [0][0]
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D1, #0
+                STORED      D1, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D1, [XY0]           ; X = 0
+                
+                ; HERE += 4
+                ADD         D0, #4
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+ELSETHEN:       ; ELSE ( addr1 -- addr2 ) compile-time
+                ; Compile BRANCH CFA (to skip the else clause)
+                LOADI       D1, #CFA_BRANCH
+                LOADI       D3, #0              ; ROM page
+                CALL        compile_cfa
+                
+                ; Get HERE (for new placeholder)
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; current HERE offset
+                
+                ; Compile placeholder offset as 4-byte cell [0][0]
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0
+                STORED      D2, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D2, [XY0]           ; X = 0
+                
+                ; Save placeholder addr, HERE += 4
+                PUSH        D1, XY3             ; save placeholder addr
+                ADD         D1, #4
+                
+                STOREP      D1, Y3, [#ZP_HERE+2]           ; D1 = new HERE
+                
+                ; Now patch IF's offset
+                ; Stack has: IF's placeholder addr
+                ; Offset = (current HERE) - (IF's placeholder_addr + 4)
+                POP         D0, XY2             ; IF's placeholder addr
+                SUB         D1, D0              ; D1 = HERE - placeholder
+                SUB         D1, #4              ; D1 = HERE - placeholder - 4
+                
+                ; Patch IF's placeholder (store in X word at addr+2)
+                MOVE        X0, D0
+                ADD         X0, #2
+                LOADI       Y0, #RAM_PAGE
+                STORED      D1, [XY0]
+                
+                ; Leave ELSE's placeholder addr on stack
+                POP         D0, XY3             ; saved placeholder addr
+                PUSH        D0, XY2
+                
+                BRA         NEXT
+
+THENTHEN:       ; THEN ( addr -- ) compile-time
+                ; Get HERE
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; current HERE = target
+                
+                ; Get placeholder address from stack
+                POP         D0, XY2
+                
+                ; Calculate offset = target - (placeholder_addr + 4)
+                ; Because ZBRANCH/BRANCH add offset after IP passes the cell
+                SUB         D1, D0              ; D1 = HERE - placeholder_addr
+                SUB         D1, #4              ; D1 = HERE - placeholder_addr - 4
+                
+                ; Patch the placeholder (store in X word at addr+2)
+                MOVE        X0, D0
+                ADD         X0, #2
+                LOADI       Y0, #RAM_PAGE
+                STORED      D1, [XY0]
+                
+                BRA         NEXT
+
+; ============================================================================
+; LITERALS AND BRANCHES
+; ============================================================================
+
+LIT:            ; Push 16-bit literal from thread
+                ; Literal is stored as 4-byte cell [Y=0][X=value]
+                ADD         X1, #2              ; Skip Y word, point to X word
+                LOADD       D0, [XY1]           ; Read value
+                ADD         X1, #2              ; Skip X word (total +4)
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; CFA for LIT (used by compile_lit)
+CFA_LIT:        .WORD       LIT
+
+; CFA for EXIT (used by SEMICOLON)
+CFA_EXIT:       .WORD       EXIT
+
+; CFAs for branching (used by IF/ELSE/THEN)
+CFA_BRANCH:     .WORD       BRANCH
+CFA_ZBRANCH:    .WORD       ZBRANCH
+
+BRANCH:         ; Unconditional branch (offset in 4-byte cell [Y][X], use X)
+                ADD         X1, #2              ; Skip Y word
+                LOADD       D0, [XY1]           ; Read X word = offset
+                ADD         X1, #2              ; Skip X word
+                ADD         X1, D0              ; IP += offset
+                BRA         NEXT
+
+ZBRANCH:        ; Branch if zero (offset in 4-byte cell)
+                POP         D0, XY2
+                CMP         D0, #0
+                BNE         .zbr_skip
+                ADD         X1, #2              ; Skip Y word
+                LOADD       D0, [XY1]           ; Read X word = offset
+                ADD         X1, #2              ; Skip X word
+                ADD         X1, D0              ; IP += offset
+                BRA         NEXT
+.zbr_skip:      ADD         X1, #4              ; Skip 4-byte offset cell
+                BRA         NEXT
+
+; ============================================================================
+; DO / LOOP / I - Definite loops
+; ============================================================================
+; Return stack during loop: [...] [limit] [index]  (index on top)
+
+; Runtime DO: ( limit index -- ) (R: -- limit index )
+DO_RT:
+                POP         D0, XY2             ; index
+                POP         D1, XY2             ; limit
+                PUSH        D1, XY3             ; push limit to return stack
+                PUSH        D0, XY3             ; push index to return stack
+                BRA         NEXT
+
+; Runtime LOOP: increment index, branch if index < limit
+LOOP_RT:
+                ; Get index and limit from return stack (don't pop yet)
+                LOADD       D0, [XY3]           ; index
+                LOADD       D1, [XY3 + #2]      ; limit
+                ADD         D0, #1              ; index++
+                STORED      D0, [XY3]           ; store back
+                
+                ; Compare: if index < limit, branch back
+                CMP         D0, D1
+                BGE         .loop_done
+                
+                ; Branch back: read offset and add to IP
+                ADD         X1, #2              ; Skip Y word
+                LOADD       D0, [XY1]           ; Read X word = offset (negative)
+                ADD         X1, #2              ; Skip X word
+                ADD         X1, D0              ; IP += offset (goes backward)
+                BRA         NEXT
+                
+.loop_done:
+                ; Drop limit and index from return stack
+                ADD         X3, #4
+                ; Skip the offset cell
+                ADD         X1, #4
+                BRA         NEXT
+
+; Runtime +LOOP: add increment to index
+PLOOP_RT:
+                POP         D2, XY2             ; increment
+                LOADD       D0, [XY3]           ; index
+                LOADD       D1, [XY3 + #2]      ; limit
+                ADD         D0, D2              ; index += increment
+                STORED      D0, [XY3]           ; store back
+                
+                ; Compare: if index < limit, branch back
+                CMP         D0, D1
+                BGE         .ploop_done
+                
+                ; Branch back
+                ADD         X1, #2
+                LOADD       D0, [XY1]
+                ADD         X1, #2
+                ADD         X1, D0
+                BRA         NEXT
+                
+.ploop_done:
+                ADD         X3, #4              ; drop limit/index
+                ADD         X1, #4              ; skip offset
+                BRA         NEXT
+
+; I: copy loop index to data stack
+I_WORD:
+                LOADD       D0, [XY3]           ; index is TOS of return stack
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; J: copy outer loop index (for nested loops)
+J_WORD:
+                LOADD       D0, [XY3 + #4]      ; outer index
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; >R: move from data stack to return stack ( x -- ) (R: -- x )
+; R>: move from return stack to data stack ( -- x ) (R: x -- )
+; R@: copy top of return stack to data stack ( -- x ) (R: x -- x )
+; (Already defined earlier in file)
+
+; CFAs for DO/LOOP
+CFA_DO:         .WORD       DO_RT
+CFA_LOOP:       .WORD       LOOP_RT
+CFA_PLOOP:      .WORD       PLOOP_RT
+
+; Compile-time DO ( -- addr )
+DO_COMP:
+                ; Compile DO runtime
+                LOADI       D1, #CFA_DO
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Push HERE for LOOP to patch
+                LOADP       D0, Y3, [#ZP_HERE+2]
+                PUSH        D0, XY2
+                
+                BRA         NEXT
+
+; Compile-time LOOP ( addr -- )
+LOOP_COMP:
+                ; Compile LOOP runtime
+                LOADI       D1, #CFA_LOOP
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get HERE for offset calculation
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = current HERE (where offset goes)
+                
+                ; Get loop start address from stack
+                POP         D0, XY2             ; D0 = DO's HERE (loop start)
+                
+                ; Calculate offset = start - (HERE + 4)
+                ; After LOOP reads offset, IP is at HERE+4, we want to go to start
+                SUB         D0, D1              ; D0 = start - HERE
+                SUB         D0, #4              ; D0 = start - HERE - 4
+                
+                ; Compile offset as 4-byte cell
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0
+                STORED      D2, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D0, [XY0]           ; X = offset
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; Compile-time +LOOP ( addr -- )
+PLOOP_COMP:
+                ; Compile +LOOP runtime
+                LOADI       D1, #CFA_PLOOP
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Same offset logic as LOOP
+                LOADP       D1, Y3, [#ZP_HERE+2]
+                
+                POP         D0, XY2
+                SUB         D0, D1
+                SUB         D0, #4
+                
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0
+                STORED      D2, [XY0]
+                ADD         X0, #2
+                STORED      D0, [XY0]
+                
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; ============================================================================
+; BEGIN / UNTIL / WHILE / REPEAT - Indefinite loops
+; ============================================================================
+; BEGIN ... UNTIL: loop until flag is true (non-zero)
+; BEGIN ... WHILE ... REPEAT: loop while flag is true
+
+; Compile-time BEGIN ( -- addr )
+BEGIN_COMP:
+                ; Just push HERE for UNTIL/REPEAT to use
+                LOADP       D0, Y3, [#ZP_HERE+2]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; Compile-time UNTIL ( addr -- )
+; Compiles ZBRANCH back to BEGIN if false (zero)
+UNTIL_COMP:
+                ; Compile ZBRANCH
+                LOADI       D1, #CFA_ZBRANCH
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get HERE for offset
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE
+                
+                ; Get BEGIN address from stack
+                POP         D0, XY2             ; D0 = BEGIN addr
+                
+                ; Offset = BEGIN - (HERE + 4)
+                SUB         D0, D1
+                SUB         D0, #4
+                
+                ; Compile offset as 4-byte cell
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0
+                STORED      D2, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D0, [XY0]           ; X = offset
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; Compile-time WHILE ( addr1 -- addr1 addr2 )
+; Compiles ZBRANCH forward (exit loop if false)
+WHILE_COMP:
+                ; Compile ZBRANCH
+                LOADI       D1, #CFA_ZBRANCH
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get HERE (placeholder address)
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE
+                
+                ; Compile placeholder offset [0][0]
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0
+                STORED      D2, [XY0]
+                ADD         X0, #2
+                STORED      D2, [XY0]
+                
+                ; Push placeholder addr (for REPEAT to patch)
+                PUSH        D1, XY2
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; Compile-time REPEAT ( addr1 addr2 -- )
+; Compiles BRANCH back to BEGIN, patches WHILE's forward branch
+REPEAT_COMP:
+                ; Compile BRANCH back to BEGIN
+                LOADI       D1, #CFA_BRANCH
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get HERE
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE
+                
+                ; Pop WHILE's placeholder addr, then BEGIN addr
+                POP         D2, XY2             ; D2 = WHILE placeholder
+                POP         D0, XY2             ; D0 = BEGIN addr
+                
+                ; Calculate backward offset = BEGIN - (HERE + 4)
+                PUSH        D2, XY3             ; save WHILE addr
+                SUB         D0, D1
+                SUB         D0, #4
+                
+                ; Compile backward offset
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D3, #0
+                STORED      D3, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D0, [XY0]           ; X = offset
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                ; Now patch WHILE's forward branch
+                ; Offset = HERE - (WHILE_placeholder + 4)
+                POP         D2, XY3             ; D2 = WHILE placeholder
+                SUB         D1, D2
+                SUB         D1, #4              ; D1 = offset
+                
+                ; Patch at WHILE_placeholder+2
+                MOVE        X0, D2
+                ADD         X0, #2
+                LOADI       Y0, #RAM_PAGE
+                STORED      D1, [XY0]
+                
+                BRA         NEXT
+
+; Compile-time AGAIN ( addr -- )
+; Compiles unconditional BRANCH back to BEGIN
+AGAIN_COMP:
+                ; Compile BRANCH
+                LOADI       D1, #CFA_BRANCH
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get HERE
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE (where offset goes)
+                
+                ; Pop BEGIN addr
+                POP         D0, XY2             ; D0 = BEGIN addr
+                
+                ; Calculate backward offset = BEGIN - (HERE + 4)
+                SUB         D0, D1
+                SUB         D0, #4
+                
+                ; Compile offset
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D3, #0
+                STORED      D3, [XY0]           ; Y = 0
+                ADD         X0, #2
+                STORED      D0, [XY0]           ; X = offset
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; ============================================================================
+; ." - Print string (IMMEDIATE)
+; ============================================================================
+; Compile-time: parse string until ", compile DOTQUOTE_RT + length + string
+; Runtime: print the inline string
+
+; Runtime: print inline string
+DOTQUOTE_RT:
+                ; IP points to [len word][string bytes...]
+                LOADD       D2, [XY1]           ; D2 = length
+                ADD         X1, #2              ; skip length word
+                
+                ; Print D2 characters from [XY1]
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                
+.dq_loop:       CMP         D2, #0
+                BEQ         .dq_done
+                LOADB       D0, [XY1]
+                STOREB      D0, [XY0]
+                ADD         X1, #1
+                SUB         D2, #1
+                BRA         .dq_loop
+                
+.dq_done:       ; Align IP to even
+                ADD         X1, #1
+                AND         X1, #$FFFE
+                BRA         NEXT
+
+CFA_DOTQUOTE:   .WORD       DOTQUOTE_RT
+
+; Compile-time ." (IMMEDIATE)
+DOTQUOTE_COMP:
+                ; Compile DOTQUOTE_RT CFA
+                LOADI       D1, #CFA_DOTQUOTE
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Get >IN (zero page)
+                LOADP       D0, Y3, [#ZP_TOIN]  ; D0 = >IN
+                
+                ; Skip leading space after ."
+.dqc_skip:      MOVE        X0, D0
+                ADD         X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D3, [XY0]
+                CMP         D3, #$20            ; space
+                BNE         .dqc_start
+                ADD         D0, #1
+                BRA         .dqc_skip
+                
+.dqc_start:
+                ; Get HERE for length word (zero page)
+                LOADP       D1, Y3, [#ZP_HERE+2] ; D1 = HERE offset
+                PUSH        D1, XY3             ; save length addr
+                
+                ; Skip length word, start copying string at HERE+2
+                ADD         D1, #2
+                
+                ; Parse string from TIB until "
+                ; D0 = >IN, D1 = dest, D2 = count
+                LOADI       D2, #0              ; count
+                
+.dqc_loop:
+                ; Get char from TIB at >IN
+                MOVE        X0, D0
+                ADD         X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D3, [XY0]
+                
+                ; Check for end quote or null
+                CMP         D3, #$22            ; "
+                BEQ         .dqc_end
+                CMP         D3, #0
+                BEQ         .dqc_end
+                
+                ; Store char at dest
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D3, [XY0]
+                
+                ADD         D0, #1              ; >IN++
+                ADD         D1, #1              ; dest++
+                ADD         D2, #1              ; count++
+                BRA         .dqc_loop
+                
+.dqc_end:
+                ; Skip closing quote
+                ADD         D0, #1
+                
+                ; Update >IN (zero page)
+                PUSH        D1, XY3             ; save dest
+                PUSH        D2, XY3             ; save count
+                STOREP      D0, Y3, [#ZP_TOIN]
+                POP         D2, XY3
+                POP         D1, XY3
+                
+                ; Store length at saved addr
+                POP         D0, XY3             ; length addr
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                STORED      D2, [XY0]
+                
+                ; Update HERE = dest aligned
+                ADD         D1, #1
+                AND         D1, #$FFFE
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; ============================================================================
+; VARIABLE / CONSTANT - Data definitions
+; ============================================================================
+
+; DOVAR runtime: push address of data field
+; XY0 contains CFA after NEXT, data field is at CFA+2
+DOVAR:
+                ; Data address = CFA + 2 (XY0 has CFA)
+                ADD         X0, #2
+                PUSH        X0, XY2             ; push data address (16-bit offset)
+                BRA         NEXT
+
+; DOCON runtime: push value from data field
+DOCON:
+                ; Read value at CFA+2 (XY0 has CFA)
+                ADD         X0, #2
+                LOADD       D0, [XY0]
+                PUSH        D0, XY2
+                BRA         NEXT
+
+CFA_DOVAR:      .WORD       DOVAR
+CFA_DOCON:      .WORD       DOCON
+
+; VARIABLE ( -- ) parses name, creates variable
+VARIABLE_WORD:
+                ; Parse the name
+                CALL        parse_word
+                CMP         D3, #0
+                BEQ         .var_err
+                
+                ; D2 = word buf addr, D3 = len
+                ; Build header like COLON does
+                
+                ; Get old LATEST (zero page)
+                LOADP       D0, Y3, [#ZP_LATEST]     ; old LATEST Y
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; old LATEST X
+                PUSH        D0, XY3             ; save old Y
+                PUSH        D1, XY3             ; save old X
+                
+                ; Get HERE
+                LOADP       D0, Y3, [#ZP_HERE+2]           ; HERE offset
+                
+                ; Update LATEST = HERE (zero page)
+                LOADI       D1, #RAM_PAGE
+                STOREP      D1, Y3, [#ZP_LATEST]
+                STOREP      D0, Y3, [#ZP_LATEST+2]
+                
+                ; Build header at HERE (D0)
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                
+                ; Store link (old LATEST)
+                POP         D1, XY3             ; old X
+                PUSH        D1, XY3
+                POP         D1, XY3
+                PUSH        D1, XY3             ; keep on stack
+                ; Actually let me redo - pop both
+                POP         D1, XY3             ; old X
+                POP         D0, XY3             ; old Y  (D0 was HERE, now old Y)
+                
+                ; Reload HERE
+                PUSH        D0, XY3
+                PUSH        D1, XY3
+                LOADP       D0, Y3, [#ZP_HERE+2]
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                
+                ; Store link Y
+                POP         D1, XY3             ; old LATEST X
+                POP         D0, XY3             ; old LATEST Y (now in D0)
+                PUSH        D1, XY3             ; save X again
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                POP         D0, XY3             ; old LATEST X
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Store flags+len
+                STORED      D3, [XY0]
+                ADD         X0, #2
+                
+                ; Copy name (D2=src, D3=len, XY0=dest) - avoid XY1
+                MOVE        D1, D3              ; count
+.var_copy:      CMP         D1, #0
+                BEQ         .var_copy_done
+                ; Read from source (D2 = src ptr)
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                ADD         D2, #1
+                POP         Y0, XY3
+                POP         X0, XY3
+                ; Write to dest
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                SUB         D1, #1
+                BRA         .var_copy
+                
+.var_copy_done:
+                LOADI       Y0, #RAM_PAGE
+                
+                ; Align
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                
+                ; Store CFA (DOVAR)
+                LOADI       D0, #DOVAR
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Store data field (0)
+                LOADI       D0, #0
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Update HERE
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+.var_err:       BRA         NEXT
+
+; CONSTANT ( n -- ) parses name, creates constant with value n
+CONSTANT_WORD:
+                ; Get value from stack
+                POP         D0, XY2
+                PUSH        D0, XY3             ; save value on return stack
+                
+                ; Parse the name
+                CALL        parse_word
+                CMP         D3, #0
+                BEQ         .con_err
+                
+                ; Same header building as VARIABLE...
+                ; Get old LATEST (zero page)
+                LOADP       D0, Y3, [#ZP_LATEST]
+                LOADP       D1, Y3, [#ZP_LATEST+2]
+                PUSH        D0, XY3             ; save old Y
+                PUSH        D1, XY3             ; save old X
+                
+                ; Get HERE & update LATEST
+                LOADP       D0, Y3, [#ZP_HERE+2]
+                
+                LOADI       D1, #RAM_PAGE
+                STOREP      D1, Y3, [#ZP_LATEST]
+                STOREP      D0, Y3, [#ZP_LATEST+2]
+                
+                ; Build at HERE
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                
+                POP         D1, XY3             ; old X
+                POP         D0, XY3             ; old Y
+                STORED      D0, [XY0]           ; link Y
+                ADD         X0, #2
+                STORED      D1, [XY0]           ; link X
+                ADD         X0, #2
+                STORED      D3, [XY0]           ; flags+len
+                ADD         X0, #2
+                
+                ; Copy name - avoid XY1
+                MOVE        D1, D3              ; count
+.con_copy:      CMP         D1, #0
+                BEQ         .con_copy_done
+                ; Read from source (D2 = src ptr)
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                ADD         D2, #1
+                POP         Y0, XY3
+                POP         X0, XY3
+                ; Write to dest
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                SUB         D1, #1
+                BRA         .con_copy
+                
+.con_copy_done:
+                LOADI       Y0, #RAM_PAGE
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                
+                ; Store CFA (DOCON)
+                LOADI       D0, #DOCON
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Store value (from return stack)
+                POP         D0, XY3             ; saved value
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                
+                ; Update HERE
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+.con_err:       POP         D0, XY3             ; discard saved value
+                BRA         NEXT
+
+; ============================================================================
+; Comments - ( ) and \
+; ============================================================================
+
+; ( - skip until ) (IMMEDIATE)
+PAREN_COMMENT:
+                ; Get >IN
+                LOADP       D0, Y3, [#ZP_TOIN]           ; D0 = >IN
+                
+.paren_loop:
+                ; Get char from TIB
+                MOVE        X0, D0
+                ADD         X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D1, [XY0]
+                
+                ; Check for ) or end of line
+                CMP         D1, #$29            ; ')'
+                BEQ         .paren_done
+                CMP         D1, #0
+                BEQ         .paren_end
+                
+                ADD         D0, #1
+                BRA         .paren_loop
+                
+.paren_done:
+                ADD         D0, #1              ; skip the )
+.paren_end:
+                ; Update >IN
+                STOREP      D0, Y3, [#ZP_TOIN]
+                BRA         NEXT
+
+; \ - skip to end of line (IMMEDIATE)
+BACKSLASH_COMMENT:
+                ; Set >IN to end of input
+                LOADP       D0, Y3, [#ZP_NUMTIB]           ; D0 = #TIB (length)
+                
+                ; Set >IN = #TIB (end of line)
+                STOREP      D0, Y3, [#ZP_TOIN]
+                BRA         NEXT
+
+; ============================================================================
+; Monitor Commands - DUMP, ?, FILL, CMOVE
+; ============================================================================
+
+; Helper: print byte as 2 hex digits (D0 = byte)
+print_hex_byte:
+                PUSH        D0, XY3
+                ; High nibble - use SHR4 instead of loop
+                MOVE        D1, D0
+                SHR4        D1                  ; D1 = high nibble (1 instruction!)
+                AND         D1, #$0F
+                CMP         D1, #10
+                BCC         .phb_hi_dig
+                ADD         D1, #$37            ; A-F
+                BRA         .phb_hi_out
+.phb_hi_dig:    ADD         D1, #$30            ; 0-9
+.phb_hi_out:    LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D1, [XY0]
+                
+                ; Low nibble
+                POP         D0, XY3
+                AND         D0, #$0F
+                CMP         D0, #10
+                BCC         .phb_lo_dig
+                ADD         D0, #$37
+                BRA         .phb_lo_out
+.phb_lo_dig:    ADD         D0, #$30
+.phb_lo_out:    STOREB      D0, [XY0]
+                RET
+
+; Helper: print 16-bit value as 4 hex digits (D0 = value)
+print_hex_word:
+                PUSH        D0, XY3
+                ; High byte - use HIGH instruction
+                HIGH        D0                  ; D0 = high byte (1 instruction!)
+                CALL        print_hex_byte
+                POP         D0, XY3
+                CALL        print_hex_byte
+                RET
+
+; Helper: print space
+print_space:
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$20
+                STOREB      D0, [XY0]
+                RET
+
+; Helper: get current PAGE into Y0
+get_page:
+                PUSH        X0, XY3
+                LOADP       D0, Y3, [#ZP_DUMPPAGE]           ; D0 = page
+                MOVE        Y0, D0
+                POP         X0, XY3
+                RET
+
+; DUMP ( addr n -- ) hex dump memory using PAGE
+; 16 bytes/line, aligned to 16-byte boundary, space between bytes 8-9
+DUMP_WORD:
+                POP         D3, XY2             ; n = byte count
+                POP         D2, XY2             ; addr
+                
+                ; Align addr down to 16-byte boundary
+                AND         D2, #$FFF0
+                
+.dump_line:
+                CMP         D3, #0
+                BEQ         .dump_done
+                
+                ; Save line start addr and remaining count
+                PUSH        D2, XY3             ; [0] line start addr
+                PUSH        D3, XY3             ; [2] remaining at line start
+                
+                ; Calc bytes this line = min(16, remaining)
+                MOVE        D1, D3
+                CMP         D1, #16
+                BCC         .d_cnt
+                LOADI       D1, #16
+.d_cnt:         PUSH        D1, XY3             ; [4] bytes this line
+                
+                ; === Print "PP:AAAA  " ===
+                CALL        get_page
+                MOVE        D0, Y0
+                CALL        print_hex_byte
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3A
+                STOREB      D0, [XY0]
+                ; Restore D2 from stack (clobbered by print)
+                LOADD       D2, [XY3 + #4]      ; line start addr
+                MOVE        D0, D2
+                CALL        print_hex_word
+                CALL        print_space
+                CALL        print_space
+                
+                ; === Print 16 hex bytes ===
+                LOADD       D1, [XY3]           ; bytes this line
+                LOADD       D2, [XY3 + #4]      ; line start addr
+                LOADI       D0, #0              ; byte counter 0-15
+.d_hex:
+                CMP         D0, #16
+                BEQ         .d_asc
+                
+                ; Extra space after byte 8
+                CMP         D0, #8
+                BNE         .d_hex2
+                PUSH        D0, XY3
+                PUSH        D1, XY3
+                PUSH        D2, XY3
+                CALL        print_space
+                POP         D2, XY3
+                POP         D1, XY3
+                POP         D0, XY3
+                
+.d_hex2:
+                ; Print byte or padding
+                CMP         D1, #0
+                BEQ         .d_pad1
+                
+                PUSH        D0, XY3
+                PUSH        D1, XY3
+                PUSH        D2, XY3
+                MOVE        X0, D2
+                CALL        get_page
+                LOADB       D0, [XY0]
+                CALL        print_hex_byte
+                CALL        print_space
+                POP         D2, XY3
+                POP         D1, XY3
+                POP         D0, XY3
+                ADD         D2, #1
+                SUB         D1, #1
+                ADD         D0, #1
+                BRA         .d_hex
+                
+.d_pad1:        ; Print padding spaces
+                PUSH        D0, XY3
+                CALL        print_space
+                CALL        print_space
+                CALL        print_space
+                POP         D0, XY3
+                ADD         D0, #1
+                BRA         .d_hex
+                
+.d_asc:         ; === Print ASCII ===
+                CALL        print_space
+                LOADD       D1, [XY3]           ; bytes this line
+                LOADD       D2, [XY3 + #4]      ; line start addr
+.d_ascl:
+                CMP         D1, #0
+                BEQ         .d_nl
+                MOVE        X0, D2
+                CALL        get_page
+                LOADB       D0, [XY0]
+                CMP         D0, #32
+                BCC         .d_dot
+                CMP         D0, #127
+                BCC         .d_chr
+.d_dot:         LOADI       D0, #$2E
+.d_chr:         LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                ADD         D2, #1
+                SUB         D1, #1
+                BRA         .d_ascl
+                
+.d_nl:          ; Newline
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$0A
+                STOREB      D0, [XY0]
+                
+                ; Update D2/D3 for next line
+                POP         D1, XY3             ; bytes this line
+                POP         D3, XY3             ; remaining at line start
+                POP         D2, XY3             ; line start addr
+                ADD         D2, D1              ; addr += bytes_this_line
+                SUB         D3, D1              ; remaining -= bytes_this_line
+                BRA         .dump_line
+                
+.dump_done:
+                BRA         NEXT
+
+; ? ( addr -- ) quick memory peek using PAGE
+QUESTION_WORD:
+                POP         D0, XY2             ; addr
+                MOVE        X0, D0
+                CALL        get_page
+                LOADD       D0, [XY0]
+                PUSH        D0, XY2
+                BRA         DOT                 ; tail call to .
+
+; FILL ( addr n byte -- ) fill memory with byte using PAGE
+FILL_WORD:
+                POP         D2, XY2             ; byte
+                POP         D1, XY2             ; n
+                POP         D0, XY2             ; addr
+                MOVE        X0, D0
+                CALL        get_page
+                
+.fill_loop:     CMP         D1, #0
+                BEQ         .fill_done
+                STOREB      D2, [XY0]
+                ADD         X0, #1
+                SUB         D1, #1
+                BRA         .fill_loop
+                
+.fill_done:     BRA         NEXT
+
+; CMOVE ( src dst n -- ) copy n bytes from src to dst using PAGE
+CMOVE_WORD:
+                POP         D2, XY2             ; n
+                POP         D1, XY2             ; dst
+                POP         D0, XY2             ; src
+                
+                ; D0=src, D1=dst, D2=n
+.cmove_loop:    CMP         D2, #0
+                BEQ         .cmove_done
+                
+                ; Read from src
+                MOVE        X0, D0
+                CALL        get_page
+                LOADB       D3, [XY0]
+                
+                ; Write to dst
+                MOVE        X0, D1
+                CALL        get_page
+                STOREB      D3, [XY0]
+                
+                ADD         D0, #1
+                ADD         D1, #1
+                SUB         D2, #1
+                BRA         .cmove_loop
+                
+.cmove_done:    BRA         NEXT
+
+; DUMPPAGE ( -- addr ) push address of DUMPPAGE variable
+DUMPPAGE_WORD:
+                LOADI       D0, #ZP_DUMPPAGE
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ============================================================================
+; HERE, ALLOT, COMMA, C-COMMA - Dictionary building words
+; ============================================================================
+
+; HERE ( -- addr ) return dictionary pointer (X offset only, assumes RAM page)
+HERE_WORD:
+                LOADP       D0, Y3, [#ZP_HERE+2]           ; Get HERE X offset
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ALLOT ( n -- ) reserve n bytes in dictionary
+ALLOT_WORD:
+                POP         D0, XY2             ; n bytes to allot
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; current HERE
+                ADD         D1, D0              ; new HERE
+                STORED      D1, [XY0]           ; store back
+                BRA         NEXT
+
+; , ( n -- ) compile 16-bit value to dictionary
+COMMA_WORD:
+                POP         D0, XY2             ; value to compile
+                ; Get HERE
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE offset
+                ; Store value at HERE
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                ; Update HERE += 2 (zero page)
+                ADD         D1, #2
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                BRA         NEXT
+
+; C, ( c -- ) compile byte to dictionary
+CCOMMA_WORD:
+                POP         D0, XY2             ; byte to compile
+                ; Get HERE (zero page)
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE offset
+                ; Store byte at HERE
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                ; Update HERE += 1 (zero page)
+                ADD         D1, #1
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                BRA         NEXT
+
+; ============================================================================
+; EXECUTE - Run CFA from stack
+; ============================================================================
+
+; EXECUTE ( cfa -- ) execute word at cfa
+EXECUTE_WORD:
+                POP         D0, XY2             ; CFA offset (assumes ROM page 0)
+                MOVE        X0, D0
+                LOADI       Y0, #0              ; ROM page
+                LOADD       D0, [XY0]           ; get code address
+                MOVE        PC, D0              ; jump to it (will BRA NEXT when done)
+
+; ============================================================================
+; RECURSE - Self-recursion (IMMEDIATE)
+; ============================================================================
+; Compiles a call to the word currently being defined
+
+RECURSE_COMP:
+                ; Get LATEST - this points to the word being defined
+                LOADP       D3, Y3, [#ZP_LATEST]     ; D3 = LATEST Y (page)
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; D1 = LATEST X (offset)
+                
+                ; Find the CFA by skipping: link(4) + flags(2) + name(len)
+                ; First get flags+len
+                MOVE        X0, D1
+                MOVE        Y0, D3
+                ADD         X0, #4              ; skip link
+                LOADD       D0, [XY0]           ; D0 = flags+len
+                AND         D0, #$3F            ; D0 = len
+                ADD         X0, #2              ; skip flags word
+                ADD         X0, D0              ; skip name
+                ADD         X0, #1              ; align up
+                AND         X0, #$FFFE
+                ; Now X0 = CFA offset, D3 = page
+                MOVE        D1, X0
+                
+                ; Compile CFA
+                CALL        compile_cfa
+                BRA         NEXT
+
+; ============================================================================
+; [ and ] - Switch compile/interpret mode (IMMEDIATE)
+; ============================================================================
+
+; [ ( -- ) switch to interpret mode
+LBRACKET_COMP:
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_STATE]
+                BRA         NEXT
+
+; ] ( -- ) switch to compile mode
+RBRACKET_WORD:
+                LOADI       D0, #1
+                STOREP      D0, Y3, [#ZP_STATE]
+                BRA         NEXT
+
+; ============================================================================
+; LITERAL - Compile number as literal (IMMEDIATE)
+; ============================================================================
+
+LITERAL_COMP:
+                ; Pop value from stack
+                POP         D0, XY2
+                PUSH        D0, XY3             ; save value
+                
+                ; Compile LIT CFA
+                LOADI       D1, #CFA_LIT
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Compile the value as inline data (4 bytes: Y=0, X=value)
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE
+                
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STORED      D0, [XY0]           ; Y = 0
+                ADD         X0, #2
+                POP         D0, XY3             ; get value back
+                STORED      D0, [XY0]           ; X = value
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+
+; ============================================================================
+; ' (tick) - Get CFA of word
+; ============================================================================
+
+TICK_WORD:
+                ; Parse next word
+                CALL        parse_word          ; D2=addr, D3=len
+                
+                CMP         D3, #0
+                BEQ         .tick_err
+                
+                ; Find it using find_word subroutine
+                PUSH        D2, XY2             ; addr
+                PUSH        D3, XY2             ; len
+                CALL        find_word           ; returns D0=flag, D1=CFA, D3=page
+                
+                ; Check if found
+                CMP         D0, #0
+                BEQ         .tick_err
+                
+                ; Push CFA (D1 = offset)
+                PUSH        D1, XY2
+                BRA         NEXT
+                
+.tick_err:
+                ; Word not found - print ?
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3F            ; '?'
+                STOREB      D0, [XY0]
+                LOADI       D0, #0
+                PUSH        D0, XY2             ; push 0
+                BRA         NEXT
+
+; ============================================================================
+; ['] (bracket-tick) - Compile CFA as literal (IMMEDIATE)
+; ============================================================================
+
+BRACKETTICK_COMP:
+                ; Parse next word
+                CALL        parse_word          ; D2=addr, D3=len
+                
+                CMP         D3, #0
+                BEQ         .btick_err
+                
+                ; Find it
+                PUSH        D2, XY2
+                PUSH        D3, XY2
+                CALL        find_word           ; D0=flag, D1=CFA
+                
+                ; Check if found
+                CMP         D0, #0
+                BEQ         .btick_err
+                
+                ; D1 = CFA - compile as literal
+                PUSH        D1, XY3             ; save CFA
+                
+                ; Compile LIT CFA
+                LOADI       D1, #CFA_LIT
+                LOADI       D3, #0
+                CALL        compile_cfa
+                
+                ; Compile the CFA value
+                LOADP       D1, Y3, [#ZP_HERE+2]           ; D1 = HERE
+                
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STORED      D0, [XY0]           ; Y = 0
+                ADD         X0, #2
+                POP         D0, XY3             ; get CFA back
+                STORED      D0, [XY0]           ; X = CFA
+                
+                ; HERE += 4
+                ADD         D1, #4
+                STOREP      D1, Y3, [#ZP_HERE+2]
+                
+                BRA         NEXT
+                
+.btick_err:
+                ; Word not found - print ?
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3F            ; '?'
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; FORGET - Remove word and all after it
+; ============================================================================
+
+FORGET_WORD:
+                ; Parse word name
+                CALL        parse_word          ; D2=addr, D3=len
+                
+                CMP         D3, #0
+                BEQ         .forget_err
+                
+                ; Save search params
+                PUSH        D2, XY3             ; save word addr
+                PUSH        D3, XY3             ; save word len
+                
+                ; Walk dictionary to find entry that matches
+                LOADP       D0, Y3, [#ZP_LATEST]     ; Y = page
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; X = offset
+                MOVE        X0, D1
+                MOVE        Y0, D0              ; XY0 = LATEST entry
+                
+.forget_search:
+                ; Check null (end of dictionary)
+                MOVE        D0, X0
+                OR          D0, Y0
+                BEQ         .forget_notfound
+                
+                ; Save entry address
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                
+                ; Get length at entry+4
+                ADD         X0, #4
+                LOADD       D0, [XY0]
+                AND         D0, #$3F            ; D0 = name len
+                
+                ; Compare with search len
+                LOADD       D1, [XY3 + #4]      ; search len from rstack
+                CMP         D0, D1
+                BNE         .forget_next
+                
+                ; Lengths match - compare names
+                ; Entry name at entry+6, search name at [rstack+6]
+                POP         Y0, XY3
+                POP         X0, XY3
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                
+                ADD         X0, #6              ; entry name ptr
+                MOVE        D1, D0              ; D1 = len counter
+                LOADD       D2, [XY3 + #6]      ; D2 = search word addr
+                
+.forget_cmp:
+                CMP         D1, #0
+                BEQ         .forget_found
+                
+                ; Get entry char
+                LOADB       D0, [XY0]
+                ; Uppercase if needed
+                CMP         D0, #$61
+                BLT         .forget_c1
+                CMP         D0, #$7B
+                BGE         .forget_c1
+                AND         D0, #$DF
+.forget_c1:
+                PUSH        D0, XY3             ; save entry char
+                
+                ; Get search char
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                ; Uppercase if needed
+                CMP         D0, #$61
+                BLT         .forget_c2
+                CMP         D0, #$7B
+                BGE         .forget_c2
+                AND         D0, #$DF
+.forget_c2:
+                MOVE        D3, D0              ; D3 = search char
+                POP         Y0, XY3
+                POP         X0, XY3
+                POP         D0, XY3             ; D0 = entry char
+                
+                CMP         D0, D3
+                BNE         .forget_next
+                
+                ADD         X0, #1              ; next entry char
+                ADD         D2, #1              ; next search char
+                SUB         D1, #1              ; count--
+                BRA         .forget_cmp
+                
+.forget_found:
+                ; Match! Entry addr on rstack
+                POP         Y0, XY3             ; entry Y (page)
+                POP         X0, XY3             ; entry X (offset)
+                POP         D3, XY3             ; discard saved len
+                POP         D2, XY3             ; discard saved addr
+                
+                ; Set HERE = entry offset (zero page)
+                MOVE        D0, X0              ; D0 = entry offset
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                ; Set LATEST = entry's link (at entry+0, entry+2)
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D1, [XY0]           ; link Y
+                ADD         X0, #2
+                LOADD       D0, [XY0]           ; link X
+                
+                STOREP      D1, Y3, [#ZP_LATEST]           ; LATEST Y
+                STORED      D0, [XY0]           ; LATEST X
+                
+                BRA         NEXT
+                
+.forget_next:
+                ; Follow link to next entry
+                POP         Y0, XY3
+                POP         X0, XY3
+                LOADD       D0, [XY0]           ; link Y
+                ADD         X0, #2
+                LOADD       D1, [XY0]           ; link X
+                MOVE        X0, D1
+                MOVE        Y0, D0
+                BRA         .forget_search
+                
+.forget_notfound:
+                POP         D3, XY3             ; clean rstack
+                POP         D2, XY3
+.forget_err:
+                ; Print ?
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$3F
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; Division - / MOD /MOD
+; ============================================================================
+; Uses repeated subtraction for simplicity. Not fast but correct.
+
+; /MOD ( n1 n2 -- rem quot ) signed division with remainder
+SLASHMOD_WORD:
+                POP         D1, XY2             ; divisor
+                POP         D0, XY2             ; dividend
+                
+                ; Handle signs
+                LOADI       D2, #0              ; D2 = result sign (0=pos, 1=neg)
+                
+                ; Check dividend sign
+                CMP         D0, #0
+                BGE         .sm_div_pos
+                NOT         D0
+                ADD         D0, #1              ; negate D0
+                XOR         D2, #1
+.sm_div_pos:
+                ; Check divisor sign
+                CMP         D1, #0
+                BGE         .sm_sor_pos
+                NOT         D1
+                ADD         D1, #1              ; negate D1
+                XOR         D2, #1
+.sm_sor_pos:
+                ; Now D0, D1 are positive
+                ; Check for divide by zero
+                CMP         D1, #0
+                BEQ         .sm_div_zero
+                
+                ; D3 = quotient
+                LOADI       D3, #0
+                
+.sm_loop:
+                CMP         D0, D1
+                BLT         .sm_done
+                SUB         D0, D1
+                ADD         D3, #1
+                BRA         .sm_loop
+                
+.sm_done:
+                ; D0 = remainder, D3 = quotient
+                ; Apply sign to quotient
+                CMP         D2, #0
+                BEQ         .sm_push
+                NOT         D3
+                ADD         D3, #1              ; negate D3
+                
+.sm_push:
+                PUSH        D0, XY2             ; remainder
+                PUSH        D3, XY2             ; quotient
+                BRA         NEXT
+                
+.sm_div_zero:
+                ; Division by zero - return 0, 0
+                LOADI       D0, #0
+                PUSH        D0, XY2
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; / ( n1 n2 -- quot ) signed division
+SLASH_WORD:
+                POP         D1, XY2             ; divisor
+                POP         D0, XY2             ; dividend
+                
+                ; Handle signs
+                LOADI       D2, #0              ; result sign
+                
+                CMP         D0, #0
+                BGE         .sl_div_pos
+                NOT         D0
+                ADD         D0, #1              ; negate D0
+                XOR         D2, #1
+.sl_div_pos:
+                CMP         D1, #0
+                BGE         .sl_sor_pos
+                NOT         D1
+                ADD         D1, #1              ; negate D1
+                XOR         D2, #1
+.sl_sor_pos:
+                CMP         D1, #0
+                BEQ         .sl_zero
+                
+                LOADI       D3, #0              ; quotient
+                
+.sl_loop:
+                CMP         D0, D1
+                BLT         .sl_done
+                SUB         D0, D1
+                ADD         D3, #1
+                BRA         .sl_loop
+                
+.sl_done:
+                CMP         D2, #0
+                BEQ         .sl_push
+                NOT         D3
+                ADD         D3, #1              ; negate D3
+.sl_push:
+                PUSH        D3, XY2
+                BRA         NEXT
+                
+.sl_zero:
+                LOADI       D0, #0
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; MOD ( n1 n2 -- rem ) signed modulo
+MOD_WORD:
+                POP         D1, XY2             ; divisor
+                POP         D0, XY2             ; dividend
+                
+                ; For MOD, remainder has same sign as dividend
+                LOADI       D2, #0              ; dividend sign
+                
+                CMP         D0, #0
+                BGE         .mod_div_pos
+                NOT         D0
+                ADD         D0, #1              ; negate D0
+                LOADI       D2, #1
+.mod_div_pos:
+                CMP         D1, #0
+                BGE         .mod_sor_pos
+                NOT         D1
+                ADD         D1, #1              ; negate D1
+.mod_sor_pos:
+                CMP         D1, #0
+                BEQ         .mod_zero
+                
+.mod_loop:
+                CMP         D0, D1
+                BLT         .mod_done
+                SUB         D0, D1
+                BRA         .mod_loop
+                
+.mod_done:
+                ; Apply dividend sign to remainder
+                CMP         D2, #0
+                BEQ         .mod_push
+                NOT         D0
+                ADD         D0, #1              ; negate D0
+.mod_push:
+                PUSH        D0, XY2
+                BRA         NEXT
+                
+.mod_zero:
+                LOADI       D0, #0
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ============================================================================
+; WORDS - Dictionary list with line wrapping at 80 chars
+; ============================================================================
+; D2 = column counter, D3 = word length, XY0 = entry pointer
+
+WORDS:
+                ; D2 = column counter
+                LOADI       D2, #0
+                
+                ; Load LATEST (24-bit pointer) from zero page
+                LOADP       D0, Y3, [#ZP_LATEST]     ; Y value (page)
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; X value (offset)
+                MOVE        X0, D1
+                MOVE        Y0, D0
+                
+.w_loop:        ; XY0 = entry, D2 = column
+                ; Check null
+                MOVE        D0, X0
+                OR          D0, Y0
+                BEQ         .w_done
+                
+                ; Get length (at entry+4) into D3
+                PUSH        XY0, XY3            ; save entry
+                ADD         X0, #4
+                LOADD       D3, [XY0]
+                AND         D3, #$3F            ; D3 = length
+                POP         XY0, XY3            ; restore entry
+                
+                ; Check if word fits: col + len + 1 >= 80?
+                MOVE        D0, D2
+                ADD         D0, D3
+                ADD         D0, #1
+                CMP         D0, #80
+                BCC         .w_print            ; fits, skip newline
+                
+                ; Print newline and reset column
+                PUSH        XY0, XY3
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$0A
+                STOREB      D0, [XY0]
+                POP         XY0, XY3
+                LOADI       D2, #0              ; reset column
+                
+.w_print:       ; Update column: col += len + 1
+                ADD         D2, D3
+                ADD         D2, #1
+                
+                ; Point to name (entry + 6)
+                PUSH        XY0, XY3            ; save entry for link follow
+                ADD         X0, #6
+                
+                ; D3 = length, XY0 = name pointer
+.w_pname:       CMP         D3, #0
+                BEQ         .w_space
+                LOADB       D0, [XY0]
+                ADD         X0, #1
+                
+                ; Print char (save name ptr and length)
+                PUSH        D3, XY3
+                PUSH        XY0, XY3
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                POP         XY0, XY3
+                POP         D3, XY3
+                
+                SUB         D3, #1
+                BRA         .w_pname
+                
+.w_space:       ; Print space
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$20
+                STOREB      D0, [XY0]
+                
+                ; Follow link (24-bit)
+                POP         XY0, XY3            ; restore entry
+                LOADD       D0, [XY0]           ; Y value (link page)
+                ADD         X0, #2
+                LOADD       D1, [XY0]           ; X value (link offset)
+                MOVE        X0, D1
+                MOVE        Y0, D0
+                BRA         .w_loop
+                
+.w_done:        ; Final newline
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$0A
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; FIND - Dictionary search (using LOADXY!)
+; ============================================================================
+; ( c-addr len -- cfa true | c-addr false )
+
+FIND:
+                POP         D3, XY2             ; len
+                POP         D2, XY2             ; addr (RAM offset)
+                
+                ; Load LATEST (zero page)
+                LOADP       D0, Y3, [#ZP_LATEST]     ; Y value
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; X value
+                MOVE        X0, D1
+                MOVE        Y0, D0
+
+.f_loop:        ; Null check
+                MOVE        D0, X0
+                OR          D0, Y0
+                BEQ         .f_notfound
+                
+                ; Save state
+                PUSH        XY0, XY3
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                
+                ; Get length
+                ADD         X0, #4
+                LOADD       D1, [XY0]
+                AND         D1, #$3F
+                
+                CMP         D1, D3
+                BNE         .f_next
+                
+                ; Compare names
+                POP         D3, XY3
+                POP         D2, XY3
+                POP         XY0, XY3
+                PUSH        XY0, XY3
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                ADD         X0, #6              ; name start
+                
+.f_cmp:         CMP         D3, #0
+                BEQ         .f_match
+                
+                ; Dict char
+                LOADB       D0, [XY0]
+                ADD         X0, #1
+                
+                ; Search char
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                SWAP        D2, X0
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D1, [XY0]
+                POP         Y0, XY3
+                POP         X0, XY3
+                ADD         D2, #1
+                
+                ; Uppercase both
+                CMP         D0, #$61
+                BCC         .f_cmp1
+                CMP         D0, #$7B
+                BCS         .f_cmp1
+                AND         D0, #$DF
+.f_cmp1:        CMP         D1, #$61
+                BCC         .f_cmp2
+                CMP         D1, #$7B
+                BCS         .f_cmp2
+                AND         D1, #$DF
+.f_cmp2:        CMP         D0, D1
+                BNE         .f_next
+                SUB         D3, #1
+                BRA         .f_cmp
+
+.f_match:       ; Calculate CFA
+                POP         D3, XY3             ; len
+                POP         D2, XY3             ; addr (discard)
+                POP         XY0, XY3            ; entry
+                
+                ; CFA = entry + 6 + len, aligned
+                ADD         X0, #4
+                LOADD       D0, [XY0]
+                AND         D0, #$3F            ; len
+                SUB         X0, #4
+                ADD         X0, #6
+                ADD         X0, D0              ; Two-operand ADD with X!
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                
+                PUSH        X0, XY2             ; CFA
+                LOADI       D0, #$FFFF          ; TRUE
+                PUSH        D0, XY2
+                BRA         NEXT
+
+.f_next:        POP         D3, XY3
+                POP         D2, XY3
+                POP         XY0, XY3
+                ; Follow 24-bit link - use two LOADDs
+                LOADD       D0, [XY0]           ; Y value
+                ADD         X0, #2
+                LOADD       D1, [XY0]           ; X value
+                MOVE        X0, D1
+                MOVE        Y0, D0
+                BRA         .f_loop
+
+.f_notfound:    PUSH        D2, XY2
+                LOADI       D0, #0              ; FALSE
+                PUSH        D0, XY2
+                BRA         NEXT
+
+; ============================================================================
+; DOT - Print number respecting BASE
+; ============================================================================
+
+DOT:            ; ( n -- )
+                POP         D0, XY2
+                CALL        print_number
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$20
+                STOREB      D0, [XY0]
+                BRA         NEXT
+
+; ============================================================================
+; print_number - Print D0 in current BASE
+; ============================================================================
+print_number:
+                ; Check BASE
+                PUSH        D0, XY3
+                LOADP       D1, Y3, [#ZP_BASE]
+                POP         D0, XY3
+                
+                CMP         D1, #16
+                BEQ         print_hex
+                ; Default to decimal
+                BRA         print_decimal
+
+; ============================================================================
+; print_decimal - Print D0 as unsigned decimal (fast table-based)
+; ============================================================================
+print_decimal:
+                ; Check for negative (signed)
+                CMP         D0, #$8000
+                BCC         .pd_positive        ; if < $8000, it's positive
+                
+                ; Negative: print '-' and negate
+                PUSH        D0, XY3
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$2D            ; '-'
+                STOREB      D0, [XY0]
+                POP         D0, XY3
+                NOT         D0
+                ADD         D0, #1              ; negate to get absolute value
+                
+.pd_positive:
+                ; Fast decimal print using div10
+                CMP         D0, #0
+                BNE         .pd_nonzero
+                
+                ; Handle zero
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                LOADI       D0, #$30
+                STOREB      D0, [XY0]
+                RET
+
+.pd_nonzero:
+                ; Use return stack to track: first push a 0 sentinel, then digits
+                LOADI       D1, #0
+                PUSH        D1, XY3             ; sentinel (0 = end of digits)
+
+.pd_loop:       CMP         D0, #0
+                BEQ         .pd_print
+                CALL        div10               ; D0 = quotient, D1 = remainder
+                ADD         D1, #$30            ; to ASCII
+                PUSH        D1, XY3             ; save digit
+                BRA         .pd_loop
+
+.pd_print:      LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+
+.pd_ploop:      POP         D0, XY3
+                CMP         D0, #0              ; sentinel?
+                BEQ         .pd_done
+                STOREB      D0, [XY0]
+                BRA         .pd_ploop
+
+.pd_done:       RET
+
+
+; ============================================================================
+; print_hex - Print D0 as 4 hex digits (optimized with HIGH/SHR4)
+; ============================================================================
+print_hex:
+                PUSH        D0, XY3
+                ; Digit 0 (bits 15:12) - HIGH then SHR4
+                HIGH        D0                  ; D0 = bits 15:8
+                SHR4        D0                  ; D0 = bits 15:12
+                CALL        .pn
+                
+                ; Digit 1 (bits 11:8) - HIGH then mask
+                POP         D0, XY3
+                PUSH        D0, XY3
+                HIGH        D0                  ; D0 = bits 15:8
+                AND         D0, #$0F            ; D0 = bits 11:8
+                CALL        .pn
+                
+                ; Digit 2 (bits 7:4) - SHR4
+                POP         D0, XY3
+                PUSH        D0, XY3
+                SHR4        D0                  ; D0 = bits 7:4
+                AND         D0, #$0F
+                CALL        .pn
+                
+                ; Digit 3 (bits 3:0) - mask
+                POP         D0, XY3
+                AND         D0, #$0F
+                CALL        .pn
+                RET
+.pn:            CMP         D0, #10
+                BCS         .pn_l
+                ADD         D0, #$30
+                BRA         .pn_o
+.pn_l:          SUB         D0, #10
+                ADD         D0, #$41
+.pn_o:          LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                RET
+
+; ============================================================================
+; print_string - Print null-terminated string
+; ============================================================================
+; Input: XY0 = pointer to string (any page)
+; Destroys: D0, XY0
+; ============================================================================
+print_string:
+                LOADI       D1, #<TERMINAL
+                LOADI       D2, #>TERMINAL
+.ps_loop:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .ps_done
+                SWAP        D1, X0
+                SWAP        D2, Y0
+                STOREB      D0, [XY0]
+                SWAP        D1, X0
+                SWAP        D2, Y0
+                ADD         X0, #1
+                BRA         .ps_loop
+.ps_done:       RET
+
+; ============================================================================
+; MAIN
+; ============================================================================
+
+MAIN:
+                ; Init stacks - Y3=$20 enables zero page access
+                LOADI       X2, #<DSTACK_TOP
+                LOADI       Y2, #>DSTACK_TOP
+                LOADI       X3, #<RSTACK_TOP
+                LOADI       Y3, #>RSTACK_TOP    ; Y3=$20 for zero page
+                
+                ; Setup interrupt vector at $200000 (common ISR entry)
+                LOADI       D0, #>ISR           ; ISR page
+                STOREP      D0, Y3, [#INT_VECTOR]
+                LOADI       D0, #<ISR           ; ISR address
+                STOREP      D0, Y3, [#INT_VECTOR+2]
+                
+                ; Init TICKS = 0
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_TICKS]
+                
+                ; Init LATEST (24-bit -> ROM dict) via zero page
+                LOADI       D0, #0              ; Y = ROM page
+                STOREP      D0, Y3, [#ZP_LATEST]
+                LOADI       D0, #DICT_EINT
+                STOREP      D0, Y3, [#ZP_LATEST+2]
+                
+                ; Init HERE (24-bit -> RAM user area)
+                LOADI       D0, #RAM_PAGE
+                STOREP      D0, Y3, [#ZP_HERE]
+                LOADI       D0, #$8000
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                ; Init STATE = 0
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_STATE]
+                
+                ; Init BASE = 10 (decimal)
+                LOADI       D0, #10
+                STOREP      D0, Y3, [#ZP_BASE]
+                
+                ; Init >IN = 0
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_TOIN]
+                
+                ; Init DUMPPAGE = RAM_PAGE ($20)
+                LOADI       D0, #RAM_PAGE
+                STOREP      D0, Y3, [#ZP_DUMPPAGE]
+                
+                ; Enable interrupts
+                EINT
+                
+                ; Print banner
+                LOADI       X0, #<BANNER
+                LOADI       Y0, #>BANNER
+                CALL        print_string
+                
+                ; Fall through to QUIT
+
+; ============================================================================
+; QUIT - Outer interpreter loop
+; ============================================================================
+
+QUIT:
+                ; Reset both stacks - Y3=$20 for zero page
+                LOADI       X2, #<DSTACK_TOP
+                LOADI       Y2, #>DSTACK_TOP
+                LOADI       X3, #<RSTACK_TOP
+                LOADI       Y3, #>RSTACK_TOP
+                
+.quit_loop:
+                ; Print prompt
+                LOADI       X0, #<STR_PROMPT
+                LOADI       Y0, #>STR_PROMPT
+                CALL        print_string
+                
+                ; ACCEPT - read line to TIB
+                CALL        accept_line
+                
+                ; Reset >IN for parsing using STOREP
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_TOIN]
+                
+                ; INTERPRET
+                CALL        interpret
+                
+                ; Print " ok" only if interpreting (STATE=0)
+                LOADP       D0, Y3, [#ZP_STATE]
+                CMP         D0, #0
+                BNE         .quit_loop          ; Skip ok if compiling
+                
+                LOADI       X0, #<STR_OK
+                LOADI       Y0, #>STR_OK
+                CALL        print_string
+                
+                BRA         .quit_loop
+
+; Error entry point - prints ? and restarts QUIT (skips "ok")
+QUIT_ERROR:
+                ; Print " ?"
+                LOADI       X0, #<STR_ERROR
+                LOADI       Y0, #>STR_ERROR
+                CALL        print_string
+                
+                ; Reset stacks and restart
+                BRA         QUIT
+
+; ============================================================================
+; ACCEPT - Read line from keyboard to TIB
+; ============================================================================
+; Reads characters until newline/CR, stores in TIB
+; Returns count in #TIB (ZP_NUMTIB)
+
+accept_line:
+                ; XY0 = keyboard
+                ; XY1 = terminal
+                ; D2 = count
+                ; D3 = TIB offset
+                
+                LOADI       X0, #<KEYBOARD
+                LOADI       Y0, #>KEYBOARD
+                LOADI       X1, #<TERMINAL
+                LOADI       Y1, #>TERMINAL
+                LOADI       D2, #0              ; count
+                LOADI       D3, #TIB_OFFSET     ; current TIB position
+                
+                ; Show cursor
+                LOADI       D0, #$5F            ; '_'
+                STOREB      D0, [XY1]
+                
+.acc_loop:
+                ; Wait for key
+                LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .acc_loop
+                
+                ; Erase cursor
+                LOADI       D1, #$08            ; BS
+                STOREB      D1, [XY1]
+                LOADI       D1, #$20            ; SP
+                STOREB      D1, [XY1]
+                LOADI       D1, #$08            ; BS
+                STOREB      D1, [XY1]
+                
+                AND         D0, #$FF            ; Mask to ASCII
+                
+                ; Check for Enter (CR or LF)
+                CMP         D0, #$0D            ; CR
+                BEQ         .acc_done
+                CMP         D0, #$0A            ; LF
+                BEQ         .acc_done
+                
+                ; Check for backspace
+                CMP         D0, #$08
+                BEQ         .acc_back
+                CMP         D0, #$7F            ; DEL
+                BEQ         .acc_back
+                
+                ; Store character to TIB
+                MOVE        D1, X0              ; Save keyboard X
+                MOVE        X0, D3              ; TIB offset
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                ; Restore XY0 to keyboard
+                MOVE        X0, D1
+                LOADI       Y0, #>KEYBOARD
+                
+                ADD         D3, #1              ; next TIB position
+                ADD         D2, #1              ; count++
+                
+                ; Echo character
+                STOREB      D0, [XY1]
+                
+                ; Check buffer limit
+                CMP         D2, #80
+                BCS         .acc_done
+                
+                ; Show cursor and loop
+                LOADI       D0, #$5F            ; '_'
+                STOREB      D0, [XY1]
+                BRA         .acc_loop
+                
+.acc_back:
+                ; Handle backspace
+                CMP         D2, #0
+                BEQ         .acc_redraw_cursor  ; Nothing to delete
+                SUB         D3, #1
+                SUB         D2, #1
+                
+                ; Echo backspace sequence (erase char)
+                LOADI       D0, #$08            ; BS
+                STOREB      D0, [XY1]
+                LOADI       D0, #$20            ; Space
+                STOREB      D0, [XY1]
+                LOADI       D0, #$08            ; BS
+                STOREB      D0, [XY1]
+                
+.acc_redraw_cursor:
+                ; Show cursor and loop
+                LOADI       D0, #$5F            ; '_'
+                STOREB      D0, [XY1]
+                BRA         .acc_loop
+                
+.acc_done:
+                ; Store null terminator
+                MOVE        D1, X0              ; Save keyboard X
+                MOVE        X0, D3
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STOREB      D0, [XY0]
+                
+                ; Store count in #TIB (zero page)
+                STOREP      D2, Y3, [#ZP_NUMTIB]
+                
+                ; Restore XY0 to keyboard (not really needed but clean)
+                MOVE        X0, D1
+                LOADI       Y0, #>KEYBOARD
+                
+                ; Echo newline
+                LOADI       D0, #$0A
+                STOREB      D0, [XY1]
+                
+                RET
+
+; ============================================================================
+; WORD - Parse next word from TIB
+; ============================================================================
+; Returns: addr in D2, len in D3 (0 if end of line)
+; Uses XY0 for TIB, saves/restores as needed - does NOT clobber XY1
+
+parse_word:
+                ; Get >IN
+                LOADP       D0, Y3, [#ZP_TOIN]
+                
+                ; Setup TIB pointer
+                LOADI       X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                ADD         X0, D0              ; TIB + >IN
+                
+                ; Skip leading spaces
+.pw_skip:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .pw_empty
+                CMP         D0, #$20            ; space
+                BNE         .pw_start
+                ADD         X0, #1
+                BRA         .pw_skip
+                
+.pw_start:
+                ; Record start address
+                MOVE        D2, X0              ; word start (TIB offset)
+                LOADI       D3, #0              ; length
+                
+                ; D1 = word buffer offset
+                LOADI       D1, #WORD_BUF_OFF
+                
+.pw_copy:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .pw_done
+                CMP         D0, #$20
+                BEQ         .pw_done
+                
+                ; Copy char to buffer (temporarily use XY0 for buffer)
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                POP         Y0, XY3
+                POP         X0, XY3
+                
+                ADD         X0, #1              ; next TIB char
+                ADD         D1, #1              ; next buffer pos
+                ADD         D3, #1              ; length++
+                
+                ; Limit word length
+                CMP         D3, #31
+                BCS         .pw_done
+                BRA         .pw_copy
+                
+.pw_done:
+                ; Null terminate word buffer
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STOREB      D0, [XY0]
+                POP         Y0, XY3
+                POP         X0, XY3
+                
+                ; Update >IN (X0 still points to end of word in TIB)
+                MOVE        D0, X0
+                SUB         D0, #TIB_OFFSET
+                PUSH        X0, XY3
+                STOREP      D0, Y3, [#ZP_TOIN]
+                POP         X0, XY3
+                
+                ; Return: D2 = WORD_BUF_OFF, D3 = length
+                LOADI       D2, #WORD_BUF_OFF
+                RET
+                
+.pw_empty:
+                ; End of input
+                LOADI       D2, #0
+                LOADI       D3, #0
+                RET
+
+; ============================================================================
+; NUMBER - Parse number from word buffer
+; ============================================================================
+; Input: D2 = addr, D3 = len
+; Output: D0 = number, D1 = success (TRUE/FALSE)
+
+parse_number:
+                CMP         D3, #0
+                BEQ         .pn_fail
+                
+                ; Setup pointer to word
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                
+                ; Check for negative
+                LOADI       D1, #0              ; negative flag
+                LOADB       D0, [XY0]
+                CMP         D0, #$2D            ; '-'
+                BNE         .pn_chk_hex
+                LOADI       D1, #1              ; set negative
+                ADD         X0, #1
+                SUB         D3, #1
+                CMP         D3, #0
+                BEQ         .pn_fail
+                LOADB       D0, [XY0]           ; get next char
+                
+.pn_chk_hex:
+                ; Check for $ prefix (force hex)
+                CMP         D0, #$24            ; '$'
+                BNE         .pn_pos
+                ; Force hex mode - save 16 as local base
+                PUSH        D1, XY3             ; save negative flag
+                LOADI       D1, #16             ; hex base
+                PUSH        D1, XY3             ; save base
+                ADD         X0, #1              ; skip '$'
+                SUB         D3, #1
+                CMP         D3, #0
+                BEQ         .pn_fail3
+                BRA         .pn_start
+                
+.pn_pos:
+                PUSH        D1, XY3             ; save negative flag
+                ; Use current BASE
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                LOADP       D1, Y3, [#ZP_BASE]           ; D1 = BASE
+                POP         Y0, XY3
+                POP         X0, XY3
+                PUSH        D1, XY3             ; save base
+                
+.pn_start:
+                LOADI       D2, #0              ; accumulator
+                
+.pn_loop:
+                CMP         D3, #0
+                BEQ         .pn_ok
+                
+                LOADB       D0, [XY0]
+                ADD         X0, #1
+                SUB         D3, #1
+                
+                ; Check if digit 0-9
+                CMP         D0, #$30            ; '0'
+                BCC         .pn_fail3
+                CMP         D0, #$3A            ; '9'+1
+                BCS         .pn_hex
+                SUB         D0, #$30
+                BRA         .pn_acc
+                
+.pn_hex:
+                ; Check A-F
+                CMP         D0, #$41            ; 'A'
+                BCC         .pn_fail3
+                CMP         D0, #$47            ; 'F'+1
+                BCS         .pn_lhex
+                SUB         D0, #$37            ; 'A' - 10
+                BRA         .pn_acc
+                
+.pn_lhex:
+                ; Check a-f
+                CMP         D0, #$61            ; 'a'
+                BCC         .pn_fail3
+                CMP         D0, #$67            ; 'f'+1
+                BCS         .pn_fail3
+                SUB         D0, #$57            ; 'a' - 10
+                
+.pn_acc:
+                ; Check digit < base (base is on stack)
+                LOADD       D1, [XY3]           ; peek base from stack
+                
+                CMP         D0, D1
+                BCS         .pn_fail3           ; digit >= base, fail (stack: neg, base)
+                
+                ; acc = acc * base + digit
+                ; D2 * D1 + D0
+                PUSH        D0, XY3             ; save digit
+                PUSH        D3, XY3             ; save count
+                
+                ; Multiply D2 by base (D1) using shifts
+                MOVE        D3, D2              ; copy acc
+                LOADI       D2, #0
+.pn_mul:        CMP         D1, #0
+                BEQ         .pn_mul_done
+                ; If D1 bit 0 set, add D3 to D2
+                MOVE        D0, D1
+                AND         D0, #1
+                CMP         D0, #0
+                BEQ         .pn_mul_skip
+                ADD         D2, D3
+.pn_mul_skip:   SHL         D3
+                SHR         D1
+                BRA         .pn_mul
+                
+.pn_mul_done:
+                POP         D3, XY3             ; restore count
+                POP         D0, XY3             ; restore digit
+                ADD         D2, D0              ; add digit
+                
+                BRA         .pn_loop
+                
+.pn_ok:
+                POP         D1, XY3             ; discard saved base
+                POP         D1, XY3             ; negative flag
+                CMP         D1, #0
+                BEQ         .pn_ret
+                ; Negate
+                LOADI       D0, #0
+                SUB         D0, D2
+                MOVE        D2, D0
+                
+.pn_ret:
+                MOVE        D0, D2
+                LOADI       D1, #$FFFF          ; TRUE
+                RET
+
+; Fail paths - must match stack state:
+; .pn_fail3: stack has [negative_flag][base] (2 items)
+; .pn_fail:  stack is empty (0 items)
+
+.pn_fail3:
+                POP         D1, XY3             ; discard base
+                POP         D1, XY3             ; discard negative flag
+.pn_fail:
+                LOADI       D1, #0              ; FALSE
+                RET
+
+; ============================================================================
+; INTERPRET - Process input line
+; ============================================================================
+
+interpret:
+.int_loop:
+                ; Parse next word
+                CALL        parse_word
+                
+                ; Check if empty (end of line)
+                CMP         D3, #0
+                BEQ         .int_done
+                
+                ; D2 = word buf addr, D3 = len
+                ; Save word info on return stack for error case
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                
+                ; Push to data stack for find_word
+                PUSH        D2, XY2
+                PUSH        D3, XY2
+                
+                ; Search dictionary
+                CALL        find_word
+                
+                ; D0 = found flag, D1 = CFA offset, D2 = flags, D3 = CFA page
+                CMP         D0, #0
+                BEQ         .int_number
+                
+                ; Found! Discard saved word info from return stack
+                ADD         X3, #4              ; drop 2 words from return stack
+                
+                ; Check STATE
+                PUSH        D1, XY3             ; save CFA offset
+                PUSH        D2, XY3             ; save flags  
+                PUSH        D3, XY3             ; save CFA page
+                
+                LOADP       D0, Y3, [#ZP_STATE]
+                CMP         D0, #0
+                BEQ         .int_execute
+                
+                ; Compile mode - check IMMEDIATE flag
+                POP         D3, XY3             ; CFA page
+                POP         D2, XY3             ; flags
+                POP         D1, XY3             ; CFA offset
+                AND         D2, #$40            ; IMMEDIATE bit
+                BNE         .int_exec_imm
+                
+                ; Not immediate - compile the CFA
+                CALL        compile_cfa
+                BRA         .int_loop
+                
+.int_exec_imm:
+                ; Execute immediate word (D1=CFA offset, D3=CFA page)
+                CALL        exec_prim
+                BRA         .int_loop
+                
+.int_execute:
+                ; Interpret mode - execute
+                POP         D3, XY3             ; CFA page
+                POP         D2, XY3             ; discard flags
+                POP         D1, XY3             ; CFA offset
+                CALL        exec_prim
+                BRA         .int_loop
+                
+.int_number:
+                ; Not found - try as number
+                POP         D3, XY3             ; restore len
+                POP         D2, XY3             ; restore addr
+                
+                CALL        parse_number
+                
+                CMP         D1, #0
+                BEQ         .int_error
+                
+                ; Check STATE for number handling
+                PUSH        D0, XY3             ; save number
+                LOADP       D1, Y3, [#ZP_STATE]
+                POP         D0, XY3             ; restore number
+                
+                CMP         D1, #0
+                BEQ         .int_push_num
+                
+                ; Compile mode - compile LIT, number
+                CALL        compile_lit
+                BRA         .int_loop
+                
+.int_push_num:
+                ; Interpret mode - push number to stack
+                PUSH        D0, XY2
+                BRA         .int_loop
+                
+.int_error:
+                ; Check if we were compiling (STATE != 0)
+                LOADP       D0, Y3, [#ZP_STATE]
+                CMP         D0, #0
+                BEQ         .int_err_done
+                
+                ; We were compiling - restore LATEST from ZP_SAVED_LATEST
+                LOADP       D0, Y3, [#ZP_SAVED_LATEST]       ; Y
+                LOADP       D1, Y3, [#ZP_SAVED_LATEST+2]     ; X
+                
+                STOREP      D0, Y3, [#ZP_LATEST]             ; restore Y
+                STOREP      D1, Y3, [#ZP_LATEST+2]           ; restore X
+                
+                ; Reset STATE to 0 (zero page)
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_STATE]
+                
+.int_err_done:
+                ; Jump to error handler (resets stacks, prints ?, restarts)
+                BRA         QUIT_ERROR
+                
+.int_done:
+                RET
+
+; ============================================================================
+; compile_cfa - Compile CFA to dictionary (D1 = CFA offset, D3 = CFA page)
+; Stores the CFA itself (for indirect threaded code)
+; ============================================================================
+compile_cfa:
+                ; Get HERE using LOADP
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_HERE+2]   ; D0 = HERE X (offset)
+                
+                ; Store 24-bit CFA at HERE using STOREXY
+                ; D3 = CFA page, D1 = CFA offset
+                MOVE        X0, D0              ; X0 = HERE offset
+                SWAP        D3, Y1              ; Y1 = CFA page
+                SWAP        D1, X1              ; X1 = CFA offset
+                STOREXY     XY1, [XY0]          ; Store CFA at HERE
+                SWAP        D3, Y1              ; Restore Y1
+                SWAP        D1, X1              ; Restore X1
+                
+                ; HERE += 4
+                ADD         D0, #4
+                LOADI       Y0, #RAM_PAGE
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                RET
+
+; ============================================================================
+; compile_lit - Compile LIT and number (D0 = number)
+; Stores: [4 bytes: CFA_LIT][4 bytes: 0:number]
+; ============================================================================
+compile_lit:
+                PUSH        D0, XY3             ; save number
+                
+                ; Compile LIT CFA (4 bytes)
+                LOADI       D1, #CFA_LIT
+                LOADI       D3, #0              ; ROM page
+                CALL        compile_cfa
+                
+                ; Get HERE using LOADP
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_HERE+2]   ; D0 = HERE offset
+                
+                ; Store Y=0 at HERE
+                MOVE        X0, D0
+                LOADI       D2, #0
+                STORED      D2, [XY0]
+                ADD         X0, #2
+                
+                ; Store number at HERE+2
+                POP         D1, XY3             ; number
+                STORED      D1, [XY0]
+                
+                ; HERE += 4
+                ADD         D0, #4
+                LOADI       Y0, #RAM_PAGE
+                STOREP      D0, Y3, [#ZP_HERE+2]
+                
+                RET
+
+; ============================================================================
+; FIND_WORD - Subroutine version of FIND
+; ============================================================================
+; Input: ( addr len ) on data stack
+; Output: D0 = found flag, D1 = CFA (if found), D2 = flags (if found)
+
+find_word:
+                POP         D3, XY2             ; len
+                POP         D2, XY2             ; addr (RAM offset)
+                
+                ; Load LATEST (zero page)
+                LOADP       D0, Y3, [#ZP_LATEST]     ; Y value
+                LOADP       D1, Y3, [#ZP_LATEST+2]   ; X value
+                MOVE        X0, D1
+                MOVE        Y0, D0
+
+.fw_loop:       ; Null check
+                MOVE        D0, X0
+                OR          D0, Y0
+                BEQ         .fw_notfound
+                
+                ; Save state
+                PUSH        XY0, XY3
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                
+                ; Get length from entry
+                ADD         X0, #4
+                LOADD       D1, [XY0]
+                AND         D1, #$3F
+                SUB         X0, #4
+                
+                CMP         D1, D3
+                BNE         .fw_next
+                
+                ; Compare names - avoid XY1 (IP register!)
+                PUSH        XY0, XY3            ; save entry again
+                ADD         X0, #6              ; point to name in dict
+                
+                ; D1 = counter, D2 = word buffer ptr, D3 = len (saved)
+                MOVE        D1, D3              ; counter
+                ; D2 already has word buffer ptr from earlier
+                
+.fw_cmp:        CMP         D1, #0
+                BEQ         .fw_match
+                
+                ; Get dict char into D0
+                LOADB       D0, [XY0]
+                ADD         X0, #1
+                
+                ; Get word char - swap to XY0 temporarily
+                PUSH        X0, XY3
+                PUSH        Y0, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D3, [XY0]           ; D3 = word char
+                ADD         D2, #1              ; advance word ptr
+                POP         Y0, XY3
+                POP         X0, XY3
+                
+                ; Uppercase dict char (D0)
+                CMP         D0, #$61
+                BCC         .fw_c1
+                CMP         D0, #$7B
+                BCS         .fw_c1
+                AND         D0, #$DF
+.fw_c1:         
+                ; Uppercase word char (D3)
+                CMP         D3, #$61
+                BCC         .fw_c2
+                CMP         D3, #$7B
+                BCS         .fw_c2
+                AND         D3, #$DF
+.fw_c2:         CMP         D0, D3
+                BNE         .fw_nomatch
+                
+                SUB         D1, #1
+                BRA         .fw_cmp
+                
+.fw_match:
+                POP         XY0, XY3            ; entry
+                POP         D3, XY3
+                POP         D2, XY3
+                POP         XY0, XY3            ; entry again
+                
+                ; Get flags+len word
+                ADD         X0, #4
+                LOADD       D2, [XY0]           ; D2 = flags+len
+                
+                ; Calculate CFA = entry + 6 + len (aligned)
+                MOVE        D1, D2
+                AND         D1, #$3F            ; len only
+                SUB         X0, #4
+                ADD         X0, #6
+                ADD         X0, D1
+                ADD         X0, #1
+                AND         X0, #$FFFE          ; align
+                
+                ; Return: D0 = TRUE, D1 = CFA offset, D2 = flags, D3 = CFA page
+                MOVE        D1, X0
+                MOVE        D3, Y0              ; page where word was found
+                LOADI       D0, #$FFFF          ; TRUE
+                RET
+                
+.fw_nomatch:
+                POP         XY0, XY3            ; discard extra entry
+                
+.fw_next:       POP         D3, XY3
+                POP         D2, XY3
+                POP         XY0, XY3
+                ; Follow link (use two LOADDs to avoid LOADXY XY0,[XY0] bug)
+                LOADD       D0, [XY0]           ; Y value (link page)
+                ADD         X0, #2
+                LOADD       D1, [XY0]           ; X value (link offset)
+                MOVE        X0, D1
+                MOVE        Y0, D0
+                BRA         .fw_loop
+                
+.fw_notfound:
+                LOADI       D0, #0              ; FALSE
+                RET
+
+; ============================================================================
+; EXECUTE_PRIMITIVE - Execute a primitive word from interpreter
+; ============================================================================
+; Input: D1 = CFA
+; Sets interpret mode, calls primitive, NEXT returns to us
+
+exec_prim:
+                ; D1 = CFA offset, D3 = CFA page
+                ; Build thread [word-CFA][STOP-CFA] at ZP_CALL_BUF
+                
+                ; Store word's CFA at ZP_CALL_BUF+0 (zero page)
+                STOREP      D3, Y3, [#ZP_CALL_BUF]       ; Store Y (page)
+                STOREP      D1, Y3, [#ZP_CALL_BUF+2]     ; Store X (offset)
+                
+                ; Store STOP CFA at ZP_CALL_BUF+4
+                LOADI       D0, #0              ; ROM page
+                STOREP      D0, Y3, [#ZP_CALL_BUF+4]
+                LOADI       D0, #CFA_STOP
+                STOREP      D0, Y3, [#ZP_CALL_BUF+6]
+                
+                ; Set IP = ZP_CALL_BUF
+                LOADI       X1, #ZP_CALL_BUF
+                LOADI       Y1, #RAM_PAGE
+                
+                ; Save return address for STOP (zero page)
+                LOADI       D0, #.exec_done
+                STOREP      D0, Y3, [#ZP_EXEC_RET]
+                
+                ; Start threaded execution
+                BRA         NEXT
+                
+.exec_done:     RET
+
+; STOP sentinel - returns to interpreter
+CFA_STOP:       .WORD       STOP
+STOP:
+                ; Return via saved address (zero page)
+                LOADP       D0, Y3, [#ZP_EXEC_RET]
+                MOVE        PC, D0
+
+; ============================================================================
+; ISR - Common Interrupt Service Routine Entry Point
+; ============================================================================
+; Dispatches to handler based on interrupt level from saved SR.
+; IRQ7 = tick counter, all others just RTI.
+; ============================================================================
+
+ISR:
+                PUSH        D0, XY3
+                
+                ; Get interrupt level from saved SR on stack
+                ; After PUSH D0, SR is at [XY3+#2]
+                LOADD       D0, [XY3+#2]
+                AND         D0, #$0070          ; mask bits 6:4 (interrupt level)
+                
+                ; Check for IRQ7 (level 0 = $0000 after mask)
+                CMP         D0, #$0000
+                BNE         .isr_other
+                
+                ; IRQ7 handler - increment tick counter
+                LOADP       D0, Y3, [#ZP_TICKS]
+                ADD         D0, #1
+                STOREP      D0, Y3, [#ZP_TICKS]
+                
+.isr_other:     ; All other IRQs - just return
+                POP         D0, XY3
+                RTI
+
+; ============================================================================
+; DICTIONARY - 24-bit links!
+; ============================================================================
+; +0: Link Y (2 bytes)
+; +2: Link X (2 bytes) 
+; +4: Flags+Len (2 bytes)
+; +6: Name (N bytes)
+; +aligned: CFA (2 bytes)
+; ============================================================================
+
+DICT_EINT:      .WORD       0                   ; Link Y (null - new head)
+                .WORD       DICT_DINT           ; Link X
+                .WORD       $04                 ; len=4
+                .WORD       $4945               ; "EI"
+                .WORD       $544E               ; "NT"
+CFA_EINT:       .WORD       EINT_WORD
+
+DICT_DINT:      .WORD       0                   ; Link Y
+                .WORD       DICT_TICKS          ; Link X
+                .WORD       $04                 ; len=4
+                .WORD       $4944               ; "DI"
+                .WORD       $544E               ; "NT"
+CFA_DINT:       .WORD       DINT_WORD
+
+DICT_TICKS:     .WORD       0                   ; Link Y
+                .WORD       DICT_DOT            ; Link X
+                .WORD       $05                 ; len=5
+                .WORD       $4954               ; "TI"
+                .WORD       $4B43               ; "CK"
+                .WORD       $0053               ; "S"
+CFA_TICKS:      .WORD       TICKS_WORD
+
+DICT_DOT:       .WORD       0                   ; Link Y
+                .WORD       DICT_DUP            ; Link X
+                .WORD       $01                 ; len=1
+                .WORD       $002E               ; "."
+CFA_DOT:        .WORD       DOT
+
+DICT_DUP:       .WORD       0
+                .WORD       DICT_DROP
+                .WORD       $03
+                .WORD       $5544               ; "DU"
+                .WORD       $0050               ; "P"
+CFA_DUP:        .WORD       DUP
+
+DICT_DROP:      .WORD       0
+                .WORD       DICT_SWAP
+                .WORD       $04
+                .WORD       $5244               ; "DR"
+                .WORD       $504F               ; "OP"
+CFA_DROP:       .WORD       DROP
+
+DICT_SWAP:      .WORD       0
+                .WORD       DICT_OVER
+                .WORD       $04
+                .WORD       $5753               ; "SW"
+                .WORD       $5041               ; "AP"
+CFA_SWAP:       .WORD       SWAP_PRIM
+
+DICT_OVER:      .WORD       0
+                .WORD       DICT_PLUS
+                .WORD       $04
+                .WORD       $564F               ; "OV"
+                .WORD       $5245               ; "ER"
+CFA_OVER:       .WORD       OVER
+
+DICT_PLUS:      .WORD       0
+                .WORD       DICT_MINUS
+                .WORD       $01
+                .WORD       $002B               ; "+"
+CFA_PLUS:       .WORD       PLUS
+
+DICT_MINUS:     .WORD       0
+                .WORD       DICT_STAR
+                .WORD       $01
+                .WORD       $002D               ; "-"
+CFA_MINUS:      .WORD       MINUS
+
+DICT_STAR:      .WORD       0
+                .WORD       DICT_AND
+                .WORD       $01
+                .WORD       $002A               ; "*"
+CFA_STAR:       .WORD       STAR
+
+DICT_AND:       .WORD       0
+                .WORD       DICT_OR
+                .WORD       $03
+                .WORD       $4E41               ; "AN"
+                .WORD       $0044               ; "D"
+CFA_AND:        .WORD       ANDD
+
+DICT_OR:        .WORD       0
+                .WORD       DICT_CR
+                .WORD       $02
+                .WORD       $524F               ; "OR"
+CFA_OR:         .WORD       ORR
+
+DICT_CR:        .WORD       0
+                .WORD       DICT_EMIT
+                .WORD       $02
+                .WORD       $5243               ; "CR"
+CFA_CR:         .WORD       CR
+
+DICT_EMIT:      .WORD       0
+                .WORD       DICT_WORDS
+                .WORD       $04
+                .WORD       $4D45               ; "EM"
+                .WORD       $5449               ; "IT"
+CFA_EMIT:       .WORD       EMIT
+
+DICT_WORDS:     .WORD       0
+                .WORD       DICT_HEX            ; Link to HEX
+                .WORD       $05
+                .WORD       $4F57               ; "WO"
+                .WORD       $4452               ; "RD"
+                .WORD       $0053               ; "S"
+CFA_WORDS:      .WORD       WORDS
+
+DICT_HEX:       .WORD       0
+                .WORD       DICT_DECIMAL
+                .WORD       $03
+                .WORD       $4548               ; "HE"
+                .WORD       $0058               ; "X"
+CFA_HEX:        .WORD       HEX
+
+DICT_DECIMAL:   .WORD       0
+                .WORD       DICT_FETCH          ; Link to @
+                .WORD       $07
+                .WORD       $4544               ; "DE"
+                .WORD       $4943               ; "CI"
+                .WORD       $414D               ; "MA"
+                .WORD       $004C               ; "L"
+CFA_DECIMAL:    .WORD       DECIMAL
+
+DICT_FETCH:     .WORD       0
+                .WORD       DICT_STORE
+                .WORD       $01
+                .WORD       $0040               ; "@"
+CFA_FETCH:      .WORD       FETCH
+
+DICT_STORE:     .WORD       0
+                .WORD       DICT_CFETCH
+                .WORD       $01
+                .WORD       $0021               ; "!"
+CFA_STORE:      .WORD       STORE
+
+DICT_CFETCH:    .WORD       0
+                .WORD       DICT_CSTORE
+                .WORD       $02
+                .WORD       $4043               ; "C@"
+CFA_CFETCH:     .WORD       CFETCH
+
+DICT_CSTORE:    .WORD       0
+                .WORD       DICT_COLON          ; Link to :
+                .WORD       $02
+                .WORD       $2143               ; "C!"
+CFA_CSTORE:     .WORD       CSTORE
+
+DICT_COLON:     .WORD       0
+                .WORD       DICT_SEMI
+                .WORD       $01
+                .WORD       $003A               ; ":"
+CFA_COLON:      .WORD       COLON
+
+DICT_SEMI:      .WORD       0
+                .WORD       DICT_EQU            ; Link to =
+                .WORD       $41                 ; len=1, IMMEDIATE flag ($40)
+                .WORD       $003B               ; ";"
+CFA_SEMI:       .WORD       SEMICOLON
+
+DICT_EQU:       .WORD       0
+                .WORD       DICT_LESS
+                .WORD       $01
+                .WORD       $003D               ; "="
+CFA_EQU:        .WORD       EQU
+
+DICT_LESS:      .WORD       0
+                .WORD       DICT_GREATER
+                .WORD       $01
+                .WORD       $003C               ; "<"
+CFA_LESS:       .WORD       LESS
+
+DICT_GREATER:   .WORD       0
+                .WORD       DICT_ZEQU
+                .WORD       $01
+                .WORD       $003E               ; ">"
+CFA_GREATER:    .WORD       GREATER
+
+DICT_ZEQU:      .WORD       0
+                .WORD       DICT_ZLESS
+                .WORD       $02
+                .WORD       $3D30               ; "0="
+CFA_ZEQU:       .WORD       ZEQU
+
+DICT_ZLESS:     .WORD       0
+                .WORD       DICT_ULESS
+                .WORD       $02
+                .WORD       $3C30               ; "0<"
+CFA_ZLESS:      .WORD       ZLESS
+
+DICT_ULESS:     .WORD       0
+                .WORD       DICT_ONEPLUS
+                .WORD       $02
+                .WORD       $3C55               ; "U<"
+CFA_ULESS:      .WORD       ULESS
+
+DICT_ONEPLUS:   .WORD       0
+                .WORD       DICT_ONEMINUS
+                .WORD       $02
+                .WORD       $2B31               ; "1+"
+CFA_ONEPLUS:    .WORD       ONEPLUS
+
+DICT_ONEMINUS:  .WORD       0
+                .WORD       DICT_TWOSTAR
+                .WORD       $02
+                .WORD       $2D31               ; "1-"
+CFA_ONEMINUS:   .WORD       ONEMINUS
+
+DICT_TWOSTAR:   .WORD       0
+                .WORD       DICT_TWOSLASH
+                .WORD       $02
+                .WORD       $2A32               ; "2*"
+CFA_TWOSTAR:    .WORD       TWOSTAR
+
+DICT_TWOSLASH:  .WORD       0
+                .WORD       DICT_NEGATE
+                .WORD       $02
+                .WORD       $2F32               ; "2/"
+CFA_TWOSLASH:   .WORD       TWOSLASH
+
+DICT_NEGATE:    .WORD       0
+                .WORD       DICT_INVERT
+                .WORD       $06
+                .WORD       $454E               ; "NE"
+                .WORD       $4147               ; "GA"
+                .WORD       $4554               ; "TE"
+CFA_NEGATE:     .WORD       NEGATE
+
+DICT_INVERT:    .WORD       0
+                .WORD       DICT_IF             ; Link to IF
+                .WORD       $06
+                .WORD       $4E49               ; "IN"
+                .WORD       $4556               ; "VE"
+                .WORD       $5452               ; "RT"
+CFA_INVERT:     .WORD       INVERT
+
+DICT_IF:        .WORD       0
+                .WORD       DICT_ELSE
+                .WORD       $42                 ; len=2, IMMEDIATE flag ($40)
+                .WORD       $4649               ; "IF"
+CFA_IF:         .WORD       IFTHEN
+
+DICT_ELSE:      .WORD       0
+                .WORD       DICT_THEN
+                .WORD       $44                 ; len=4, IMMEDIATE flag ($40)
+                .WORD       $4C45               ; "EL"
+                .WORD       $4553               ; "SE"
+CFA_ELSE:       .WORD       ELSETHEN
+
+DICT_THEN:      .WORD       0
+                .WORD       DICT_DO             ; Link to DO
+                .WORD       $44                 ; len=4, IMMEDIATE flag ($40)
+                .WORD       $4854               ; "TH"
+                .WORD       $4E45               ; "EN"
+CFA_THEN:       .WORD       THENTHEN
+
+DICT_DO:        .WORD       0
+                .WORD       DICT_LOOP
+                .WORD       $42                 ; len=2, IMMEDIATE flag ($40)
+                .WORD       $4F44               ; "DO"
+CFA_DO_DICT:    .WORD       DO_COMP
+
+DICT_LOOP:      .WORD       0
+                .WORD       DICT_PLOOP
+                .WORD       $44                 ; len=4, IMMEDIATE flag ($40)
+                .WORD       $4F4C               ; "LO"
+                .WORD       $504F               ; "OP"
+CFA_LOOP_DICT:  .WORD       LOOP_COMP
+
+DICT_PLOOP:     .WORD       0
+                .WORD       DICT_I
+                .WORD       $45                 ; len=5, IMMEDIATE flag ($40)
+                .WORD       $4C2B               ; "+L"
+                .WORD       $4F4F               ; "OO"
+                .WORD       $0050               ; "P"
+CFA_PLOOP_DICT: .WORD       PLOOP_COMP
+
+DICT_I:         .WORD       0
+                .WORD       DICT_J
+                .WORD       $01                 ; len=1
+                .WORD       $0049               ; "I"
+CFA_I:          .WORD       I_WORD
+
+DICT_J:         .WORD       0
+                .WORD       DICT_BEGIN          ; Link to BEGIN
+                .WORD       $01                 ; len=1
+                .WORD       $004A               ; "J"
+CFA_J:          .WORD       J_WORD
+
+DICT_BEGIN:     .WORD       0
+                .WORD       DICT_UNTIL
+                .WORD       $45                 ; len=5, IMMEDIATE flag ($40)
+                .WORD       $4542               ; "BE"
+                .WORD       $4947               ; "GI"
+                .WORD       $004E               ; "N"
+CFA_BEGIN:      .WORD       BEGIN_COMP
+
+DICT_UNTIL:     .WORD       0
+                .WORD       DICT_WHILE
+                .WORD       $45                 ; len=5, IMMEDIATE flag ($40)
+                .WORD       $4E55               ; "UN"
+                .WORD       $4954               ; "TI"
+                .WORD       $004C               ; "L"
+CFA_UNTIL:      .WORD       UNTIL_COMP
+
+DICT_WHILE:     .WORD       0
+                .WORD       DICT_REPEAT
+                .WORD       $45                 ; len=5, IMMEDIATE flag ($40)
+                .WORD       $4857               ; "WH"
+                .WORD       $4C49               ; "IL"
+                .WORD       $0045               ; "E"
+CFA_WHILE:      .WORD       WHILE_COMP
+
+DICT_REPEAT:    .WORD       0
+                .WORD       DICT_TOR            ; Link to >R
+                .WORD       $46                 ; len=6, IMMEDIATE flag ($40)
+                .WORD       $4552               ; "RE"
+                .WORD       $4550               ; "PE"
+                .WORD       $5441               ; "AT"
+CFA_REPEAT:     .WORD       REPEAT_COMP
+
+DICT_TOR:       .WORD       0
+                .WORD       DICT_RFROM
+                .WORD       $02                 ; len=2
+                .WORD       $523E               ; ">R"
+CFA_TOR:        .WORD       TOR
+
+DICT_RFROM:     .WORD       0
+                .WORD       DICT_RFETCH
+                .WORD       $02                 ; len=2
+                .WORD       $3E52               ; "R>"
+CFA_RFROM:      .WORD       RFROM
+
+DICT_RFETCH:    .WORD       0
+                .WORD       DICT_DOTQUOTE       ; Link to ."
+                .WORD       $02                 ; len=2
+                .WORD       $4052               ; "R@"
+CFA_RFETCH:     .WORD       RFETCH
+
+DICT_DOTQUOTE:  .WORD       0
+                .WORD       DICT_VARIABLE       ; Link to VARIABLE
+                .WORD       $42                 ; len=2, IMMEDIATE flag ($40)
+                .WORD       $222E               ; ".""
+CFA_DOTQUOTE_D: .WORD       DOTQUOTE_COMP
+
+DICT_VARIABLE:  .WORD       0
+                .WORD       DICT_CONSTANT
+                .WORD       $08                 ; len=8
+                .WORD       $4156               ; "VA"
+                .WORD       $4952               ; "RI"
+                .WORD       $4241               ; "AB"
+                .WORD       $454C               ; "LE"
+CFA_VARIABLE:   .WORD       VARIABLE_WORD
+
+DICT_CONSTANT:  .WORD       0
+                .WORD       DICT_PAREN          ; Link to (
+                .WORD       $08                 ; len=8
+                .WORD       $4F43               ; "CO"
+                .WORD       $534E               ; "NS"
+                .WORD       $4154               ; "TA"
+                .WORD       $544E               ; "NT"
+CFA_CONSTANT:   .WORD       CONSTANT_WORD
+
+DICT_PAREN:     .WORD       0
+                .WORD       DICT_BACKSLASH
+                .WORD       $41                 ; len=1, IMMEDIATE flag ($40)
+                .WORD       $0028               ; "("
+CFA_PAREN:      .WORD       PAREN_COMMENT
+
+DICT_BACKSLASH: .WORD       0
+                .WORD       DICT_DUMP           ; Link to DUMP
+                .WORD       $41                 ; len=1, IMMEDIATE flag ($40)
+                .WORD       $005C               ; "\"
+CFA_BACKSLASH:  .WORD       BACKSLASH_COMMENT
+
+DICT_DUMP:      .WORD       0
+                .WORD       DICT_QUESTION
+                .WORD       $04                 ; len=4
+                .WORD       $5544               ; "DU"
+                .WORD       $504D               ; "MP"
+CFA_DUMP:       .WORD       DUMP_WORD
+
+DICT_QUESTION:  .WORD       0
+                .WORD       DICT_FILL
+                .WORD       $01                 ; len=1
+                .WORD       $003F               ; "?"
+CFA_QUESTION:   .WORD       QUESTION_WORD
+
+DICT_FILL:      .WORD       0
+                .WORD       DICT_CMOVE
+                .WORD       $04                 ; len=4
+                .WORD       $4946               ; "FI"
+                .WORD       $4C4C               ; "LL"
+CFA_FILL:       .WORD       FILL_WORD
+
+DICT_CMOVE:     .WORD       0
+                .WORD       DICT_DUMPPAGE       ; Link to DUMPPAGE
+                .WORD       $05                 ; len=5
+                .WORD       $4D43               ; "CM"
+                .WORD       $564F               ; "OV"
+                .WORD       $0045               ; "E"
+CFA_CMOVE:      .WORD       CMOVE_WORD
+
+DICT_DUMPPAGE:  .WORD       0
+                .WORD       DICT_PAGE           ; Link to PAGE
+                .WORD       $08                 ; len=8
+                .WORD       $5544               ; "DU"
+                .WORD       $504D               ; "MP"
+                .WORD       $4150               ; "PA"
+                .WORD       $4547               ; "GE"
+CFA_DUMPPAGE:   .WORD       DUMPPAGE_WORD
+
+DICT_PAGE:      .WORD       0
+                .WORD       DICT_CLS            ; Link to CLS
+                .WORD       $04                 ; len=4
+                .WORD       $4150               ; "PA"
+                .WORD       $4547               ; "GE"
+CFA_PAGE:       .WORD       CLS                 ; PAGE clears screen (ANSI)
+
+DICT_CLS:       .WORD       0
+                .WORD       DICT_ROT            ; Link to new entries
+                .WORD       $03                 ; len=3
+                .WORD       $4C43               ; "CL"
+                .WORD       $0053               ; "S"
+CFA_CLS:        .WORD       CLS
+
+; ============================================================================
+; NEW DICTIONARY ENTRIES - Exposing existing primitives
+; ============================================================================
+
+; --- Stack Operations ---
+
+DICT_ROT:       .WORD       0
+                .WORD       DICT_MINUSROT
+                .WORD       $03                 ; len=3
+                .WORD       $4F52               ; "RO"
+                .WORD       $0054               ; "T"
+CFA_ROT:        .WORD       ROT
+
+DICT_MINUSROT:  .WORD       0
+                .WORD       DICT_NIP
+                .WORD       $04                 ; len=4
+                .WORD       $522D               ; "-R"
+                .WORD       $544F               ; "OT"
+CFA_MINUSROT:   .WORD       MINUSROT
+
+DICT_NIP:       .WORD       0
+                .WORD       DICT_TUCK
+                .WORD       $03                 ; len=3
+                .WORD       $494E               ; "NI"
+                .WORD       $0050               ; "P"
+CFA_NIP:        .WORD       NIP
+
+DICT_TUCK:      .WORD       0
+                .WORD       DICT_QDUP
+                .WORD       $04                 ; len=4
+                .WORD       $5554               ; "TU"
+                .WORD       $4B43               ; "CK"
+CFA_TUCK:       .WORD       TUCK
+
+DICT_QDUP:      .WORD       0
+                .WORD       DICT_TWODUP
+                .WORD       $04                 ; len=4
+                .WORD       $443F               ; "?D"
+                .WORD       $5055               ; "UP"
+CFA_QDUP:       .WORD       QDUP
+
+DICT_TWODUP:    .WORD       0
+                .WORD       DICT_TWODROP
+                .WORD       $04                 ; len=4
+                .WORD       $4432               ; "2D"
+                .WORD       $5055               ; "UP"
+CFA_TWODUP:     .WORD       TWODUP
+
+DICT_TWODROP:   .WORD       0
+                .WORD       DICT_TWOSWAP
+                .WORD       $05                 ; len=5
+                .WORD       $4432               ; "2D"
+                .WORD       $4F52               ; "RO"
+                .WORD       $0050               ; "P"
+CFA_TWODROP:    .WORD       TWODROP
+
+DICT_TWOSWAP:   .WORD       0
+                .WORD       DICT_TWOOVER
+                .WORD       $05                 ; len=5
+                .WORD       $5332               ; "2S"
+                .WORD       $4157               ; "WA"
+                .WORD       $0050               ; "P"
+CFA_TWOSWAP:    .WORD       TWOSWAP
+
+DICT_TWOOVER:   .WORD       0
+                .WORD       DICT_PICK
+                .WORD       $05                 ; len=5
+                .WORD       $4F32               ; "2O"
+                .WORD       $4556               ; "VE"
+                .WORD       $0052               ; "R"
+CFA_TWOOVER:    .WORD       TWOOVER
+
+DICT_PICK:      .WORD       0
+                .WORD       DICT_DEPTH
+                .WORD       $04                 ; len=4
+                .WORD       $4950               ; "PI"
+                .WORD       $4B43               ; "CK"
+CFA_PICK:       .WORD       PICK
+
+DICT_DEPTH:     .WORD       0
+                .WORD       DICT_ABS
+                .WORD       $05                 ; len=5
+                .WORD       $4544               ; "DE"
+                .WORD       $5450               ; "PT"
+                .WORD       $0048               ; "H"
+CFA_DEPTH:      .WORD       DEPTH
+
+; --- Math Operations ---
+
+DICT_ABS:       .WORD       0
+                .WORD       DICT_MIN
+                .WORD       $03                 ; len=3
+                .WORD       $4241               ; "AB"
+                .WORD       $0053               ; "S"
+CFA_ABS:        .WORD       ABSS
+
+DICT_MIN:       .WORD       0
+                .WORD       DICT_MAX
+                .WORD       $03                 ; len=3
+                .WORD       $494D               ; "MI"
+                .WORD       $004E               ; "N"
+CFA_MIN:        .WORD       MIN
+
+DICT_MAX:       .WORD       0
+                .WORD       DICT_XOR
+                .WORD       $03                 ; len=3
+                .WORD       $414D               ; "MA"
+                .WORD       $0058               ; "X"
+CFA_MAX:        .WORD       MAX
+
+DICT_XOR:       .WORD       0
+                .WORD       DICT_PLUSSTORE
+                .WORD       $03                 ; len=3
+                .WORD       $4F58               ; "XO"
+                .WORD       $0052               ; "R"
+CFA_XOR:        .WORD       XORR
+
+DICT_PLUSSTORE: .WORD       0
+                .WORD       DICT_SPACE
+                .WORD       $02                 ; len=2
+                .WORD       $212B               ; "+!"
+CFA_PLUSSTORE:  .WORD       PLUSSTORE
+
+; --- I/O Operations ---
+
+DICT_SPACE:     .WORD       0
+                .WORD       DICT_SPACES
+                .WORD       $05                 ; len=5
+                .WORD       $5053               ; "SP"
+                .WORD       $4341               ; "AC"
+                .WORD       $0045               ; "E"
+CFA_SPACE:      .WORD       SPACE
+
+DICT_SPACES:    .WORD       0
+                .WORD       DICT_KEY
+                .WORD       $06                 ; len=6
+                .WORD       $5053               ; "SP"
+                .WORD       $4341               ; "AC"
+                .WORD       $5345               ; "ES"
+CFA_SPACES:     .WORD       SPACES
+
+DICT_KEY:       .WORD       0
+                .WORD       DICT_TYPE
+                .WORD       $03                 ; len=3
+                .WORD       $454B               ; "KE"
+                .WORD       $0059               ; "Y"
+CFA_KEY:        .WORD       KEY
+
+DICT_TYPE:      .WORD       0
+                .WORD       DICT_DOTS
+                .WORD       $04                 ; len=4
+                .WORD       $5954               ; "TY"
+                .WORD       $4550               ; "PE"
+CFA_TYPE:       .WORD       TYPE
+
+DICT_DOTS:      .WORD       0
+                .WORD       DICT_NOTEQ
+                .WORD       $02                 ; len=2
+                .WORD       $532E               ; ".S"
+CFA_DOTS:       .WORD       DOTS
+
+; --- Additional Comparison Operations ---
+
+DICT_NOTEQ:     .WORD       0
+                .WORD       DICT_LESSEQ
+                .WORD       $02                 ; len=2
+                .WORD       $3E3C               ; "<>"
+CFA_NOTEQ:      .WORD       NOTEQ
+
+DICT_LESSEQ:    .WORD       0
+                .WORD       DICT_GREATEQ
+                .WORD       $02                 ; len=2
+                .WORD       $3D3C               ; "<="
+CFA_LESSEQ:     .WORD       LESSEQ
+
+DICT_GREATEQ:   .WORD       0
+                .WORD       DICT_ZGREAT
+                .WORD       $02                 ; len=2
+                .WORD       $3D3E               ; ">="
+CFA_GREATEQ:    .WORD       GREATEQ
+
+DICT_ZGREAT:    .WORD       0
+                .WORD       DICT_UGREAT
+                .WORD       $02                 ; len=2
+                .WORD       $3E30               ; "0>"
+CFA_ZGREAT:     .WORD       ZGREAT
+
+DICT_UGREAT:    .WORD       0
+                .WORD       DICT_HERE
+                .WORD       $02                 ; len=2
+                .WORD       $3E55               ; "U>"
+CFA_UGREAT:     .WORD       UGREAT
+
+; === NEW WORDS v2.18 ===
+
+DICT_HERE:      .WORD       0
+                .WORD       DICT_ALLOT
+                .WORD       $04                 ; len=4
+                .WORD       $4548               ; "HE"
+                .WORD       $4552               ; "RE"
+CFA_HERE:       .WORD       HERE_WORD
+
+DICT_ALLOT:     .WORD       0
+                .WORD       DICT_COMMA
+                .WORD       $05                 ; len=5
+                .WORD       $4C41               ; "AL"
+                .WORD       $4F4C               ; "LO"
+                .WORD       $0054               ; "T"
+CFA_ALLOT:      .WORD       ALLOT_WORD
+
+DICT_COMMA:     .WORD       0
+                .WORD       DICT_CCOMMA
+                .WORD       $01                 ; len=1
+                .WORD       $002C               ; ","
+CFA_COMMA:      .WORD       COMMA_WORD
+
+DICT_CCOMMA:    .WORD       0
+                .WORD       DICT_EXECUTE
+                .WORD       $02                 ; len=2
+                .WORD       $2C43               ; "C,"
+CFA_CCOMMA:     .WORD       CCOMMA_WORD
+
+DICT_EXECUTE:   .WORD       0
+                .WORD       DICT_SLASH
+                .WORD       $07                 ; len=7
+                .WORD       $5845               ; "EX"
+                .WORD       $4345               ; "EC"
+                .WORD       $5455               ; "UT"
+                .WORD       $0045               ; "E"
+CFA_EXECUTE:    .WORD       EXECUTE_WORD
+
+DICT_SLASH:     .WORD       0
+                .WORD       DICT_MOD
+                .WORD       $01                 ; len=1
+                .WORD       $002F               ; "/"
+CFA_SLASH:      .WORD       SLASH_WORD
+
+DICT_MOD:       .WORD       0
+                .WORD       DICT_SLASHMOD
+                .WORD       $03                 ; len=3
+                .WORD       $4F4D               ; "MO"
+                .WORD       $0044               ; "D"
+CFA_MOD:        .WORD       MOD_WORD
+
+DICT_SLASHMOD:  .WORD       0
+                .WORD       DICT_AGAIN
+                .WORD       $04                 ; len=4
+                .WORD       $4D2F               ; "/M"
+                .WORD       $444F               ; "OD"
+CFA_SLASHMOD:   .WORD       SLASHMOD_WORD
+
+; === NEW WORDS v2.19 ===
+
+DICT_AGAIN:     .WORD       0
+                .WORD       DICT_RECURSE
+                .WORD       $45                 ; len=5, IMMEDIATE ($40)
+                .WORD       $4741               ; "AG"
+                .WORD       $4941               ; "AI"
+                .WORD       $004E               ; "N"
+CFA_AGAIN:      .WORD       AGAIN_COMP
+
+DICT_RECURSE:   .WORD       0
+                .WORD       DICT_LBRACKET
+                .WORD       $47                 ; len=7, IMMEDIATE ($40)
+                .WORD       $4552               ; "RE"
+                .WORD       $5543               ; "CU"
+                .WORD       $5352               ; "RS"
+                .WORD       $0045               ; "E"
+CFA_RECURSE:    .WORD       RECURSE_COMP
+
+DICT_LBRACKET:  .WORD       0
+                .WORD       DICT_RBRACKET
+                .WORD       $41                 ; len=1, IMMEDIATE ($40)
+                .WORD       $005B               ; "["
+CFA_LBRACKET:   .WORD       LBRACKET_COMP
+
+DICT_RBRACKET:  .WORD       0
+                .WORD       DICT_LITERAL
+                .WORD       $01                 ; len=1
+                .WORD       $005D               ; "]"
+CFA_RBRACKET:   .WORD       RBRACKET_WORD
+
+DICT_LITERAL:   .WORD       0
+                .WORD       DICT_TICK
+                .WORD       $47                 ; len=7, IMMEDIATE ($40)
+                .WORD       $494C               ; "LI"
+                .WORD       $4554               ; "TE"
+                .WORD       $4152               ; "RA"
+                .WORD       $004C               ; "L"
+CFA_LITERAL:    .WORD       LITERAL_COMP
+
+DICT_TICK:      .WORD       0
+                .WORD       DICT_BRACKETTICK
+                .WORD       $01                 ; len=1
+                .WORD       $0027               ; "'"
+CFA_TICK:       .WORD       TICK_WORD
+
+DICT_BRACKETTICK: .WORD     0
+                .WORD       DICT_FORGET
+                .WORD       $43                 ; len=3, IMMEDIATE ($40)
+                .WORD       $275B               ; "['"
+                .WORD       $005D               ; "]"
+CFA_BRACKETTICK: .WORD      BRACKETTICK_COMP
+
+DICT_FORGET:    .WORD       0
+                .WORD       0                   ; End of chain
+                .WORD       $06                 ; len=6
+                .WORD       $4F46               ; "FO"
+                .WORD       $4752               ; "RG"
+                .WORD       $5445               ; "ET"
+CFA_FORGET:     .WORD       FORGET_WORD
+
+; ============================================================================
+; END
+; ============================================================================
