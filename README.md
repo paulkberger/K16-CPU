@@ -136,7 +136,7 @@ The K16 prioritizes:
 K/OS Forth is a complete Forth implementation running natively on the K16:
 - Indirect Threaded Code (ITC) interpreter
 - 17-cycle inner interpreter with sentinel-based execution
-- 86+ built-in words
+- 102+ built-in words
 - Uses XY1 as IP, XY2 as data stack, XY3 as return stack
 - MULB-based fast multiplication
 
@@ -150,7 +150,7 @@ K/OS Forth is a complete Forth implementation running natively on the K16:
 
 - Hardware design validated in Digital simulator
 - Microcode generator and assembler implemented in Pascal/Delphi
-- K/OS Forth interpreter complete with 86 words
+- K/OS Forth interpreter complete with 102 words
 - Documentation and test suites in active development
 
 ## License
