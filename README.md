@@ -40,17 +40,27 @@ ROM outputs feed into 4× 74x283 TTL adders for carry propagation. This hybrid a
 
 | Range | Size | Description |
 |-------|------|-------------|
-| $00_0000 - $0F_FFFF | 1MB | Program ROM |
-| $10_0000 - $1F_FFFF | 1MB | Lookup Table ROM |
-| $20_0000 - $7F_FFFF | 6MB | RAM |
-| $FF_0000 - $FF_FFFF | 64KB | Memory-Mapped I/O |
+| $00_0000 - $00_FFFF | 64KB | Page 00: Zero Page & Stack |
+| $01_0000 - $1F_FFFF | ~2MB | RAM (currently installed) |
+| $20_0000 - $BF_FFFF | 10MB | RAM (expansion space) |
+| $C0_0000 - $DF_FFFF | 2MB | I/O Space |
+| $E0_0000 - $EF_FFFF | 1MB | ROM: Lookup Tables (Bank 1) |
+| $F0_0000 - $FB_FFFF | 768KB | ROM: Lookup Tables (Bank 2) |
+| $FC_0000 - $FE_FFFF | 192KB | ROM: Program Code |
+| $FF_0000 - $FF_FFFF | 64KB | ROM: Boot Code & Reset Vector |
+
+**Reset Vector:** CPU starts execution at $FF_0000
+
+**I/O Addresses:**
+- $C0_0000: Keyboard input (word)
+- $D0_0000: Terminal output (byte)
 
 ### Lookup Tables
 
-The K16 extends the ROM-based philosophy to complex operations via dedicated lookup table memory. Operations like shifts, rotates, byte swaps, and multiplication use 64K-word lookup tables accessed in 4 cycles:
+The K16 extends the ROM-based philosophy to complex operations via dedicated lookup table memory. Operations like shifts, rotates, byte swaps, and multiplication use 64K-word lookup tables accessed in 3 cycles:
 
 ```asm
-SHL D0          ; Shift left via lookup (4 cycles)
+SHL D0          ; Shift left via lookup (3 cycles)
 MULB D1         ; 8×8 multiply via lookup
 RECIP D2        ; Reciprocal approximation
 ```
