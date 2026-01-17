@@ -1,6 +1,6 @@
-# K/OS Forth v2.20 Manual
+# K/OS Forth v2.22 Manual
 
-**Version:** 2.20  
+**Version:** 2.22  
 **Date:** January 2026  
 **Platform:** K16 CPU Architecture
 
@@ -11,11 +11,35 @@
 K/OS Forth is a complete Forth implementation for the K16 CPU architecture, featuring:
 - 24-bit address space (16MB)
 - Indirect Threaded Code (ITC) interpreter
-- 102 built-in words
+- 105 built-in words
 - Optimized inner interpreter (17 cycles) with sentinel-based execution
 - Zero page variables for fast access (3 cycles vs 7 cycles)
 - MULB-based fast multiplication
 - Full signed comparison branch set (BLT, BGT, BGE, BLE)
+- Interrupt support with EINT/DINT/TICKS words
+- Automatic RAM detection at startup
+
+### Startup
+
+On power-up or reset, K/OS Forth displays:
+
+```
+K/OS - Forth v2.22
+Page 00 Memory Map
+Interrupts Disabled
+RAM: 128KB
+> 
+```
+
+The system:
+1. Disables interrupts (DINT)
+2. Initializes stacks and zero page variables
+3. Sets up interrupt vector at $000000
+4. Detects installed RAM (tests pages $01-$BF)
+5. Displays banner and RAM size
+6. Enters the interpreter loop (QUIT)
+
+Use `EINT` to enable interrupts if timer functionality is needed.
 
 ---
 
@@ -34,21 +58,36 @@ Forth uses these registers as follows:
 | XY0 | Scratch / CFA carrier from NEXT |
 | XY1 | IP (Instruction Pointer) - points to next thread cell |
 | XY2 | Data Stack Pointer (DSP) - grows downward |
-| XY3 | Return Stack Pointer (RSP) - grows downward, Y3=$20 enables zero page |
+| XY3 | Return Stack Pointer (RSP) - grows downward, Y3=$00 enables zero page |
 
 **Important:** XY1 (IP) must be preserved by all primitives except those that legitimately manipulate the instruction pointer (DOCOL, EXIT, LIT, BRANCH, etc.).
 
 ### Memory Map
 
 ```
-Page $00: ROM (Forth kernel code + built-in dictionary)
-Page $20: RAM (Stack segment / Zero Page)
-  $20:0100 - Zero page variables (Forth system)
-  $20:0800 - TIB (Terminal Input Buffer, 128 bytes)
-  $20:0880 - Word parse buffer (128 bytes)
-  $20:8000 - User dictionary area (grows upward)
-  $20:EFFE - Return stack top (grows downward, ~4K)
-  $20:FFFE - Data stack top (grows downward, ~4K)
+Page $00: RAM (Zero Page / Stack segment)
+  $00:0000 - Interrupt vector (4 bytes)
+  $00:0100 - Zero page variables (Forth system)
+  $00:0800 - TIB (Terminal Input Buffer, 128 bytes)
+  $00:0880 - Word parse buffer (128 bytes)
+  $00:EFFE - Return stack top (grows downward, ~56K)
+  $00:FFFE - Data stack top (grows downward, ~4K)
+
+Page $01+: RAM (User area)
+  $01:0000 - User dictionary area (grows upward)
+
+Page $C0: I/O
+  $C0:0000 - Keyboard input
+
+Page $D0: I/O
+  $D0:0000 - Terminal output
+
+Page $E0-$FB: Lookup tables (ROM)
+
+Page $FC-$FE: Program ROM
+
+Page $FF: Boot ROM
+  $FF:0000 - Reset vector, Forth kernel, built-in dictionary
 ```
 
 ### Zero Page Variables
@@ -57,6 +96,7 @@ System variables are accessed via `LOADP/STOREP` with Y3, saving 4 cycles per ac
 
 | Offset | Name | Description |
 |--------|------|-------------|
+| $0000 | INT_VECTOR | Interrupt vector (24-bit: Y at $0000, X at $0002) |
 | $0100 | ZP_LATEST | Dictionary head (24-bit: Y at $0100, X at $0102) |
 | $0104 | ZP_HERE | Next free byte (24-bit: Y at $0104, X at $0106) |
 | $0108 | ZP_STATE | 0 = interpreting, 1 = compiling |
@@ -66,6 +106,7 @@ System variables are accessed via `LOADP/STOREP` with Y3, saving 4 cycles per ac
 | $0110 | ZP_SAVED_LATEST | Error recovery (24-bit) |
 | $0116 | ZP_DUMPPAGE | Memory page for DUMP/FILL/CMOVE |
 | $0118 | ZP_EXEC_RET | Interpreter return address |
+| $011A | ZP_TICKS | System tick counter (60Hz, IRQ7) |
 | $0120 | ZP_CALL_BUF | Call buffer (8 bytes) |
 
 ---
@@ -227,7 +268,7 @@ All comparison words return a flag: TRUE = $FFFF (-1), FALSE = $0000
 | `,` | ( n -- ) | Compile 16-bit value to dictionary |
 | `C,` | ( c -- ) | Compile byte to dictionary |
 
-**Note:** All memory words operate on RAM page ($20). Address is 16-bit offset.
+**Note:** Memory words `@`, `!`, `C@`, `C!` operate on RAM page (default $00 for zero page, $01+ for user data). Use `DUMPPAGE` to set the page for `DUMP`, `FILL`, and `CMOVE`.
 
 ### Input/Output
 
@@ -245,6 +286,16 @@ All comparison words return a flag: TRUE = $FFFF (-1), FALSE = $0000
 | `WORDS` | ( -- ) | List dictionary (80-col wrapped) |
 | `PAGE` | ( -- ) | Clear screen (ANSI standard) |
 | `CLS` | ( -- ) | Clear screen (alias) |
+
+### Interrupts
+
+| Word | Stack Effect | Description |
+|------|--------------|-------------|
+| `EINT` | ( -- ) | Enable interrupts |
+| `DINT` | ( -- ) | Disable interrupts |
+| `TICKS` | ( -- n ) | Get system tick counter (60Hz) |
+
+**Note:** Interrupts are disabled by default at startup. Use `EINT` to enable the timer interrupt (IRQ7) which increments TICKS at 60Hz.
 
 ### Number Base
 
@@ -587,9 +638,9 @@ Or just use the built-in `.S`:
     LOOP DROP ;
 
 HEX
-$20 DUMPPAGE !
-$8000 100 pattern
-$8000 100 DUMP
+1 DUMPPAGE !           \ Set to page $01 (user RAM)
+$0000 100 pattern
+$0000 100 DUMP
 ```
 
 ### Star Pattern
@@ -650,7 +701,7 @@ On error, the system returns to the interpreter prompt `>`.
 
 ### ISA Optimizations
 
-K/OS Forth v2.20 uses several K16 ISA features:
+K/OS Forth v2.22 uses several K16 ISA features:
 
 | Feature | Benefit |
 |---------|---------|
@@ -665,11 +716,11 @@ K/OS Forth v2.20 uses several K16 ISA features:
 
 ### Zero Page Variables
 
-System variables use Y3=$20 as implicit page register:
+System variables use Y3=$00 as implicit page register:
 
 ```asm
 ; Old method (7 cycles, burns Y0)
-LOADI   Y0, #$20
+LOADI   Y0, #$00
 LOADP   D0, Y0, [#$0108]
 
 ; New method (3 cycles, Y0 free)
@@ -755,6 +806,8 @@ MEMORY:   @ ! C@ C! HERE ALLOT , C,
 I/O:      EMIT KEY CR SPACE SPACES . .S ." TYPE
           WORDS PAGE CLS HEX DECIMAL
 
+INTERRUPT: EINT DINT TICKS
+
 CONTROL:  IF ELSE THEN
           DO LOOP +LOOP I J
           BEGIN UNTIL AGAIN WHILE REPEAT
@@ -774,15 +827,16 @@ MONITOR:  DUMP ? FILL CMOVE DUMPPAGE
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.20 |
-| Dictionary words | 102 |
-| Code size | ~4370 lines |
+| Version | 2.22 |
+| Dictionary words | 105 |
+| Code size | ~4500 lines |
 | NEXT cycles | 17 |
 | Variable access | 3 cycles (zero page) |
 | Multiply cycles | ~50 |
-| Data stack | ~4K (at $20FFFE, grows down) |
-| Return stack | ~4K (at $20EFFE, grows down) |
+| Data stack | ~4K (at $00FFFE, grows down) |
+| Return stack | ~56K (at $00EFFE, grows down) |
 | TIB | 128 bytes |
+| User dictionary | Page $01+ (12MB available) |
 
 ---
 
@@ -802,6 +856,39 @@ MONITOR:  DUMP ? FILL CMOVE DUMPPAGE
 | 2.18 | Jan 2026 | Division (`/` `MOD` `/MOD`), dictionary words, `EXECUTE` (94 words) |
 | 2.19 | Jan 2026 | `RECURSE` `[` `]` `LITERAL` `'` `[']` `FORGET` `AGAIN` (102 words) |
 | 2.20 | Jan 2026 | Zero page variables, new stack layout ($20FFFE/$20EFFE) |
+| 2.21 | Jan 2026 | Timer interrupt support (IRQ7), EINT/DINT/TICKS words |
+| 2.22 | Jan 2026 | New memory map (Page $00), RAM detection, interrupts disabled by default |
+
+### v2.22 Changes in Detail
+
+**Startup:**
+- Interrupts disabled by default (use `EINT` to enable)
+- Automatic RAM detection displays installed memory
+- Banner shows "Interrupts Disabled"
+
+**Memory Layout (Page $00):**
+- Zero page/stacks moved from $20xxxx to $00xxxx
+- Y3 = $00 (was $20)
+- Data stack: $00FFFE (was $20FFFE)
+- Return stack: $00EFFE (was $20EFFE)
+- User dictionary: $010000+ (page $01, was $208000)
+- Interrupt vector at $000000
+
+**I/O Changes:**
+- Terminal output: $D00000 (was $E00000)
+- Keyboard input: $C00000 (unchanged)
+
+**ROM Location:**
+- Forth kernel and dictionary at page $FF
+- Reset vector at $FF0000
+
+### v2.21 Changes in Detail
+
+**Interrupt Support:**
+- IRQ7 timer interrupt at 60Hz increments ZP_TICKS
+- `EINT` word enables interrupts
+- `DINT` word disables interrupts
+- `TICKS` word reads system tick counter
 
 ### v2.20 Changes in Detail
 
@@ -822,5 +909,5 @@ MONITOR:  DUMP ? FILL CMOVE DUMPPAGE
 
 ---
 
-*K/OS Forth v2.20 - A Forth for the K16 CPU Architecture*  
+*K/OS Forth v2.22 - A Forth for the K16 CPU Architecture*  
 *January 2026*

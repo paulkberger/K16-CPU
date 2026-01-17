@@ -1,6 +1,6 @@
 # K16 Reference Manual
 
-Version 2.5 — January 12, 2026
+Version 2.7 — January 17, 2026
 
 ---
 
@@ -23,11 +23,20 @@ The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based l
 
 | Address Range | Size | Description |
 |---------------|------|-------------|
-| $00_0000 - $0F_FFFF | 1MB | ROM Bank 0 (Program ROM) |
-| $10_0000 - $1F_FFFF | 1MB | ROM Bank 1 (Lookup Tables) |
-| $20_0000 - $7F_FFFF | 6MB | RAM Banks 0-5 |
-| $80_0000 - $EF_FFFF | 7MB | Reserved/Expansion |
-| $FF_0000 - $FF_FFFF | 64KB | Memory-Mapped I/O |
+| $00_0000 - $00_FFFF | 64KB | Page 00: Zero Page & Stack |
+| $01_0000 - $1F_FFFF | ~2MB | RAM (currently installed) |
+| $20_0000 - $BF_FFFF | 10MB | RAM (expansion space) |
+| $C0_0000 - $DF_FFFF | 2MB | I/O Space |
+| $E0_0000 - $EF_FFFF | 1MB | ROM: Lookup Tables (Bank 1) |
+| $F0_0000 - $FB_FFFF | 768KB | ROM: Lookup Tables (Bank 2) |
+| $FC_0000 - $FE_FFFF | 192KB | ROM: Program Code |
+| $FF_0000 - $FF_FFFF | 64KB | ROM: Boot Code & Reset Vector |
+
+**Reset Vector:** CPU starts execution at $FF_0000 after reset.
+
+**I/O Addresses:**
+- $C0_0000: Keyboard input (word)
+- $D0_0000: Terminal output (byte)
 
 ### 1.3 Opcode Map
 
@@ -193,7 +202,28 @@ Sets the assembly address. The address must be even (K16 is word-aligned). If no
 .ORG $1000       ; Continue assembly at $1000
 ```
 
-### 4.2 .EQU — Define Constant
+### 4.2 .BASE — Set Image Base Address
+
+Sets the base address for the output binary image. This determines how assembly addresses map to file offsets: `file_offset = assembly_address - base_address`.
+
+Used when creating ROM images that will be loaded at a specific address. Without .BASE, the file offset equals the assembly address.
+
+```asm
+.BASE $F00000             ; ROM image base address
+.ORG $FF0000              ; Reset vector - CPU starts here
+```
+
+In this example, code at $FF0000 appears at file offset $F0000 (= $FF0000 - $F00000).
+
+**Typical ROM image setup:**
+```asm
+.BASE $F00000             ; 1MB ROM starts at $F00000
+.ORG $FF0000              ; CPU reset vector
+Start:
+    LOADI D0, #0          ; First instruction at file offset $F0000
+```
+
+### 4.3 .EQU — Define Constant
 
 Defines a symbolic constant. Supports expressions and 24-bit values ($000000-$FFFFFF).
 
@@ -205,7 +235,7 @@ Defines a symbolic constant. Supports expressions and 24-bit values ($000000-$FF
 .EQU VIDEO_RAM, $0F0000             ; 24-bit address
 ```
 
-### 4.3 .WORD — Define Data Word
+### 4.4 .WORD — Define Data Word
 
 Emits one or more 16-bit data words. Supports expressions and symbols.
 
@@ -215,30 +245,40 @@ Emits one or more 16-bit data words. Supports expressions and symbols.
 .WORD LABEL + 4          ; Expression
 ```
 
-### 4.4 .TEXT — Define String
+### 4.5 .TEXT — Define String
 
-Emits ASCII text as packed words (2 characters per word), null-terminated. If the string has odd length, it is padded with a null byte to maintain word alignment.
+Emits ASCII text as packed words (2 characters per word). Strings are NOT automatically null-terminated. Two ways to add a null terminator:
+- Use `\0` escape inside the string: `.TEXT "Hello\0"`
+- Add `, 0` after the string: `.TEXT "Hello", 0`
+
+If total byte count is odd, a null byte is added for word alignment (but this is padding, not a terminator).
 
 ```asm
-.TEXT "Hello"            ; 3 words: "He", "ll", "o\0"
-.TEXT "Hi"               ; 2 words: "Hi", "\0\0" (padded)
+.TEXT "Hello\0"           ; 3 words: "He", "ll", "o\0" (null-terminated)
+.TEXT "Hello", 0          ; Same result
+.TEXT "Hi", 0             ; 2 words: "Hi", "\0\0" (null + pad)
+.TEXT "AB"                ; 1 word: "AB" (no terminator, word-aligned)
+.TEXT "ABC"               ; 2 words: "AB", "C\0" (pad for alignment only)
 ```
 
 **Escape Sequences:**
 
 | Escape | Character |
 |--------|-----------|
+| `\0` | Null (NUL) |
 | `\n` | Newline (LF) |
 | `\r` | Carriage Return (CR) |
 | `\t` | Tab |
 | `\\` | Backslash |
 | `\"` | Double Quote |
+| `\xHH` | Hex byte |
 
 ```asm
-.TEXT "Line 1\nLine 2"   ; String with embedded newline
-.TEXT "Tab:\tValue"      ; String with tab
-.TEXT "Say \"Hi\""       ; String with embedded quotes
-.TEXT "C:\\PATH\\FILE"   ; String with backslashes
+.TEXT "Line 1\nLine 2\0"  ; String with embedded newline
+.TEXT "Tab:\tValue", 0    ; String with tab
+.TEXT "Say \"Hi\"\0"      ; String with embedded quotes
+.TEXT "C:\\PATH\\FILE", 0 ; String with backslashes
+.TEXT "\x1B[2J", 0        ; ANSI escape sequence
 ```
 
 ---
@@ -882,22 +922,22 @@ Shift, rotate, and byte manipulation operations implemented via ROM lookup table
 
 **Lookup Table Pages:**
 
-| Mnemonic | Page | Operation |
-|----------|------|-----------|
-| SHL4 | $04 | Shift left 4 bits (×16) |
-| SHR4 | $06 | Shift right 4 bits (÷16 unsigned) |
-| ASR4 | $08 | Arithmetic shift right 4 (÷16 signed) |
-| ASR8 | $0A | Arithmetic shift right 8 (÷256 signed) |
-| MULB | $0C | Multiply hi byte × lo byte |
-| RECIP | $0E | Reciprocal (65536 ÷ D) |
-| SHL | $10 | Shift left 1 bit (×2) |
-| SHR | $12 | Shift right 1 bit (÷2 unsigned) |
-| ASR | $14 | Arithmetic shift right 1 (÷2 signed) |
-| ROL | $16 | Rotate left through carry |
-| ROR | $18 | Rotate right through carry |
-| SWAPB | $1A | Byte swap ($1234 → $3412) |
-| HIGH | $1C | Extract high byte (D >> 8) |
-| LOW | $1E | Extract low byte (D AND $00FF) |
+| Mnemonic | Page | Address Range | Operation |
+|----------|------|---------------|-----------|
+| SHL | $E0 | $E0_0000-$E1_FFFF | Shift left 1 bit (×2) |
+| SHR | $E2 | $E2_0000-$E3_FFFF | Shift right 1 bit (÷2 unsigned) |
+| ASR | $E4 | $E4_0000-$E5_FFFF | Arithmetic shift right 1 (÷2 signed) |
+| ROL | $E6 | $E6_0000-$E7_FFFF | Rotate left through carry |
+| ROR | $E8 | $E8_0000-$E9_FFFF | Rotate right through carry |
+| SWAPB | $EA | $EA_0000-$EB_FFFF | Byte swap ($1234 → $3412) |
+| HIGH | $EC | $EC_0000-$ED_FFFF | Extract high byte (D >> 8) |
+| LOW | $EE | $EE_0000-$EF_FFFF | Extract low byte (D AND $00FF) |
+| SHR4 | $F0 | $F0_0000-$F1_FFFF | Shift right 4 bits (÷16 unsigned) |
+| SHL4 | $F2 | $F2_0000-$F3_FFFF | Shift left 4 bits (×16) |
+| ASR4 | $F4 | $F4_0000-$F5_FFFF | Arithmetic shift right 4 (÷16 signed) |
+| ASR8 | $F6 | $F6_0000-$F7_FFFF | Arithmetic shift right 8 (÷256 signed) |
+| MULB | $F8 | $F8_0000-$F9_FFFF | Multiply hi byte × lo byte |
+| RECIP | $FA | $FA_0000-$FB_FFFF | Reciprocal (65536 ÷ D) |
 
 ```asm
 SHL D0                  ; D0 ← D0 × 2
@@ -909,7 +949,8 @@ LOW D0                  ; D0 ← low byte ($1234 → $0034)
 SHL4 D0                 ; D0 ← D0 × 16
 MULB D0                 ; D0 ← hi_byte(D0) × lo_byte(D0)
 RECIP D0                ; D0 ← 65536 / D0
-LOOKUP D0, #$20         ; Custom table at page $20 (RAM)
+LOOKUP D0, #$E0         ; Same as SHL D0
+LOOKUP D0, #$10         ; Custom table at page $10 (RAM)
 ```
 
 ### 6.6 Compare
@@ -1241,50 +1282,42 @@ Traditional indexed access requires loading a base address into an XY pair befor
 
 **Savings:** 3 cycles per load (50% faster), plus XY registers remain free for other work.
 
-### 8.2 Memory Map (Page $20)
+### 8.2 Memory Map (Page $00)
 
-The stack segment at page $20 is organized for both stack operations and zero page variables:
+The stack segment at page $00 is organized for both stack operations and zero page variables:
 
 | Address Range | Offset | Size | Purpose |
 |---------------|--------|------|---------|
-| $20_0000-$20_0003 | $0000 | 4 bytes | Interrupt vector |
-| $20_0004-$20_00FF | $0004 | 252 bytes | System variables |
-| $20_0100-$20_017F | $0100 | 128 bytes | Forth interpreter reserved |
-| $20_0180-$20_01FF | $0180 | 128 bytes | Pascal/compiler reserved |
-| $20_0200-$20_0FFF | $0200 | ~3.5KB | Application zero page |
-| $20_1000-$20_7FFF | $1000 | ~28KB | User dictionary / heap |
-| $20_8000-$20_EFFF | $8000 | ~28KB | Free / expansion |
-| $20_F000-$20_FFFF | $F000 | 4KB | Stack space (grows down) |
+| $00_0000-$00_0003 | $0000 | 4 bytes | Interrupt vector |
+| $00_0004-$00_00FF | $0004 | 252 bytes | System variables |
+| $00_0100-$00_017F | $0100 | 128 bytes | Forth interpreter reserved |
+| $00_0180-$00_01FF | $0180 | 128 bytes | Pascal/compiler reserved |
+| $00_0200-$00_0FFF | $0200 | ~3.5KB | Application zero page |
+| $00_1000-$00_FFFF | $1000 | ~60KB | Stack space (grows down) |
 
 ### 8.3 Stack Layout
 
 ```
-$20FFFE ─┬─ Data stack top (XY2)
-         │  Data stack grows DOWN
-$20F000 ─┼─ 
+$00FFFF ─┬─ Stack top (XY3 initialized to $00:FFF0)
+         │  Stack grows DOWN
+$00F000 ─┼─ 
+         │  ~60KB stack space
+$001000 ─┼─
          │
-$20EFFE ─┬─ Return stack top (XY3)
-         │  Return stack grows DOWN
-$20E000 ─┼─
-         │  
-$208000 ─┼─ User dictionary (HERE)
-         │  Dictionary grows UP (~24KB)
-$201000 ─┼─
-         │
-$200FFF ─┼─ Application ZP top
+$000FFF ─┼─ Application ZP top
          │  Application variables (~3.5KB)
-$200200 ─┼─ Application ZP base
+$000200 ─┼─ Application ZP base
          │
-$2001FF ─┼─ Pascal/compiler (128 bytes)
-$200180 ─┼─
+$0001FF ─┼─ Pascal/compiler (128 bytes)
+$000180 ─┼─
          │
-$20017F ─┼─ Forth reserved (128 bytes)
-$200100 ─┼─
+$00017F ─┼─ Forth reserved (128 bytes)
+$000100 ─┼─
          │
-$2000FF ─┼─ System variables (~252 bytes)
-$200004 ─┼─
+$0000FF ─┼─ System variables (~252 bytes)
+$000004 ─┼─
          │
-$200000 ─┴─ Interrupt vector (4 bytes)
+$000000 ─┴─ Interrupt vector (4 bytes)
 ```
 
 ### 8.4 Accessing Zero Page Variables
@@ -1298,11 +1331,11 @@ Use LOADP/STOREP with Y3 as the page register:
 .EQU ZP_TEMP,       $0204
 
 ; Load from zero page (3 cycles)
-LOADP   D0, Y3, [#ZP_COUNTER]   ; D0 ← [$20:0200]
-LOADP   D1, Y3, [#ZP_FLAGS]     ; D1 ← [$20:0202]
+LOADP   D0, Y3, [#ZP_COUNTER]   ; D0 ← [$00:0200]
+LOADP   D1, Y3, [#ZP_FLAGS]     ; D1 ← [$00:0202]
 
 ; Store to zero page (5 cycles)
-STOREP  D0, Y3, [#ZP_TEMP]      ; [$20:0204] ← D0
+STOREP  D0, Y3, [#ZP_TEMP]      ; [$00:0204] ← D0
 
 ; Byte access (3 cycles load, 5 cycles store)
 LOADPB  D0, Y3, [#ZP_FLAGS]     ; Load byte, zero-extended
@@ -1375,20 +1408,19 @@ Organize by usage frequency — place most-used variables at lower addresses:
 .EQU ZP_SUM,       $0202
 .EQU ZP_PTR_X,     $0204
 .EQU ZP_PTR_Y,     $0206
+.EQU SYS_TICKS,    $0004
 
 ;=====================================================
-; Program Code
+; Program Code (in ROM)
 ;=====================================================
-        .ORG    $010000
+        .ORG    $FF0000
 
 START:
-        ; Initialize stacks (Y3=$20 enables ZP access)
-        LOADI   X2, #$FFFE
-        LOADI   Y2, #$20
-        LOADI   X3, #$EFFE
-        LOADI   Y3, #$20
+        ; Initialize stack (Y3=$00 enables ZP access)
+        LOADI   X3, #$FFF0
+        LOADI   Y3, #$00
         
-        ; Setup interrupt vector
+        ; Setup interrupt vector at $000000
         LOADI   D0, #>ISR
         STOREP  D0, Y3, [#$0000]
         LOADI   D0, #<ISR
@@ -1682,9 +1714,10 @@ Symbol Table:
 | Directive | Usage |
 |-----------|-------|
 | .ORG | `.ORG address` — Set assembly origin |
+| .BASE | `.BASE address` — Set ROM image base address |
 | .EQU | `.EQU symbol, value` — Define constant |
 | .WORD | `.WORD value [,value...]` — Emit data words |
-| .TEXT | `.TEXT "string"` — Emit ASCII string |
+| .TEXT | `.TEXT "string"` — Emit ASCII string (use `\0` or `, 0` for null terminator) |
 
 ---
 
@@ -1694,23 +1727,40 @@ This example demonstrates C-style calling conventions, parameter passing, stack 
 
 ```asm
 ;===============================================================
-; K16 Hex Dump Routine - C-style calling convention
-; Parameters pushed right-to-left, callee cleanup via RET #nw
+; K16 HexDump - Sample Program
 ; 
-; Version: 2.1 (December 4, 2025)
-; Status: 16 bytes per line, 16-byte aligned addresses
+; Demonstrates:
+;   - Stack-based parameter passing (C calling convention)
+;   - 24-bit address arithmetic
+;   - Memory-mapped I/O
+;   - Byte-level memory access
+;   - Subroutine calls with callee cleanup
+; 
+; Version: 3.1 (January 2026)
+; Updated for new memory map:
+;   - Reset vector at $FF0000
+;   - Stack/ZP at page $00
+;   - Terminal I/O at $D00000
 ;===============================================================
 
-                .ORG        $000000
-                .EQU        STACK,    $220000
-                .EQU        TERMINAL, $E00000
+;---------------------------------------------------------------
+; Memory Map Constants
+;---------------------------------------------------------------
+                .EQU        TERMINAL, $D00000   ; Terminal output
 
 ;---------------------------------------------------------------
-; Entry point
+; Program Code - ROM at $FF0000 (reset vector)
+;---------------------------------------------------------------
+                .BASE       $F00000             ; ROM image base address
+                .ORG        $FF0000             ; Reset vector - CPU starts here
+
+;---------------------------------------------------------------
+; Entry point (reset vector)
 ;---------------------------------------------------------------
 Start:
-                LOADI       X3, #<STACK
-                LOADI       Y3, #>STACK
+                ; Initialize stack pointer
+                LOADI       X3, #$FFF0
+                LOADI       Y3, #$00
 
                 ; Call HexDump(start_low, start_high, end_low, end_high)
                 ; Push right-to-left: param4 first, param1 last
@@ -1730,7 +1780,7 @@ Start:
 ;              uint16 end_low, uint8 end_high)
 ;
 ; Output format (16 bytes per line, 16-byte aligned):
-;   AAAA00: XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX  ................
+;   AAAAAA: XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX  ................
 ;
 ; Stack frame at entry:
 ;   [X3+0]  = return address high
@@ -1757,24 +1807,24 @@ HexDump:
                 LOADY       Y0, [XY3 + #10]     ; start_high
                 
                 ; Align X0 down to 16-byte boundary
-                MOVE        D0, X0
-                AND         X0, D0, #$FFF0
+                AND         X0, #$FFF0
                 
-                ; Load end address into XY2
-                LOADX       X2, [XY3 + #12]     ; end_low
-                LOADY       Y2, [XY3 + #14]     ; end_high
+                ; Load end address into D2/D3 (can't use XY2 easily)
+                LOADD       D2, [XY3 + #12]     ; end_low
+                LOADD       D3, [XY3 + #14]     ; end_high
 
 .line_loop:
-                ; Check if done (XY0 >= XY2)
-                CMP         Y0, Y2
-                BCC         .do_line            ; Y0 < Y2, continue
-                BNE         .exit               ; Y0 > Y2, done
-                CMP         X0, X2
-                BCS         .exit               ; X0 >= X2, done
+                ; Check if done (Y0:X0 >= D3:D2)
+                CMP         Y0, D3
+                BCC         .do_line            ; Y0 < D3, continue
+                BNE         .exit               ; Y0 > D3, done
+                CMP         X0, D2
+                BCS         .exit               ; X0 >= D2, done
 
 .do_line:
-                ; Save X0 at start of line for ASCII column later
+                ; Save current address for ASCII column
                 PUSH        X0, XY3
+                PUSH        Y0, XY3
                 
                 ; Print address "AAAAAA: "
                 PUSH        Y0, XY3
@@ -1787,16 +1837,16 @@ HexDump:
                 LOADI       D0, #$20            ; ' '
                 STOREB      D0, [XY1]
 
-                ; D3 = bytes printed this line (0-15)
-                LOADI       D3, #0
+                ; Use stack to track byte count (push initial 0)
+                PUSH        #0, XY3             ; byte counter
 
 .byte_loop:
-                ; Check if at end address (XY0 >= XY2)
-                CMP         Y0, Y2
-                BCC         .print_byte         ; Y0 < Y2, continue
-                BNE         .finish_line        ; Y0 > Y2, done
-                CMP         X0, X2
-                BCS         .finish_line        ; X0 >= X2, done
+                ; Check if at end address
+                CMP         Y0, D3
+                BCC         .print_byte         ; Y0 < D3, continue
+                BNE         .finish_line        ; Y0 > D3, done with data
+                CMP         X0, D2
+                BCS         .finish_line        ; X0 >= D2, done with data
 
 .print_byte:
                 ; Get byte from memory
@@ -1810,42 +1860,45 @@ HexDump:
                 LOADI       D0, #$20
                 STOREB      D0, [XY1]
                 
-                ; Extra space after byte 7 (middle separator)
-                CMP         D3, #7
+                ; Check byte counter for middle separator (after byte 7)
+                LOADD       D0, [XY3]           ; get counter from stack top
+                CMP         D0, #7
                 BNE         .no_mid_space
-                LOADI       D0, #$20
-                STOREB      D0, [XY1]
+                LOADI       D1, #$20
+                STOREB      D1, [XY1]
 .no_mid_space:
                 
-                ; Increment current address
+                ; Increment current address (24-bit)
                 ADD         X0, #1
                 ADC         Y0, #0
                 
-                ; Increment byte counter and check if line full
-                ADD         D3, #1
-                CMP         D3, #16             ; 16 bytes per line
+                ; Increment byte counter on stack
+                LOADD       D0, [XY3]
+                ADD         D0, #1
+                STORED      D0, [XY3]
+                
+                CMP         D0, #16             ; 16 bytes per line
                 BCC         .byte_loop
 
 .finish_line:
-                ; D3 = bytes actually printed on this line (1-16)
-                MOVE        D2, D3              ; Save byte count for ASCII loop
+                ; Get bytes printed from stack (don't pop yet - need for ASCII)
+                LOADD       D0, [XY3]           ; D0 = bytes printed
                 
                 ; Pad remaining positions with spaces if line incomplete
 .pad_loop:
-                CMP         D3, #16
+                CMP         D0, #16
                 BCS         .print_ascii
                 ; Print "   " (3 spaces for missing "XX ")
-                LOADI       D0, #$20
-                STOREB      D0, [XY1]
-                STOREB      D0, [XY1]
-                STOREB      D0, [XY1]
+                LOADI       D1, #$20
+                STOREB      D1, [XY1]
+                STOREB      D1, [XY1]
+                STOREB      D1, [XY1]
                 ; Extra space at position 7 for middle separator
-                CMP         D3, #7
+                CMP         D0, #7
                 BNE         .no_pad_mid
-                LOADI       D0, #$20
-                STOREB      D0, [XY1]
+                STOREB      D1, [XY1]
 .no_pad_mid:
-                ADD         D3, #1
+                ADD         D0, #1
                 BRA         .pad_loop
 
 .print_ascii:
@@ -1854,18 +1907,24 @@ HexDump:
                 STOREB      D0, [XY1]
                 STOREB      D0, [XY1]
                 
-                ; Restore X0 to line start
-                POP         X0, XY3
+                ; Get byte count, then restore line start address
+                POP         D0, XY3             ; byte count -> D0
+                POP         Y0, XY3             ; restore Y0
+                POP         X0, XY3             ; restore X0
                 
-                ; Print D2 ASCII characters
-                LOADI       D3, #0
+                ; D0 = number of ASCII characters to print
+                LOADI       D1, #0              ; D1 = ASCII counter
+                
 .ascii_loop:
-                CMP         D3, D2
+                CMP         D1, D0
                 BCS         .print_newline
                 
                 ; Get byte from memory
+                PUSH        D0, XY3             ; save byte count
+                PUSH        D1, XY3             ; save counter
                 LOADB       D0, [XY0]
                 ADD         X0, #1
+                ADC         Y0, #0
                 
                 ; Check if printable ($20-$7E)
                 CMP         D0, #$20
@@ -1878,7 +1937,9 @@ HexDump:
                 
 .print_char:
                 STOREB      D0, [XY1]
-                ADD         D3, #1
+                POP         D1, XY3             ; restore counter
+                POP         D0, XY3             ; restore byte count
+                ADD         D1, #1
                 BRA         .ascii_loop
 
 .print_newline:
@@ -1889,64 +1950,60 @@ HexDump:
 .exit:
                 POP         D3, XY3
                 POP         D2, XY3
-                RET         #4w
+                RET         #4w                 ; cleanup 8 bytes (4 params)
 
 ;---------------------------------------------------------------
 ; PrintHexWord - Print 16-bit value as 4 hex digits
 ;---------------------------------------------------------------
+; void PrintHexWord(uint16 value)
+; Stack: [X3+4] = value
+;---------------------------------------------------------------
 PrintHexWord:
                 LOADD       D0, [XY3 + #4]
                 
-                ; D1 = D0 >> 8 (high byte via repeated subtraction)
-                LOADI       D1, #0
-.div256_loop:
-                CMP         D0, #256
-                BCC         .div256_done
-                SUB         D0, #256
-                ADD         D1, #1
-                BRA         .div256_loop
-.div256_done:
-                ; D1 = high byte, D0 = low byte
-                PUSH        D0, XY3
-                
-                PUSH        D1, XY3
-                CALL        PrintHexByte
-                
-                POP         D0, XY3
+                ; Use HIGH lookup to get high byte
+                PUSH        D0, XY3             ; save original
+                HIGH        D0                  ; D0 = high byte
                 PUSH        D0, XY3
                 CALL        PrintHexByte
                 
-                RET         #1w
+                ; Get low byte
+                POP         D0, XY3             ; restore original
+                AND         D0, #$FF            ; mask to low byte
+                PUSH        D0, XY3
+                CALL        PrintHexByte
+                
+                RET         #1w                 ; cleanup 2 bytes
 
 ;---------------------------------------------------------------
 ; PrintHexByte - Print byte value as 2 hex digits
+;---------------------------------------------------------------
+; void PrintHexByte(uint8 value)
+; Stack: [X3+4] = value (only low 8 bits used)
 ;---------------------------------------------------------------
 PrintHexByte:
                 LOADD       D0, [XY3 + #4]
                 AND         D0, #$FF
                 
-                ; D1 = high nibble, D0 = low nibble (via division by 16)
-                LOADI       D1, #0
-.div16_loop:
-                CMP         D0, #16
-                BCC         .div16_done
-                SUB         D0, #16
-                ADD         D1, #1
-                BRA         .div16_loop
-.div16_done:
-                PUSH        D0, XY3
-                MOVE        D0, D1
+                ; Use SHR4 lookup for high nibble
+                PUSH        D0, XY3             ; save original
+                SHR4        D0                  ; D0 = high nibble
                 CALL        NibbleToAscii
                 STOREB      D0, [XY1]
                 
+                ; Get low nibble
                 POP         D0, XY3
+                AND         D0, #$0F
                 CALL        NibbleToAscii
                 STOREB      D0, [XY1]
                 
-                RET         #1w
+                RET         #1w                 ; cleanup 2 bytes
 
 ;---------------------------------------------------------------
 ; NibbleToAscii - Convert 0-15 in D0 to ASCII '0'-'F'
+;---------------------------------------------------------------
+; Input: D0 = nibble (0-15)
+; Output: D0 = ASCII character ('0'-'9' or 'A'-'F')
 ;---------------------------------------------------------------
 NibbleToAscii:
                 CMP         D0, #10
@@ -1962,20 +2019,22 @@ NibbleToAscii:
 ; Test data to dump
 ;---------------------------------------------------------------
 DumpStart:
-                .TEXT       "Hello, World!\n"
-                .TEXT       "K16 HexDump v2.1"
+                .TEXT       "Hello, World!\n", 0
+                .TEXT       "K16 HexDump v3.1", 0
                 .WORD       $0000, $1234, $5678, $9ABC
                 .WORD       $DEF0, $FFFF, $CAFE, $BABE
 DumpEnd:
 ```
 
 **Key patterns demonstrated:**
-- Stack initialization with 24-bit address using `#<` and `#>` operators
+- `.BASE` directive for ROM image base address
+- Stack initialization at page $00 (Y3=$00, X3=$FFF0)
 - C-style calling convention (parameters pushed right-to-left)
 - Callee cleanup with `RET #4w` (8 bytes = 4 parameters)
 - Local labels with `.` prefix for scope
 - Register preservation (push/pop D2, D3)
 - 24-bit address comparison using Y then X registers
+- LOOKUP operations (`HIGH`, `SHR4`) for byte/nibble extraction
 - Byte-level memory access with `LOADB`/`STOREB`
 - Memory-mapped I/O (terminal output via `STOREB D0, [XY1]`)
 
@@ -2001,6 +2060,8 @@ DumpEnd:
 | 2.3 | January 10, 2026 | Added Section 9: Zero Page Programming (memory map, stack layout, variable allocation, LOADP/STOREP usage); renumbered sections 9-12 → 10-13 |
 | 2.4 | January 10, 2026 | Fixed Zero Page cycle counts (LOADP=3, not 1); reorganized sections: Byte Operations→7, Zero Page→8, Special Features→9, Expression Evaluation→10 |
 | 2.5 | January 12, 2026 | Fixed Scc conditions in opcode map to match Branch (SLT/SGT/SGE/SLE, not SMI/SPL/SAL) |
+| 2.6 | January 17, 2026 | Updated memory map: RAM at $00-$BF, I/O at $C0-$DF, ROM at $E0-$FF; reset vector $FF0000; Zero Page now page $00; LOOKUP tables at $E0-$FA |
+| 2.7 | January 17, 2026 | Added .BASE directive; clarified .TEXT requires explicit `, 0` for null termination; updated Appendix A sample |
 
 ---
 
