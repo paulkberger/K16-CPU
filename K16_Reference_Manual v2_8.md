@@ -1,6 +1,6 @@
 # K16 Reference Manual
 
-Version 2.7 — January 17, 2026
+Version 2.8 — January 18, 2026
 
 ---
 
@@ -228,11 +228,11 @@ Start:
 Defines a symbolic constant. Supports expressions and 24-bit values ($000000-$FFFFFF).
 
 ```asm
-.EQU BUFFER_SIZE, 256
-.EQU HEADER, 16
-.EQU TOTAL, BUFFER_SIZE + HEADER    ; Expression
-.EQU WORDS, 8w                      ; Word suffix (= 16)
-.EQU VIDEO_RAM, $0F0000             ; 24-bit address
+BUFFER_SIZE  .EQU    256
+HEADER       .EQU    16
+TOTAL        .EQU    BUFFER_SIZE + HEADER    ; Expression
+WORDS        .EQU    8w                      ; Word suffix (= 16)
+VIDEO_RAM    .EQU    $0F0000                 ; 24-bit address
 ```
 
 ### 4.4 .WORD — Define Data Word
@@ -1326,9 +1326,9 @@ Use LOADP/STOREP with Y3 as the page register:
 
 ```asm
 ; Define zero page variable locations
-.EQU ZP_COUNTER,    $0200
-.EQU ZP_FLAGS,      $0202
-.EQU ZP_TEMP,       $0204
+ZP_COUNTER   .EQU    $0200
+ZP_FLAGS     .EQU    $0202
+ZP_TEMP      .EQU    $0204
 
 ; Load from zero page (3 cycles)
 LOADP   D0, Y3, [#ZP_COUNTER]   ; D0 ← [$00:0200]
@@ -1347,32 +1347,32 @@ STOREPB D0, Y3, [#ZP_FLAGS]     ; Store low byte only
 #### System Variables ($0000-$00FF)
 
 ```asm
-.EQU INT_VECTOR_PAGE,  $0000    ; ISR page (required)
-.EQU INT_VECTOR_ADDR,  $0002    ; ISR address (required)
-.EQU SYS_TICKS,        $0004    ; System tick counter
-.EQU SYS_FLAGS,        $0006    ; System status flags
+INT_VECTOR_PAGE  .EQU    $0000       ; ISR page (required)
+INT_VECTOR_ADDR  .EQU    $0002       ; ISR address (required)
+SYS_TICKS        .EQU    $0004       ; System tick counter
+SYS_FLAGS        .EQU    $0006       ; System status flags
 ```
 
 #### Forth Interpreter ($0100-$017F)
 
 ```asm
-.EQU ZP_LATEST,        $0100    ; Dictionary head (Y)
-.EQU ZP_LATEST_X,      $0102    ; Dictionary head (X)
-.EQU ZP_HERE,          $0104    ; Next free byte (Y)
-.EQU ZP_HERE_X,        $0106    ; Next free byte (X)
-.EQU ZP_STATE,         $0108    ; Compile state (0=interpret)
-.EQU ZP_TOIN,          $010A    ; >IN parse position
-.EQU ZP_NUMTIB,        $010C    ; #TIB character count
-.EQU ZP_BASE,          $010E    ; Number base (default 10)
+ZP_LATEST    .EQU    $0100           ; Dictionary head (Y)
+ZP_LATEST_X  .EQU    $0102           ; Dictionary head (X)
+ZP_HERE      .EQU    $0104           ; Next free byte (Y)
+ZP_HERE_X    .EQU    $0106           ; Next free byte (X)
+ZP_STATE     .EQU    $0108           ; Compile state (0=interpret)
+ZP_TOIN      .EQU    $010A           ; >IN parse position
+ZP_NUMTIB    .EQU    $010C           ; #TIB character count
+ZP_BASE      .EQU    $010E           ; Number base (default 10)
 ```
 
 #### Pascal/Compiler Runtime ($0180-$01FF)
 
 ```asm
-.EQU PAS_FRAME,        $0180    ; Frame pointer backup
-.EQU PAS_HEAP,         $0182    ; Heap pointer
-.EQU PAS_TEMP1,        $0184    ; Expression temporary 1
-.EQU PAS_TEMP2,        $0186    ; Expression temporary 2
+PAS_FRAME    .EQU    $0180           ; Frame pointer backup
+PAS_HEAP     .EQU    $0182           ; Heap pointer
+PAS_TEMP1    .EQU    $0184           ; Expression temporary 1
+PAS_TEMP2    .EQU    $0186           ; Expression temporary 2
 ```
 
 ### 8.6 Application Variables ($0200-$0FFF)
@@ -1381,21 +1381,21 @@ Organize by usage frequency — place most-used variables at lower addresses:
 
 ```asm
 ; High-frequency variables
-.EQU APP_COUNT,        $0200    ; Loop counter
-.EQU APP_TEMP_A,       $0202    ; Temporary A
-.EQU APP_TEMP_B,       $0204    ; Temporary B
-.EQU APP_RESULT,       $0206    ; Result
+APP_COUNT    .EQU    $0200           ; Loop counter
+APP_TEMP_A   .EQU    $0202           ; Temporary A
+APP_TEMP_B   .EQU    $0204           ; Temporary B
+APP_RESULT   .EQU    $0206           ; Result
 
 ; 24-bit pointers (stored as Y at offset, X at offset+2)
-.EQU APP_PTR1_Y,       $0300    ; Pointer 1 page
-.EQU APP_PTR1_X,       $0302    ; Pointer 1 offset
+APP_PTR1_Y   .EQU    $0300           ; Pointer 1 page
+APP_PTR1_X   .EQU    $0302           ; Pointer 1 offset
 
 ; Application state
-.EQU APP_MODE,         $0400    ; Current mode
-.EQU APP_STATUS,       $0402    ; Status flags
+APP_MODE     .EQU    $0400           ; Current mode
+APP_STATUS   .EQU    $0402           ; Status flags
 
 ; Buffers and arrays
-.EQU APP_BUFFER,       $0500    ; 256-byte work buffer
+APP_BUFFER   .EQU    $0500           ; 256-byte work buffer
 ```
 
 ### 8.7 Example: Complete Program
@@ -1404,16 +1404,17 @@ Organize by usage frequency — place most-used variables at lower addresses:
 ;=====================================================
 ; Zero Page Definitions
 ;=====================================================
-.EQU ZP_COUNT,     $0200
-.EQU ZP_SUM,       $0202
-.EQU ZP_PTR_X,     $0204
-.EQU ZP_PTR_Y,     $0206
-.EQU SYS_TICKS,    $0004
+ZP_COUNT     .EQU    $0200
+ZP_SUM       .EQU    $0202
+ZP_PTR_X     .EQU    $0204
+ZP_PTR_Y     .EQU    $0206
+SYS_TICKS    .EQU    $0004
 
 ;=====================================================
 ; Program Code (in ROM)
 ;=====================================================
-        .ORG    $FF0000
+             .BASE   $F00000
+             .ORG    $FF0000
 
 START:
         ; Initialize stack (Y3=$00 enables ZP access)
@@ -1472,7 +1473,7 @@ The 'w' suffix multiplies a value by 2, converting word counts to byte counts. U
 LOADI D0, #4w           ; = 8 (4 words × 2)
 LOADD D0, [XY0+#3w]     ; offset = 6 bytes
 RET #2w                 ; cleanup 4 bytes (2 words)
-.EQU STRUCT_SIZE, 8w    ; = 16 bytes
+STRUCT_SIZE  .EQU   8w  ; = 16 bytes
 LOADI D0, #10 + 2w      ; = 14 (10 + 4)
 ```
 
@@ -1488,7 +1489,7 @@ The K16 uses 24-bit addresses but registers are 8-bit (Y) or 16-bit (X). These o
 **Loading a 24-bit address into an XY pair:**
 
 ```asm
-.EQU BUFFER, $12AB34
+BUFFER       .EQU    $12AB34
 
 LOADI Y1, #>BUFFER      ; Y1 = $12 (high byte)
 LOADI X1, #<BUFFER      ; X1 = $AB34 (low word)
@@ -1500,8 +1501,8 @@ LOADD D0, [XY1]         ; Access data at BUFFER
 **Multiple pointers:**
 
 ```asm
-.EQU VIDEO_RAM, $0F0000
-.EQU ROM_TABLE, $FF8000
+VIDEO_RAM    .EQU    $0F0000
+ROM_TABLE    .EQU    $FF8000
 
 ; Load video pointer into XY0
 LOADI Y0, #>VIDEO_RAM   ; Y0 = $0F
@@ -1532,11 +1533,11 @@ The assembler supports arithmetic expressions in immediate values, .EQU directiv
 ### 10.2 Examples
 
 ```asm
-.EQU SIZE, 256
-.EQU HEADER, 16
-.EQU TOTAL, SIZE + HEADER           ; = 272
-.EQU HALF, SIZE / 2                 ; = 128
-.EQU COMPLEX, (SIZE - HEADER) / 2   ; = 120
+SIZE         .EQU    256
+HEADER       .EQU    16
+TOTAL        .EQU    SIZE + HEADER           ; = 272
+HALF         .EQU    SIZE / 2                ; = 128
+COMPLEX      .EQU    (SIZE - HEADER) / 2     ; = 120
 
 LOADI D0, #SIZE + 4                 ; = 260
 LOADI D1, #(TOTAL / 4)              ; = 68
@@ -1715,7 +1716,7 @@ Symbol Table:
 |-----------|-------|
 | .ORG | `.ORG address` — Set assembly origin |
 | .BASE | `.BASE address` — Set ROM image base address |
-| .EQU | `.EQU symbol, value` — Define constant |
+| .EQU | `SYMBOL .EQU value` — Define constant |
 | .WORD | `.WORD value [,value...]` — Emit data words |
 | .TEXT | `.TEXT "string"` — Emit ASCII string (use `\0` or `, 0` for null terminator) |
 
@@ -1746,13 +1747,13 @@ This example demonstrates C-style calling conventions, parameter passing, stack 
 ;---------------------------------------------------------------
 ; Memory Map Constants
 ;---------------------------------------------------------------
-                .EQU        TERMINAL, $D00000   ; Terminal output
+TERMINAL     .EQU        $D00000             ; Terminal output
 
 ;---------------------------------------------------------------
 ; Program Code - ROM at $FF0000 (reset vector)
 ;---------------------------------------------------------------
-                .BASE       $F00000             ; ROM image base address
-                .ORG        $FF0000             ; Reset vector - CPU starts here
+             .BASE       $F00000             ; ROM image base address
+             .ORG        $FF0000             ; Reset vector - CPU starts here
 
 ;---------------------------------------------------------------
 ; Entry point (reset vector)
@@ -2062,6 +2063,7 @@ DumpEnd:
 | 2.5 | January 12, 2026 | Fixed Scc conditions in opcode map to match Branch (SLT/SGT/SGE/SLE, not SMI/SPL/SAL) |
 | 2.6 | January 17, 2026 | Updated memory map: RAM at $00-$BF, I/O at $C0-$DF, ROM at $E0-$FF; reset vector $FF0000; Zero Page now page $00; LOOKUP tables at $E0-$FA |
 | 2.7 | January 17, 2026 | Added .BASE directive; clarified .TEXT requires explicit `, 0` for null termination; updated Appendix A sample |
+| 2.8 | January 18, 2026 | Converted all .EQU examples to symbol-first format (`SYMBOL .EQU value`) |
 
 ---
 
