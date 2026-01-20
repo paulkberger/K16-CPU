@@ -24,7 +24,7 @@ When opening **K16 CPU.dig**  Digital automatically loads the following files in
 - **ProgramLOW.hex**
 
 
-It is <u>important </u>that these files are located in the same directory as **K16 CPU. dig**
+It is <u>important </u>that these files are located in the same directory as **K16 CPU.dig**
 
 
 
