@@ -15,6 +15,7 @@ When opening **K16 CPU.dig**  Digital automatically loads the following files in
 - **ALU0.hex**
 - **ALU1.hex**
 - **ALU2.hex**
+- **ALU3.hex**
 - **CONTROL0.hex**
 - **CONTROL1.hex**
 - **LOOKUP_LO.hex**
