@@ -1,4 +1,4 @@
-# How to getting the K16 CPU running.
+# How to get the K16 CPU up and running.
 
 
 
