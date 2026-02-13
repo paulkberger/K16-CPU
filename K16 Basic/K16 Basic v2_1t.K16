@@ -1,0 +1,4115 @@
+; ============================================================================
+; K16 BASIC v2.1t - Tokenized Integer BASIC Interpreter
+; ============================================================================
+; Based on K16 BASIC v2.0. Tokenized for performance and memory efficiency.
+;
+; New in v2.1t:
+;   Input tokenization: keywords replaced with single-byte tokens ($80+)
+;   JMPT-based statement dispatch (11 cycles vs ~100+ for string matching)
+;   Token-based operator parsing (OR, AND, XOR, NOT, MOD, <=, >=, <>)
+;   Token-based function dispatch (ABS, RND, SGN, etc.)
+;   Detokenizer for LIST output
+;   Compound operators (<=, >=, <>) tokenized at input time
+;
+; Features (from v2.0):
+;   String variables A$-Z$ with descriptor-based storage
+;   String functions: LEFT$, RIGHT$, MID$, LEN(), CHR$(), ASC(),
+;                     STR$(), VAL(), HEX$()
+;   Arrays: DIM A(n), integer arrays A()-Z()
+;   DATA/READ/RESTORE
+;   IF/THEN/ELSE
+;   ON expr GOTO/GOSUB line1,line2,...
+;   DEEK/DOKE (word PEEK/POKE)
+;   CLR command (clear variables, keep program)
+;   Shift-subtract division (faster)
+;   MOD operator
+;   XOR operator in expressions
+;
+; Retained from v1.0:
+;   LET, PRINT, INPUT, IF/THEN, GOTO, GOSUB/RETURN,
+;   FOR/NEXT/STEP, END, STOP, REM, NEW, LIST, RUN,
+;   PEEK, POKE, ABS(), RND(), SGN(), NOT,
+;   Operators: + - * / MOD AND OR XOR = <> < > <= >=
+;   26 integer variables A-Z, line numbers 1-65534
+;
+; Memory Map:
+;   Page $00: $0000-$00FF  Vectors + zero page
+;             $0100-$03FF  System variables, stacks, descriptors
+;             $0400-$04FF  Input buffer (256 bytes)
+;             $0500-$05FF  Temp string buffer (256 bytes)
+;             $0600-$7FFF  Array storage (grows up from $0600)
+;             $8000-$FEFF  String pool (grows DOWN from $FEFF)
+;             $FF00-$FFFE  System stack
+;   Page $01: $0000-$FFFF  BASIC program storage
+;   $C00000  Keyboard input
+;   $D00000  Terminal output
+;   $FF0000  Boot ROM (reset vector)
+;
+; Register Conventions:
+;   XY3 - System stack pointer (Y3=$00)
+;   XY0 - Scratch / I/O pointer
+;   XY1 - Scratch pointer
+;   D0-D3 - General purpose
+;
+; Program Line Format:
+;   [2 bytes: line number][text bytes...][0x00 NUL][pad to even]
+;   End of program: line number = $0000
+;
+; String Descriptor (4 bytes):
+;   [2: length][2: pointer in page $00]
+;
+; Array Descriptor (4 bytes):
+;   [2: dimension (max index+1)][2: base pointer in page $00]
+;
+; ============================================================================
+
+.BASE $F00000
+.ORG $FF0000
+
+                BRA         MAIN
+
+; ============================================================================
+; CONFIGURATION
+; ============================================================================
+
+TERMINAL    .EQU    $D00000
+KEYBOARD    .EQU    $C00000
+RAM_PAGE    .EQU    $00
+PROG_PAGE   .EQU    $01
+
+SSTACK_TOP  .EQU    $FFFE
+TIB_OFFSET  .EQU    $0400
+TIB_SIZE    .EQU    250
+TMPSTR_BUF  .EQU    $0500
+TMPSTR2_BUF .EQU    $0580               ; second temp buf for concat safety
+ARRAY_BASE  .EQU    $0600
+STRPOOL_TOP .EQU    $FEFE
+
+; ============================================================================
+; ZERO PAGE VARIABLES
+; ============================================================================
+
+ZP_RUNNING  .EQU    $0100
+ZP_CURLINE  .EQU    $0102
+ZP_TXTPOS   .EQU    $0104
+ZP_PROGEND  .EQU    $0106
+ZP_LINENUM  .EQU    $0108
+ZP_RNDSEED  .EQU    $010A
+ZP_RUNSP    .EQU    $010C
+ZP_GOSUBSP  .EQU    $010E
+GOSUB_MAX   .EQU    16
+ZP_GOSUBSTK .EQU    $0200               ; 16 entries x 4 bytes -> $0200-$023F
+ZP_FORSP    .EQU    $0110
+FOR_MAX     .EQU    8
+ZP_FORSTK   .EQU    $0240               ; 8 entries x 10 bytes -> $0240-$028F
+FOR_ENTRY   .EQU    10
+ZP_VARS     .EQU    $0150               ; A-Z integers (52 bytes -> $0150-$0183)
+
+; New in v2.0
+ZP_STRVARS  .EQU    $0190               ; A$-Z$ descriptors (26x4=104 -> $0190-$01F7)
+ZP_ARRAYS   .EQU    $0290               ; A()-Z() descriptors (26x4=104 -> $0290-$02F7)
+ZP_STRPOOL  .EQU    $0300               ; String pool bottom pointer
+ZP_ARRTOP   .EQU    $0302               ; Array storage top pointer
+ZP_DATALINE .EQU    $0304               ; DATA line offset
+ZP_DATAPOS  .EQU    $0306               ; DATA position within line
+ZP_TMPLEN   .EQU    $0308               ; Temp string length
+ZP_TMPPTR   .EQU    $030A               ; Temp string pointer
+INT_VECTOR  .EQU    $0000
+
+; ============================================================================
+; STRING CONSTANTS
+; ============================================================================
+
+BANNER:     .TEXT   "K16 BASIC v2.1t", $0A, 0
+STR_READY:  .TEXT   "Ready.", $0A, 0
+STR_PROMPT: .TEXT   "> ", 0
+STR_SYNERR: .TEXT   "Syntax error", 0
+STR_DIVERR: .TEXT   "Division by zero", 0
+STR_GOSERR: .TEXT   "GOSUB stack", 0
+STR_FORERR: .TEXT   "FOR stack", 0
+STR_LINERR: .TEXT   "Line not found", 0
+STR_RETERR: .TEXT   "RETURN without GOSUB", 0
+STR_NXTERR: .TEXT   "NEXT without FOR", 0
+STR_MEMERR: .TEXT   "Out of memory", 0
+STR_INLN:   .TEXT   " in line ", 0
+STR_BREAK:  .TEXT   "Break", 0
+STR_QUEST:  .TEXT   "? ", 0
+STR_DIMERR: .TEXT   "Bad DIM", 0
+STR_SUBERR: .TEXT   "Subscript error", 0
+STR_DATERR: .TEXT   "Out of DATA", 0
+STR_TYPERR: .TEXT   "Type mismatch", 0
+STR_BYTES:  .TEXT   " bytes free", $0A, 0
+
+; ============================================================================
+; TOKEN DEFINITIONS
+; Byte tokens $80+ replace keyword strings. Saves memory, enables JMPT dispatch.
+; ============================================================================
+
+; --- Statement tokens (dispatchable via JMPT) ---
+TOK_PRINT   .EQU    $80
+TOK_INPUT   .EQU    $81
+TOK_RESTORE .EQU    $82
+TOK_RETURN  .EQU    $83
+TOK_GOSUB   .EQU    $84
+TOK_GOTO    .EQU    $85
+TOK_FOR     .EQU    $86
+TOK_NEXT    .EQU    $87
+TOK_READ    .EQU    $88
+TOK_DATA    .EQU    $89
+TOK_DIM     .EQU    $8A
+TOK_DOKE    .EQU    $8B
+TOK_POKE    .EQU    $8C
+TOK_LIST    .EQU    $8D
+TOK_LET     .EQU    $8E
+TOK_IF      .EQU    $8F
+TOK_ON      .EQU    $90
+TOK_END     .EQU    $91
+TOK_STOP    .EQU    $92
+TOK_CLR     .EQU    $93
+TOK_REM     .EQU    $94
+TOK_NEW     .EQU    $95
+TOK_RUN     .EQU    $96
+TOK_LAST_STMT .EQU  $96             ; last dispatchable statement token
+
+; --- Secondary keywords (matched inline, not dispatched) ---
+TOK_THEN    .EQU    $97
+TOK_TO      .EQU    $98
+TOK_STEP    .EQU    $99
+TOK_ELSE    .EQU    $9A
+
+; --- Operators ---
+TOK_AND     .EQU    $9B
+TOK_OR      .EQU    $9C
+TOK_XOR     .EQU    $9D
+TOK_NOT     .EQU    $9E
+TOK_MOD     .EQU    $9F
+
+; --- Comparison operators ---
+TOK_LE      .EQU    $A0             ; <=
+TOK_GE      .EQU    $A1             ; >=
+TOK_NE      .EQU    $A2             ; <>
+
+; --- Numeric functions ---
+TOK_ABS     .EQU    $A3
+TOK_ASC     .EQU    $A4
+TOK_RND     .EQU    $A5
+TOK_SGN     .EQU    $A6
+TOK_PEEK    .EQU    $A7
+TOK_DEEK    .EQU    $A8
+TOK_LEN     .EQU    $A9
+TOK_VAL     .EQU    $AA
+
+; --- String functions ---
+TOK_CHRS    .EQU    $AB             ; CHR$
+TOK_STRS    .EQU    $AC             ; STR$
+TOK_HEXS    .EQU    $AD             ; HEX$
+TOK_LEFTS   .EQU    $AE             ; LEFT$
+TOK_RIGHTS  .EQU    $AF             ; RIGHT$
+TOK_MIDS    .EQU    $B0             ; MID$
+
+TOK_COUNT   .EQU    $31             ; $B0 - $80 + 1 = 49 tokens
+
+; ============================================================================
+; TOKEN STRING TABLE (for tokenizer matching and LIST detokenization)
+; Longer keywords MUST come first to avoid prefix ambiguity.
+; Format: .TEXT $token, "KEYWORD", 0  ... .TEXT 0 = end
+; ============================================================================
+
+TOK_TABLE:
+                ; Statement keywords (longer matches first)
+                .TEXT   $82, "RESTORE", 0
+                .TEXT   $83, "RETURN", 0
+                .TEXT   $80, "PRINT", 0
+                .TEXT   $81, "INPUT", 0
+                .TEXT   $84, "GOSUB", 0
+                .TEXT   $85, "GOTO", 0
+                .TEXT   $87, "NEXT", 0
+                .TEXT   $88, "READ", 0
+                .TEXT   $89, "DATA", 0
+                .TEXT   $8B, "DOKE", 0
+                .TEXT   $8C, "POKE", 0
+                .TEXT   $8D, "LIST", 0
+                .TEXT   $99, "STEP", 0
+                .TEXT   $92, "STOP", 0
+                .TEXT   $97, "THEN", 0
+                .TEXT   $9A, "ELSE", 0
+                .TEXT   $86, "FOR", 0
+                .TEXT   $8A, "DIM", 0
+                .TEXT   $8E, "LET", 0
+                .TEXT   $95, "NEW", 0
+                .TEXT   $96, "RUN", 0
+                .TEXT   $93, "CLR", 0
+                .TEXT   $94, "REM", 0
+                .TEXT   $91, "END", 0
+                .TEXT   $9E, "NOT", 0
+                .TEXT   $9B, "AND", 0
+                .TEXT   $9D, "XOR", 0
+                .TEXT   $9F, "MOD", 0
+                .TEXT   $8F, "IF", 0
+                .TEXT   $90, "ON", 0
+                .TEXT   $9C, "OR", 0
+                .TEXT   $98, "TO", 0
+                ; Numeric functions
+                .TEXT   $A7, "PEEK", 0
+                .TEXT   $A8, "DEEK", 0
+                .TEXT   $A3, "ABS", 0
+                .TEXT   $A4, "ASC", 0
+                .TEXT   $A5, "RND", 0
+                .TEXT   $A6, "SGN", 0
+                .TEXT   $A9, "LEN", 0
+                .TEXT   $AA, "VAL", 0
+                ; String functions (with $)
+                .TEXT   $AE, "LEFT$", 0
+                .TEXT   $AF, "RIGHT$", 0
+                .TEXT   $B0, "MID$", 0
+                .TEXT   $AB, "CHR$", 0
+                .TEXT   $AC, "STR$", 0
+                .TEXT   $AD, "HEX$", 0
+                ; Single-char aliases
+                .TEXT   $80, "?", 0
+                ; End marker
+                .TEXT   $FF
+
+; ============================================================================
+; DETOKENIZE STRING TABLE (indexed by token - $80)
+; Each entry is a pointer to the keyword string for LIST output.
+; ============================================================================
+
+DETOK_TABLE:
+                .WORD   DS_PRINT            ; $80
+                .WORD   DS_INPUT            ; $81
+                .WORD   DS_RESTORE          ; $82
+                .WORD   DS_RETURN           ; $83
+                .WORD   DS_GOSUB            ; $84
+                .WORD   DS_GOTO             ; $85
+                .WORD   DS_FOR              ; $86
+                .WORD   DS_NEXT             ; $87
+                .WORD   DS_READ             ; $88
+                .WORD   DS_DATA             ; $89
+                .WORD   DS_DIM              ; $8A
+                .WORD   DS_DOKE             ; $8B
+                .WORD   DS_POKE             ; $8C
+                .WORD   DS_LIST             ; $8D
+                .WORD   DS_LET              ; $8E
+                .WORD   DS_IF               ; $8F
+                .WORD   DS_ON               ; $90
+                .WORD   DS_END              ; $91
+                .WORD   DS_STOP             ; $92
+                .WORD   DS_CLR              ; $93
+                .WORD   DS_REM              ; $94
+                .WORD   DS_NEW              ; $95
+                .WORD   DS_RUN              ; $96
+                .WORD   DS_THEN             ; $97
+                .WORD   DS_TO               ; $98
+                .WORD   DS_STEP             ; $99
+                .WORD   DS_ELSE             ; $9A
+                .WORD   DS_AND              ; $9B
+                .WORD   DS_OR               ; $9C
+                .WORD   DS_XOR              ; $9D
+                .WORD   DS_NOT              ; $9E
+                .WORD   DS_MOD              ; $9F
+                .WORD   DS_LE               ; $A0
+                .WORD   DS_GE               ; $A1
+                .WORD   DS_NE               ; $A2
+                .WORD   DS_ABS              ; $A3
+                .WORD   DS_ASC              ; $A4
+                .WORD   DS_RND              ; $A5
+                .WORD   DS_SGN              ; $A6
+                .WORD   DS_PEEK             ; $A7
+                .WORD   DS_DEEK             ; $A8
+                .WORD   DS_LEN              ; $A9
+                .WORD   DS_VAL              ; $AA
+                .WORD   DS_CHRS             ; $AB
+                .WORD   DS_STRS             ; $AC
+                .WORD   DS_HEXS             ; $AD
+                .WORD   DS_LEFTS            ; $AE
+                .WORD   DS_RIGHTS           ; $AF
+                .WORD   DS_MIDS             ; $B0
+
+DS_PRINT:   .TEXT   "PRINT", 0
+DS_INPUT:   .TEXT   "INPUT", 0
+DS_RESTORE: .TEXT   "RESTORE", 0
+DS_RETURN:  .TEXT   "RETURN", 0
+DS_GOSUB:   .TEXT   "GOSUB", 0
+DS_GOTO:    .TEXT   "GOTO", 0
+DS_FOR:     .TEXT   "FOR", 0
+DS_NEXT:    .TEXT   "NEXT", 0
+DS_READ:    .TEXT   "READ", 0
+DS_DATA:    .TEXT   "DATA", 0
+DS_DIM:     .TEXT   "DIM", 0
+DS_DOKE:    .TEXT   "DOKE", 0
+DS_POKE:    .TEXT   "POKE", 0
+DS_LIST:    .TEXT   "LIST", 0
+DS_LET:     .TEXT   "LET", 0
+DS_IF:      .TEXT   "IF", 0
+DS_ON:      .TEXT   "ON", 0
+DS_END:     .TEXT   "END", 0
+DS_STOP:    .TEXT   "STOP", 0
+DS_CLR:     .TEXT   "CLR", 0
+DS_REM:     .TEXT   "REM", 0
+DS_NEW:     .TEXT   "NEW", 0
+DS_RUN:     .TEXT   "RUN", 0
+DS_THEN:    .TEXT   "THEN", 0
+DS_TO:      .TEXT   "TO", 0
+DS_STEP:    .TEXT   "STEP", 0
+DS_ELSE:    .TEXT   "ELSE", 0
+DS_AND:     .TEXT   " AND ", 0
+DS_OR:      .TEXT   " OR ", 0
+DS_XOR:     .TEXT   " XOR ", 0
+DS_NOT:     .TEXT   "NOT ", 0
+DS_MOD:     .TEXT   " MOD ", 0
+DS_LE:      .TEXT   "<=", 0
+DS_GE:      .TEXT   ">=", 0
+DS_NE:      .TEXT   "<>", 0
+DS_ABS:     .TEXT   "ABS", 0
+DS_ASC:     .TEXT   "ASC", 0
+DS_RND:     .TEXT   "RND", 0
+DS_SGN:     .TEXT   "SGN", 0
+DS_PEEK:    .TEXT   "PEEK", 0
+DS_DEEK:    .TEXT   "DEEK", 0
+DS_LEN:     .TEXT   "LEN", 0
+DS_VAL:     .TEXT   "VAL", 0
+DS_CHRS:    .TEXT   "CHR$", 0
+DS_STRS:    .TEXT   "STR$", 0
+DS_HEXS:    .TEXT   "HEX$", 0
+DS_LEFTS:   .TEXT   "LEFT$", 0
+DS_RIGHTS:  .TEXT   "RIGHT$", 0
+DS_MIDS:    .TEXT   "MID$", 0
+
+; ============================================================================
+; STATEMENT DISPATCH TABLE (for JMPT via token offset)
+; Index = (token - $80) * 2.  JMPT XY1, D0 reads address from here.
+; ============================================================================
+
+STMT_DISPATCH:
+                .WORD   CMD_PRINT           ; $80
+                .WORD   CMD_INPUT           ; $81
+                .WORD   CMD_RESTORE         ; $82
+                .WORD   CMD_RETURN          ; $83
+                .WORD   CMD_GOSUB           ; $84
+                .WORD   CMD_GOTO            ; $85
+                .WORD   CMD_FOR             ; $86
+                .WORD   CMD_NEXT            ; $87
+                .WORD   CMD_READ            ; $88
+                .WORD   CMD_DATA            ; $89
+                .WORD   CMD_DIM             ; $8A
+                .WORD   CMD_DOKE            ; $8B
+                .WORD   CMD_POKE            ; $8C
+                .WORD   CMD_LIST            ; $8D
+                .WORD   CMD_LET             ; $8E
+                .WORD   CMD_IF              ; $8F
+                .WORD   CMD_ON              ; $90
+                .WORD   CMD_END             ; $91
+                .WORD   CMD_STOP            ; $92
+                .WORD   CMD_CLR             ; $93
+                .WORD   CMD_REM             ; $94
+                .WORD   CMD_NEW             ; $95
+                .WORD   CMD_RUN             ; $96
+
+; ============================================================================
+; MAIN
+; ============================================================================
+
+MAIN:
+                DINT
+                LOADI       X3, #<SSTACK_TOP
+                LOADI       Y3, #>SSTACK_TOP
+
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+                STOREP      D0, Y3, [#ZP_FORSP]
+                STOREP      D0, Y3, [#ZP_PROGEND]
+                STOREP      D0, Y3, [#ZP_DATALINE]
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+
+                LOADI       D0, #12345
+                STOREP      D0, Y3, [#ZP_RNDSEED]
+                LOADI       D0, #STRPOOL_TOP
+                STOREP      D0, Y3, [#ZP_STRPOOL]
+                LOADI       D0, #ARRAY_BASE
+                STOREP      D0, Y3, [#ZP_ARRTOP]
+
+                CALL        clear_vars
+
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+                LOADI       D0, #0
+                STORED      D0, [XY0]
+
+                LOADI       X0, #<BANNER
+                LOADI       Y0, #>BANNER
+                CALL        print_string
+
+                ; Display free memory
+                LOADI       D0, #STRPOOL_TOP
+                SUB         D0, #ARRAY_BASE
+                CALL        print_unsigned
+                LOADI       X0, #<STR_BYTES
+                LOADI       Y0, #>STR_BYTES
+                CALL        print_string
+
+                LOADI       X0, #<STR_READY
+                LOADI       Y0, #>STR_READY
+                CALL        print_string
+
+                BRA         cmd_loop
+
+; ============================================================================
+; COMMAND LOOP
+; ============================================================================
+
+cmd_loop:
+                LOADI       X3, #<SSTACK_TOP
+                LOADI       Y3, #>SSTACK_TOP
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+                STOREP      D0, Y3, [#ZP_FORSP]
+
+                LOADI       X0, #<STR_PROMPT
+                LOADI       Y0, #>STR_PROMPT
+                CALL        print_string
+                CALL        accept_line
+
+                ; Tokenize the input line in-place
+                CALL        tokenize_line
+
+                LOADI       X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+
+.cmd_skip:      CMP         D0, #$20
+                BNE         .cmd_chk
+                ADD         X0, #1
+                LOADB       D0, [XY0]
+                BRA         .cmd_skip
+
+.cmd_chk:       CMP         D0, #0
+                BEQ         cmd_loop
+                CMP         D0, #$30
+                BCC         .cmd_direct
+                CMP         D0, #$3A
+                BCS         .cmd_direct
+
+                CALL        parse_linenum
+                CMP         D0, #0
+                BEQ         .cmd_direct
+
+                PUSH        D0, XY3
+                LOADB       D1, [XY0]
+.cmd_skp2:      CMP         D1, #$20
+                BNE         .cmd_chktxt
+                ADD         X0, #1
+                LOADB       D1, [XY0]
+                BRA         .cmd_skp2
+
+.cmd_chktxt:    CMP         D1, #0
+                BEQ         .cmd_delline
+                MOVE        D2, X0
+                POP         D0, XY3
+                CALL        store_line
+                BRA         cmd_loop
+
+.cmd_delline:   POP         D0, XY3
+                CALL        delete_line_v2
+                BRA         cmd_loop
+
+.cmd_direct:    MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                CALL        exec_statement
+                BRA         cmd_loop
+
+; ============================================================================
+; ACCEPT_LINE - Read line from keyboard into TIB
+; Returns D0 = character count
+; ============================================================================
+
+accept_line:
+                LOADI       X0, #<KEYBOARD
+                LOADI       Y0, #>KEYBOARD
+                LOADI       X1, #<TERMINAL
+                LOADI       Y1, #>TERMINAL
+                LOADI       D2, #0
+                LOADI       D3, #TIB_OFFSET
+
+.al_loop:       LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .al_loop
+                AND         D0, #$FF
+                CMP         D0, #$0D
+                BEQ         .al_done
+                CMP         D0, #$0A
+                BEQ         .al_done
+                CMP         D0, #$08
+                BEQ         .al_back
+                CMP         D0, #$7F
+                BEQ         .al_back
+                CMP         D2, #TIB_SIZE
+                BCS         .al_loop
+
+                PUSH        XY0, XY3
+                MOVE        X0, D3
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                POP         XY0, XY3
+                ADD         D3, #1
+                ADD         D2, #1
+                STOREB      D0, [XY1]
+                BRA         .al_loop
+
+.al_back:       CMP         D2, #0
+                BEQ         .al_loop
+                SUB         D3, #1
+                SUB         D2, #1
+                LOADI       D0, #$08
+                STOREB      D0, [XY1]
+                LOADI       D0, #$20
+                STOREB      D0, [XY1]
+                LOADI       D0, #$08
+                STOREB      D0, [XY1]
+                BRA         .al_loop
+
+.al_done:       PUSH        XY0, XY3
+                MOVE        X0, D3
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D0, #0
+                STOREB      D0, [XY0]
+                POP         XY0, XY3
+                LOADI       D0, #$0A
+                STOREB      D0, [XY1]
+                MOVE        D0, D2
+                RET
+
+; ============================================================================
+; PARSE_LINENUM - Parse decimal line number from [XY0]
+; ============================================================================
+
+parse_linenum:
+                LOADI       D0, #0
+.pln_loop:      LOADB       D1, [XY0]
+                CMP         D1, #$30
+                BCC         .pln_done
+                CMP         D1, #$3A
+                BCS         .pln_done
+                MOVE        D2, D0
+                SHL         D0
+                SHL         D0
+                ADD         D0, D2
+                SHL         D0
+                SUB         D1, #$30
+                ADD         D0, D1
+                ADD         X0, #1
+                BRA         .pln_loop
+.pln_done:      RET
+
+; ============================================================================
+; STORE_LINE - Insert/replace program line
+; Input: D0=line number, D2=text offset in page $00
+; ============================================================================
+
+store_line:
+                PUSH        D0, XY3
+                PUSH        D2, XY3
+
+                ; Measure text length
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D1, #0
+.sl_meas:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .sl_meas_done
+                ADD         D1, #1
+                ADD         X0, #1
+                BRA         .sl_meas
+.sl_meas_done:  ADD         D1, #4              ; +2 line#, +1 NUL, +1 align
+                AND         D1, #$FFFE
+                PUSH        D1, XY3
+
+                ; Delete existing line if present
+                ; Stack: [D1=size, D2=text, D0=linenum]
+                LOADD       D0, [XY3+#2w]       ; peek line number (3rd word)
+                CALL        delete_line_v2
+
+                ; Find insertion point
+                ; Stack unchanged - read D0 again
+                LOADD       D0, [XY3+#2w]       ; line number (3rd word)
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+.sl_find:       LOADD       D2, [XY0]
+                CMP         D2, #0
+                BEQ         .sl_insert
+                CMP         D2, D0
+                BCS         .sl_insert
+                ADD         X0, #2
+.sl_skip:       LOADB       D3, [XY0]
+                ADD         X0, #1
+                CMP         D3, #0
+                BNE         .sl_skip
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                BRA         .sl_find
+
+.sl_insert:     POP         D1, XY3             ; record size
+                POP         D2, XY3             ; text offset
+                POP         D0, XY3             ; line number
+                MOVE        D3, X0              ; insert offset
+                PUSH        D, XY3              ; save D0-D3
+
+                ; Find end of program
+                LOADI       X1, #$0000
+                LOADI       Y1, #PROG_PAGE
+                MOVE        X1, D3
+.sl_fend:       LOADD       D0, [XY1]
+                CMP         D0, #0
+                BEQ         .sl_fend2
+                ADD         X1, #2
+.sl_fe2:        LOADB       D0, [XY1]
+                ADD         X1, #1
+                CMP         D0, #0
+                BNE         .sl_fe2
+                ADD         X1, #1
+                AND         X1, #$FFFE
+                BRA         .sl_fend
+.sl_fend2:      ADD         X1, #2
+
+                ; Shift data up by D1 bytes
+                MOVE        D2, X1
+                SUB         D2, D3              ; bytes to move
+                SUB         X1, #1
+                LOADI       Y1, #PROG_PAGE
+                MOVE        D0, X1
+                ADD         D0, D1
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+
+.sl_shift:      CMP         D2, #0
+                BEQ         .sl_shifted
+                LOADB       D0, [XY1]
+                STOREB      D0, [XY0]
+                SUB         X1, #1
+                SUB         X0, #1
+                SUB         D2, #1
+                BRA         .sl_shift
+
+.sl_shifted:    POP         D, XY3              ; D0=linenum, D1=size, D2=text, D3=insert
+
+                ; Write line record
+                MOVE        X0, D3
+                LOADI       Y0, #PROG_PAGE
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                MOVE        X1, D2
+                LOADI       Y1, #RAM_PAGE
+.sl_copy:       LOADB       D0, [XY1]
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                ADD         X1, #1
+                CMP         D0, #0
+                BNE         .sl_copy
+                RET
+
+; ============================================================================
+; DELETE_LINE
+; ============================================================================
+
+delete_line_v2:
+                PUSH        D0, XY3
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+
+.dl2_find:      LOADD       D1, [XY0]
+                CMP         D1, #0
+                BEQ         .dl2_nf
+                LOADD       D2, [XY3]
+                CMP         D1, D2
+                BEQ         .dl2_found
+                BCS         .dl2_nf
+                ADD         X0, #2
+.dl2_skip:      LOADB       D1, [XY0]
+                ADD         X0, #1
+                CMP         D1, #0
+                BNE         .dl2_skip
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                BRA         .dl2_find
+
+.dl2_nf:        POP         D0, XY3
+                RET
+
+.dl2_found:     POP         D2, XY3
+                MOVE        D2, X0              ; start of line record
+
+                ; Find end of this line
+                ADD         X0, #2
+.dl2_fend:      LOADB       D1, [XY0]
+                ADD         X0, #1
+                CMP         D1, #0
+                BNE         .dl2_fend
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                MOVE        D3, X0              ; start of next record
+
+                ; Find end of program
+                MOVE        X1, D3
+                LOADI       Y1, #PROG_PAGE
+.dl2_pend:      LOADD       D0, [XY1]
+                CMP         D0, #0
+                BEQ         .dl2_gotend
+                ADD         X1, #2
+.dl2_pe2:       LOADB       D0, [XY1]
+                ADD         X1, #1
+                CMP         D0, #0
+                BNE         .dl2_pe2
+                ADD         X1, #1
+                AND         X1, #$FFFE
+                BRA         .dl2_pend
+.dl2_gotend:    ADD         X1, #2
+
+                ; Shift down
+                MOVE        D0, X1
+                SUB         D0, D3              ; bytes to copy
+                MOVE        X1, D3
+                LOADI       Y1, #PROG_PAGE
+                MOVE        X0, D2
+                LOADI       Y0, #PROG_PAGE
+
+.dl2_copy:      CMP         D0, #0
+                BEQ         .dl2_done
+                LOADB       D1, [XY1]
+                STOREB      D1, [XY0]
+                ADD         X1, #1
+                ADD         X0, #1
+                SUB         D0, #1
+                BRA         .dl2_copy
+.dl2_done:      RET
+
+; ============================================================================
+; RUN / RUN_LOOP / EXEC_STATEMENT
+; ============================================================================
+
+CMD_RUN:
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+                STOREP      D0, Y3, [#ZP_FORSP]
+                STOREP      D0, Y3, [#ZP_DATALINE]
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                LOADI       D0, #STRPOOL_TOP
+                STOREP      D0, Y3, [#ZP_STRPOOL]
+                LOADI       D0, #ARRAY_BASE
+                STOREP      D0, Y3, [#ZP_ARRTOP]
+                CALL        clear_vars
+                LOADI       D0, #$0000
+                STOREP      D0, Y3, [#ZP_CURLINE]
+                LOADI       D0, #1
+                STOREP      D0, Y3, [#ZP_RUNNING]
+
+run_loop:
+                STOREP      X3, Y3, [#ZP_RUNSP]
+                LOADP       D0, Y3, [#ZP_CURLINE]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+                LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .run_end
+
+                STOREP      D0, Y3, [#ZP_LINENUM]
+                MOVE        D0, X0
+                ADD         D0, #2
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                CALL        exec_statement
+
+                LOADP       D0, Y3, [#ZP_RUNNING]
+                CMP         D0, #0
+                BEQ         cmd_loop
+
+                ; Advance to next line
+                LOADP       D0, Y3, [#ZP_CURLINE]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+                ADD         X0, #2
+.rl_skip:       LOADB       D0, [XY0]
+                ADD         X0, #1
+                CMP         D0, #0
+                BNE         .rl_skip
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_CURLINE]
+                BRA         run_loop
+
+.run_end:       LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                BRA         cmd_loop
+
+; --- Statement dispatcher (token-based JMPT dispatch) ---
+exec_statement:
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #0
+                BEQ         .es_done
+                CMP         D0, #$3A
+                BEQ         .es_next_stmt
+
+                ; Is it a statement token ($80-$96)?
+                CMP         D0, #TOK_PRINT
+                BCC         .es_not_token
+                CMP         D0, #TOK_LAST_STMT+1
+                BCS         .es_not_token
+
+                ; --- Token dispatch via JMPT ---
+                CALL        get_char             ; consume token, D0 = token
+                SUB         D0, #TOK_PRINT       ; zero-base offset
+                ADD         D0, D0               ; word offset for table
+                LOADI       X1, #<STMT_DISPATCH
+                LOADI       Y1, #>STMT_DISPATCH
+                CALL        .es_dispatch         ; push return, then JMPT
+
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$3A
+                BEQ         .es_next_stmt
+.es_done:       RET
+
+.es_dispatch:   JMPT        XY1, D0              ; PC ? mem[XY1 + D0]
+
+.es_not_token:
+                ; Not a token - implicit LET (variable name A-Z/a-z)
+                CMP         D0, #$41
+                BCC         .es_syntax_err
+                CMP         D0, #$5B
+                BCC         .es_implicit_let
+                CMP         D0, #$61
+                BCC         .es_syntax_err
+                CMP         D0, #$7B
+                BCS         .es_syntax_err
+
+.es_implicit_let:
+                CALL        CMD_LET
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$3A
+                BEQ         .es_next_stmt
+                RET
+
+.es_next_stmt:  CALL        get_char
+                BRA         exec_statement
+
+.es_syntax_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; ============================================================================
+; ERROR HANDLING
+; ============================================================================
+
+error_msg:
+                CALL        print_string
+                LOADP       D0, Y3, [#ZP_RUNNING]
+                CMP         D0, #0
+                BEQ         .err_nl
+                PUSH        XY0, XY3
+                LOADI       X0, #<STR_INLN
+                LOADI       Y0, #>STR_INLN
+                CALL        print_string
+                LOADP       D0, Y3, [#ZP_LINENUM]
+                CALL        print_unsigned
+                POP         XY0, XY3
+.err_nl:        CALL        print_newline
+                BRA         cmd_loop
+
+; ============================================================================
+; TEXT HELPERS
+; ============================================================================
+
+get_text_page:
+                LOADP       D0, Y3, [#ZP_RUNNING]
+                CMP         D0, #0
+                BEQ         .gtp_direct
+                LOADI       Y0, #PROG_PAGE
+                RET
+.gtp_direct:    LOADI       Y0, #RAM_PAGE
+                RET
+
+peek_char:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+                LOADB       D0, [XY0]
+                RET
+
+get_char:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+                LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .gc_done
+                ADD         X0, #1
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                SUB         X0, #1
+                LOADB       D0, [XY0]
+.gc_done:       RET
+
+skip_spaces:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+.ss_loop:       LOADB       D0, [XY0]
+                CMP         D0, #$20
+                BNE         .ss_done
+                ADD         X0, #1
+                BRA         .ss_loop
+.ss_done:       MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                RET
+
+; ============================================================================
+; TOKENIZER - converts raw ASCII line to tokenized form (in-place in TIB)
+; Tokens are always shorter than keywords, so in-place write is safe.
+; Call after read_line, before parse_linenum.
+; Uses: XY0=read, XY2=write (both in TIB, RAM_PAGE)
+; ============================================================================
+
+tokenize_line:
+                LOADI       X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                MOVE        X2, X0
+                LOADI       Y2, #RAM_PAGE
+
+.tok_loop:      LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .tok_done
+
+                ; --- Inside a quoted string: copy verbatim ---
+                CMP         D0, #$22            ; double-quote
+                BEQ         .tok_string
+
+                ; --- Alphabetic? potential keyword ---
+                CALL        .tok_is_alpha
+                CMP         D0, #0
+                BNE         .tok_try_kw
+
+                ; --- Check for compound operators <= >= <> ---
+                LOADB       D0, [XY0]
+                CMP         D0, #$3C            ; '<'
+                BEQ         .tok_lt
+                CMP         D0, #$3E            ; '>'
+                BEQ         .tok_gt
+
+                ; --- Copy single byte ---
+.tok_copy1:     LOADB       D0, [XY0]
+                STOREB      D0, [XY2]
+                ADD         X0, #1
+                ADD         X2, #1
+                BRA         .tok_loop
+
+                ; --- '<' followed by '=' or '>' ---
+.tok_lt:        ADD         X0, #1
+                LOADB       D1, [XY0]
+                CMP         D1, #$3D            ; '='
+                BEQ         .tok_emit_le
+                CMP         D1, #$3E            ; '>'
+                BEQ         .tok_emit_ne
+                SUB         X0, #1              ; put back, copy '<' as-is
+                BRA         .tok_copy1
+.tok_emit_le:   LOADI       D0, #TOK_LE
+                BRA         .tok_emit2
+.tok_emit_ne:   LOADI       D0, #TOK_NE
+                BRA         .tok_emit2
+
+                ; --- '>' followed by '=' ---
+.tok_gt:        ADD         X0, #1
+                LOADB       D1, [XY0]
+                CMP         D1, #$3D            ; '='
+                BEQ         .tok_emit_ge
+                SUB         X0, #1              ; put back, copy '>' as-is
+                BRA         .tok_copy1
+.tok_emit_ge:   LOADI       D0, #TOK_GE
+
+.tok_emit2:     STOREB      D0, [XY2]          ; emit token
+                ADD         X0, #1              ; skip 2nd char
+                ADD         X2, #1
+                BRA         .tok_loop
+
+                ; --- Copy quoted string verbatim ---
+.tok_string:    STOREB      D0, [XY2]          ; copy opening quote
+                ADD         X0, #1
+                ADD         X2, #1
+.tok_str_lp:    LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .tok_done           ; unterminated string
+                STOREB      D0, [XY2]
+                ADD         X0, #1
+                ADD         X2, #1
+                CMP         D0, #$22
+                BNE         .tok_str_lp         ; keep until closing quote
+                BRA         .tok_loop
+
+                ; --- Try keyword match ---
+.tok_try_kw:    PUSH        XY0, XY3            ; save read pos
+                LOADI       X1, #<TOK_TABLE
+                LOADI       Y1, #>TOK_TABLE
+
+.tok_kw_entry:  LOADB       D3, [XY1]          ; token value
+                CMP         D3, #$FF
+                BEQ         .tok_kw_fail        ; $FF = end of table
+                CMP         D3, #0
+                BEQ         .tok_kw_pad         ; $00 = alignment padding, skip
+
+                ADD         X1, #1              ; skip token byte
+                ; Save table pos after token byte
+                MOVE        D2, X1
+
+                ; Compare keyword string at XY1 with source at XY0
+                ; (XY0 already correct from entry or POP/PUSH in .tok_kw_skip)
+
+.tok_kw_cmp:    LOADB       D0, [XY1]          ; table char
+                CMP         D0, #0
+                BEQ         .tok_kw_hit         ; end of keyword = match
+
+                LOADB       D1, [XY0]           ; source char
+                ; To uppercase for comparison
+                CMP         D1, #$61
+                BCC         .tok_kw_c1
+                CMP         D1, #$7B
+                BCS         .tok_kw_c1
+                AND         D1, #$DF            ; to uppercase
+.tok_kw_c1:     CMP         D0, D1
+                BNE         .tok_kw_skip        ; mismatch, try next keyword
+                ADD         X0, #1
+                ADD         X1, #1
+                BRA         .tok_kw_cmp
+
+.tok_kw_hit:    ; Keyword matched! Check next char isn't alphanumeric
+                ; (avoid matching "FOR" in "FORMAT")
+                LOADB       D1, [XY0]
+                CALL        .tok_is_alnum_d1
+                CMP         D0, #0
+                BNE         .tok_kw_skip        ; next char is alnum, not a match
+
+                ; Emit token byte, advance read pointer past keyword
+                MOVE        D1, X0              ; save X0 (past matched keyword)
+                POP         XY0, XY3            ; discard saved read pos (overwrites X0!)
+                MOVE        X0, D1              ; restore advanced position
+                STOREB      D3, [XY2]
+                ADD         X2, #1
+                ; XY0 is now past the matched keyword
+                ; Check for REM - copy rest of line verbatim
+                CMP         D3, #TOK_REM
+                BEQ         .tok_rem
+                ; Check for DATA - also copy rest verbatim
+                CMP         D3, #TOK_DATA
+                BEQ         .tok_rem
+                BRA         .tok_loop
+
+                ; --- REM/DATA: copy rest of line as-is ---
+.tok_rem:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .tok_done
+                STOREB      D0, [XY2]
+                ADD         X0, #1
+                ADD         X2, #1
+                BRA         .tok_rem
+
+                ; --- Skip to next keyword table entry ---
+.tok_kw_skip:   MOVE        X1, D2              ; restore to after token byte
+                LOADI       Y1, #>TOK_TABLE
+.tok_kw_sk2:    LOADB       D0, [XY1]          ; skip keyword string
+                ADD         X1, #1
+                CMP         D0, #0
+                BNE         .tok_kw_sk2
+                ; XY1 now at next entry's token byte
+                ; Restore XY0 read position
+                POP         XY0, XY3
+                PUSH        XY0, XY3            ; re-push for next try
+                BRA         .tok_kw_entry
+
+.tok_kw_pad:    ADD         X1, #1              ; skip padding byte
+                BRA         .tok_kw_entry
+
+.tok_kw_fail:   POP         XY0, XY3            ; restore read pos
+                ; No keyword matched - copy single byte
+                BRA         .tok_copy1
+
+.tok_done:      STOREB      D0, [XY2]          ; null terminate (D0=0)
+                RET
+
+; --- Helper: check if byte at [XY0] is alphabetic ---
+; Returns D0=1 if alpha, D0=0 if not
+.tok_is_alpha:  LOADB       D0, [XY0]
+                CMP         D0, #$41            ; 'A'
+                BCC         .tok_not_alpha
+                CMP         D0, #$5B            ; 'Z'+1
+                BCC         .tok_yes_alpha
+                CMP         D0, #$61            ; 'a'
+                BCC         .tok_not_alpha
+                CMP         D0, #$7B            ; 'z'+1
+                BCC         .tok_yes_alpha
+.tok_not_alpha: LOADI       D0, #0
+                RET
+.tok_yes_alpha: LOADI       D0, #1
+                RET
+
+; --- Helper: check if D1 is alphanumeric ---
+; Returns D0=1 if alnum, D0=0 if not. Preserves D1.
+.tok_is_alnum_d1:
+                CMP         D1, #$30            ; '0'
+                BCC         .tok_not_alnum
+                CMP         D1, #$3A            ; '9'+1
+                BCC         .tok_yes_alnum
+                CMP         D1, #$41
+                BCC         .tok_not_alnum
+                CMP         D1, #$5B
+                BCC         .tok_yes_alnum
+                CMP         D1, #$61
+                BCC         .tok_not_alnum
+                CMP         D1, #$7B
+                BCC         .tok_yes_alnum
+.tok_not_alnum: LOADI       D0, #0
+                RET
+.tok_yes_alnum: LOADI       D0, #1
+                RET
+
+; ============================================================================
+; DETOKENIZE BYTE - expand token to keyword string for LIST output
+; Input: D0 = byte to print. If $80+, look up and print keyword string.
+; Uses: XY1 scratch
+; ============================================================================
+
+detok_print:
+                CMP         D0, #$80
+                BCC         .dp_raw             ; < $80 = normal ASCII
+                ; Token byte: look up in DETOK_TABLE
+                PUSH        XY0, XY3
+                SUB         D0, #$80            ; zero-base index
+                ADD         D0, D0              ; word offset
+                LOADI       X1, #<DETOK_TABLE
+                LOADI       Y1, #>DETOK_TABLE
+                LOADD       D0, [XY1+D0]       ; Mode 01: string pointer
+                MOVE        X0, D0
+                LOADI       Y0, #>DETOK_TABLE   ; same page as strings
+                CALL        print_string
+                POP         XY0, XY3
+                RET
+.dp_raw:        ; Print single ASCII char
+                LOADI       X1, #<TERMINAL
+                LOADI       Y1, #>TERMINAL
+                STOREB      D0, [XY1]
+                RET
+
+; ============================================================================
+; COMMAND HANDLERS - Simple commands
+; ============================================================================
+
+; --- NEW ---
+CMD_NEW:
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+                LOADI       D0, #0
+                STORED      D0, [XY0]
+                STOREP      D0, Y3, [#ZP_PROGEND]
+                ; fall through to CLR
+
+; --- CLR ---
+CMD_CLR:
+                CALL        clear_vars
+                LOADI       D0, #STRPOOL_TOP
+                STOREP      D0, Y3, [#ZP_STRPOOL]
+                LOADI       D0, #ARRAY_BASE
+                STOREP      D0, Y3, [#ZP_ARRTOP]
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_DATALINE]
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                RET
+
+clear_vars:
+                LOADI       D1, #26
+                LOADI       D0, #0
+                LOADI       X0, #ZP_VARS
+                LOADI       Y0, #RAM_PAGE
+.cv_int:        STORED      D0, [XY0]
+                ADD         X0, #2
+                SUB         D1, #1
+                BNE         .cv_int
+                LOADI       D1, #52             ; 26 descriptors x 2 words
+                LOADI       X0, #ZP_STRVARS
+.cv_str:        STORED      D0, [XY0]
+                ADD         X0, #2
+                SUB         D1, #1
+                BNE         .cv_str
+                LOADI       D1, #52
+                LOADI       X0, #ZP_ARRAYS
+.cv_arr:        STORED      D0, [XY0]
+                ADD         X0, #2
+                SUB         D1, #1
+                BNE         .cv_arr
+                RET
+
+; --- LIST ---
+CMD_LIST:
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+.list_loop:     LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .list_done
+                STOREP      X0, Y3, [#ZP_TMPLEN] ; save position in ZP
+                CALL        print_unsigned
+                LOADI       D0, #$20
+                CALL        emit_char
+                LOADP       X0, Y3, [#ZP_TMPLEN] ; restore position
+                LOADI       Y0, #PROG_PAGE
+                ADD         X0, #2
+.list_text:     LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .list_nl
+                STOREP      X0, Y3, [#ZP_TMPLEN]
+                CALL        detok_print          ; expand tokens to keywords
+                LOADP       X0, Y3, [#ZP_TMPLEN]
+                LOADI       Y0, #PROG_PAGE
+                ADD         X0, #1
+                BRA         .list_text
+.list_nl:       ADD         X0, #1
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                STOREP      X0, Y3, [#ZP_TMPLEN]
+                CALL        print_newline
+                LOADP       X0, Y3, [#ZP_TMPLEN]
+                LOADI       Y0, #PROG_PAGE
+                BRA         .list_loop
+.list_done:     RET
+
+; --- REM / DATA (skip rest of line at execution time) ---
+CMD_REM:
+CMD_DATA:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+.rem_skip:      LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .rem_done
+                ADD         X0, #1
+                BRA         .rem_skip
+.rem_done:      MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                RET
+
+; --- END ---
+CMD_END:
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                RET
+
+; --- STOP ---
+CMD_STOP:
+                LOADI       X0, #<STR_BREAK
+                LOADI       Y0, #>STR_BREAK
+                CALL        print_string
+                LOADI       X0, #<STR_INLN
+                LOADI       Y0, #>STR_INLN
+                CALL        print_string
+                LOADP       D0, Y3, [#ZP_LINENUM]
+                CALL        print_unsigned
+                CALL        print_newline
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_RUNNING]
+                RET
+
+; --- GOTO ---
+CMD_GOTO:
+                CALL        skip_spaces
+                CALL        expr
+                CALL        find_line
+                CMP         D0, #$FFFF
+                BEQ         .goto_err
+                STOREP      D0, Y3, [#ZP_CURLINE]
+                LOADP       D0, Y3, [#ZP_RUNNING]
+                CMP         D0, #0
+                BEQ         .goto_direct_err
+                LOADP       X3, Y3, [#ZP_RUNSP]
+                BRA         run_loop
+.goto_err:
+                LOADI       X0, #<STR_LINERR
+                LOADI       Y0, #>STR_LINERR
+                BRA         error_msg
+.goto_direct_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; --- GOSUB ---
+CMD_GOSUB:
+                LOADP       D0, Y3, [#ZP_GOSUBSP]
+                CMP         D0, #GOSUB_MAX
+                BCS         .gosub_err
+
+                MOVE        D1, D0
+                SHL         D1
+                SHL         D1
+                ADD         D1, #ZP_GOSUBSTK
+
+                LOADP       D2, Y3, [#ZP_CURLINE]
+                PUSH        XY0, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D2, [XY0]
+                ADD         X0, #2
+                LOADP       D2, Y3, [#ZP_TXTPOS]
+                STORED      D2, [XY0]
+                POP         XY0, XY3
+
+                ADD         D0, #1
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+                BRA         CMD_GOTO
+
+.gosub_err:
+                LOADI       X0, #<STR_GOSERR
+                LOADI       Y0, #>STR_GOSERR
+                BRA         error_msg
+
+; --- RETURN ---
+CMD_RETURN:
+                LOADP       D0, Y3, [#ZP_GOSUBSP]
+                CMP         D0, #0
+                BEQ         .ret_err
+                SUB         D0, #1
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+
+                MOVE        D1, D0
+                SHL         D1
+                SHL         D1
+                ADD         D1, #ZP_GOSUBSTK
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D2, [XY0]
+                STOREP      D2, Y3, [#ZP_CURLINE]
+                ADD         X0, #2
+                LOADD       D2, [XY0]
+                STOREP      D2, Y3, [#ZP_TXTPOS]
+                RET
+
+.ret_err:
+                LOADI       X0, #<STR_RETERR
+                LOADI       Y0, #>STR_RETERR
+                BRA         error_msg
+
+; ============================================================================
+
+CMD_LET:
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$61
+                BCC         .let_c1
+                AND         D0, #$DF
+.let_c1:        CMP         D0, #$41
+                BCC         .let_err
+                CMP         D0, #$5B
+                BCS         .let_err
+                SUB         D0, #$41
+                PUSH        D0, XY3             ; save var index
+
+                CALL        peek_char
+                CMP         D0, #$24             ; '$'
+                BEQ         .let_string
+                CMP         D0, #$28             ; '('
+                BEQ         .let_array
+
+                ; Integer assignment
+                POP         D0, XY3
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$3D
+                BNE         .let_err2
+                CALL        expr
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                RET
+
+.let_string:
+                CALL        get_char             ; consume '$'
+                POP         D0, XY3
+                SHL         D0
+                SHL         D0
+                ADD         D0, #ZP_STRVARS
+                PUSH        D0, XY3             ; descriptor addr
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$3D
+                BNE         .let_err2
+
+                CALL        str_expr             ; result in ZP_TMPLEN/ZP_TMPPTR
+
+                ; Allocate in string pool
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                CALL        str_pool_alloc       ; D2 = pool ptr, D0 = status
+                CMP         D0, #0
+                BNE         .let_mem_err
+
+                ; Copy string to pool
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X1, D0
+                LOADI       Y1, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                CALL        memcpy
+
+                ; Update descriptor
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                POP         D1, XY3             ; descriptor addr
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]           ; length
+                ADD         X0, #2
+                STORED      D2, [XY0]           ; pointer
+                RET
+
+.let_array:
+                CALL        get_char             ; consume '('
+                LOADD       D0, [XY3]             ; var index
+                CALL        expr                 ; subscript
+                MOVE        D2, D0
+                PUSH        D2, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; consume ')'
+                POP         D2, XY3             ; subscript
+                POP         D0, XY3             ; var index
+                CALL        array_addr           ; D0 = element address
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$3D
+                BNE         .let_err2
+                CALL        expr
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                RET
+
+.let_mem_err:   POP         D0, XY3
+                LOADI       X0, #<STR_MEMERR
+                LOADI       Y0, #>STR_MEMERR
+                BRA         error_msg
+.let_err2:      POP         D0, XY3
+.let_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; ============================================================================
+
+CMD_PRINT:
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #0
+                BEQ         .pr_nl
+                CMP         D0, #$3A
+                BEQ         .pr_nl
+
+.pr_loop:       CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #0
+                BEQ         .pr_nl
+                CMP         D0, #$3A
+                BEQ         .pr_nl
+
+                ; String literal?
+                CMP         D0, #$22
+                BEQ         .pr_strlit
+
+                ; Check if string expression
+                CALL        is_string_expr
+                CMP         D0, #1
+                BEQ         .pr_strexpr
+
+                ; Numeric expression
+                CALL        expr
+                CALL        print_signed
+                BRA         .pr_sep
+
+.pr_strlit:     CALL        get_char
+                CALL        print_str_literal
+                BRA         .pr_sep
+
+.pr_strexpr:    CALL        str_expr
+                LOADP       D2, Y3, [#ZP_TMPLEN]
+                LOADP       D3, Y3, [#ZP_TMPPTR]
+                CMP         D2, #0
+                BEQ         .pr_sep
+                MOVE        X0, D3
+                LOADI       Y0, #RAM_PAGE
+.pr_sloop:      LOADB       D0, [XY0]
+                PUSH        XY0, XY3
+                PUSH        D2, XY3
+                CALL        emit_char
+                POP         D2, XY3
+                POP         XY0, XY3
+                ADD         X0, #1
+                SUB         D2, #1
+                BNE         .pr_sloop
+                BRA         .pr_sep
+
+.pr_sep:        CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$3B             ; ';'
+                BEQ         .pr_semi
+                CMP         D0, #$2C             ; ','
+                BEQ         .pr_comma
+                BRA         .pr_nl
+
+.pr_semi:       CALL        get_char
+                CALL        peek_char
+                CMP         D0, #0
+                BEQ         .pr_done
+                CMP         D0, #$3A
+                BEQ         .pr_done
+                BRA         .pr_loop
+
+.pr_comma:      CALL        get_char
+                LOADI       D0, #$09
+                CALL        emit_char
+                BRA         .pr_loop
+
+.pr_nl:         CALL        print_newline
+.pr_done:       RET
+
+print_str_literal:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+.psl_loop:      LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .psl_done
+                CMP         D0, #$22
+                BEQ         .psl_end
+                PUSH        XY0, XY3
+                CALL        emit_char
+                POP         XY0, XY3
+                ADD         X0, #1
+                BRA         .psl_loop
+.psl_end:       ADD         X0, #1
+.psl_done:      MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                RET
+
+; ============================================================================
+; INPUT - integer and string
+; ============================================================================
+
+CMD_INPUT:
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$22
+                BNE         .inp_defprompt
+                CALL        get_char
+                CALL        print_str_literal
+                CALL        skip_spaces
+                CALL        get_char             ; skip separator
+                BRA         .inp_getvar
+.inp_defprompt:
+                LOADI       X0, #<STR_QUEST
+                LOADI       Y0, #>STR_QUEST
+                CALL        print_string
+
+.inp_getvar:    CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$61
+                BCC         .inp_c1
+                AND         D0, #$DF
+.inp_c1:        CMP         D0, #$41
+                BCC         .inp_err
+                CMP         D0, #$5B
+                BCS         .inp_err
+                SUB         D0, #$41
+                PUSH        D0, XY3
+
+                ; Check for '$'
+                CALL        peek_char
+                CMP         D0, #$24
+                BEQ         .inp_str
+
+                ; Integer input
+                POP         D0, XY3
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                PUSH        D0, XY3
+                CALL        accept_line
+                LOADI       X0, #TIB_OFFSET
+                LOADI       Y0, #RAM_PAGE
+                CALL        parse_input_number
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                RET
+
+.inp_str:       CALL        get_char             ; consume '$'
+                POP         D0, XY3
+                SHL         D0
+                SHL         D0
+                ADD         D0, #ZP_STRVARS
+                PUSH        D0, XY3
+
+                CALL        accept_line          ; D0 = length
+                PUSH        D0, XY3             ; save length
+
+                ; Allocate in string pool
+                CALL        str_pool_alloc       ; D2 = pool ptr, D0 = status
+                CMP         D0, #0
+                BNE         .inp_mem_err2
+
+                ; Copy TIB to pool
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADI       X1, #TIB_OFFSET
+                LOADI       Y1, #RAM_PAGE
+                LOADD       D0, [XY3]             ; length
+                CALL        memcpy
+
+                ; Update descriptor
+                POP         D3, XY3             ; length
+                POP         D0, XY3             ; descriptor addr
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                STORED      D3, [XY0]           ; length
+                ADD         X0, #2
+                STORED      D2, [XY0]           ; pointer
+                RET
+
+.inp_mem_err2:  POP         D0, XY3             ; discard length
+                LOADI       X0, #<STR_MEMERR
+                LOADI       Y0, #>STR_MEMERR
+                BRA         error_msg
+
+.inp_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+parse_input_number:
+                LOADI       D2, #0
+                LOADI       D3, #0
+                LOADB       D0, [XY0]
+                CMP         D0, #$24
+                BEQ         .pin_hex
+                CMP         D0, #$2D
+                BNE         .pin_loop
+                LOADI       D3, #1
+                ADD         X0, #1
+.pin_loop:      LOADB       D0, [XY0]
+                CMP         D0, #$30
+                BCC         .pin_done
+                CMP         D0, #$3A
+                BCS         .pin_done
+                MOVE        D1, D2
+                SHL         D2
+                SHL         D2
+                ADD         D2, D1
+                SHL         D2
+                SUB         D0, #$30
+                ADD         D2, D0
+                ADD         X0, #1
+                BRA         .pin_loop
+.pin_done:      CMP         D3, #0
+                BEQ         .pin_pos
+                LOADI       D0, #0
+                SUB         D0, D2
+                MOVE        D2, D0
+.pin_pos:       MOVE        D0, D2
+                RET
+.pin_hex:       ADD         X0, #1
+.pin_hloop:     LOADB       D0, [XY0]
+                CMP         D0, #$30
+                BCC         .pin_hdone
+                CMP         D0, #$3A
+                BCC         .pin_hdigit
+                AND         D0, #$DF
+                CMP         D0, #$41
+                BCC         .pin_hdone
+                CMP         D0, #$47
+                BCS         .pin_hdone
+                SUB         D0, #$37
+                BRA         .pin_haccum
+.pin_hdigit:    SUB         D0, #$30
+.pin_haccum:    SHL4        D2
+                OR          D2, D0
+                ADD         X0, #1
+                BRA         .pin_hloop
+.pin_hdone:     MOVE        D0, D2
+                RET
+
+; ============================================================================
+
+CMD_IF:
+                CALL        expr
+                CMP         D0, #0
+                BEQ         .if_false
+                CALL        skip_spaces
+                CALL        match_then
+                BRA         exec_statement
+
+.if_false:      CALL        skip_to_else
+                CMP         D0, #0
+                BEQ         .if_done
+                BRA         exec_statement
+.if_done:       RET
+
+; Skip to ELSE at nesting depth 0, or end of line.
+; D0=1 if ELSE found, 0 if EOL.
+; Tracks nested IF/ELSE so inner ELSE is skipped.
+skip_to_else:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+                LOADI       D2, #0               ; nesting depth
+
+.ste_loop:      LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .ste_nf
+                CMP         D0, #$22              ; skip quoted strings
+                BEQ         .ste_skipstr
+                CMP         D0, #TOK_IF
+                BEQ         .ste_nest
+                CMP         D0, #TOK_ELSE
+                BEQ         .ste_else
+                ADD         X0, #1
+                BRA         .ste_loop
+
+.ste_skipstr:   ADD         X0, #1
+.ste_ss2:       LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .ste_nf
+                CMP         D0, #$22
+                BEQ         .ste_ss3
+                ADD         X0, #1
+                BRA         .ste_ss2
+.ste_ss3:       ADD         X0, #1
+                BRA         .ste_loop
+
+.ste_nest:      ADD         D2, #1               ; increase nesting depth
+                ADD         X0, #1
+                BRA         .ste_loop
+
+.ste_else:      ADD         X0, #1               ; skip past ELSE token
+                CMP         D2, #0
+                BEQ         .ste_found           ; at depth 0 = our ELSE
+                SUB         D2, #1               ; nested ELSE
+                BRA         .ste_loop
+
+.ste_found:     MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                LOADI       D0, #1
+                RET
+
+.ste_nf:        MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                LOADI       D0, #0
+                RET
+
+match_then:
+                CALL        peek_char
+                CMP         D0, #TOK_THEN
+                BNE         .mt_done
+                CALL        get_char             ; consume THEN token
+.mt_done:       RET
+
+; ============================================================================
+; FOR / NEXT
+; ============================================================================
+
+CMD_FOR:
+                LOADP       D0, Y3, [#ZP_FORSP]
+                CMP         D0, #FOR_MAX
+                BCS         .for_err
+                PUSH        D0, XY3
+
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$61
+                BCC         .for_c1
+                AND         D0, #$DF
+.for_c1:        SUB         D0, #$41
+                PUSH        D0, XY3
+
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$3D
+                BNE         .for_syn_err
+
+                CALL        expr
+                PUSH        D0, XY3             ; start
+
+                CALL        skip_spaces
+                CALL        match_to
+                CMP         D0, #0
+                BEQ         .for_syn_err2
+
+                CALL        expr
+                PUSH        D0, XY3             ; limit
+
+                CALL        skip_spaces
+                CALL        match_step
+                CMP         D0, #0
+                BEQ         .for_step1
+                CALL        expr
+                BRA         .for_save
+.for_step1:     LOADI       D0, #1
+
+.for_save:      MOVE        D3, D0              ; step
+                POP         D2, XY3             ; limit
+                POP         D1, XY3             ; start
+                POP         D0, XY3             ; var index
+
+                ; Set variable = start
+                PUSH        D0, XY3
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                PUSH        XY0, XY3
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                STORED      D1, [XY0]
+                POP         XY0, XY3
+
+                ; Build FOR stack entry
+                POP         D0, XY3             ; var index
+                POP         D1, XY3             ; FOR SP
+
+                PUSH        D1, XY3
+                PUSH        D0, XY3
+
+                ; Entry addr = ZP_FORSTK + index*10
+                MOVE        X0, D1
+                SHL         D1
+                SHL         D1
+                ADD         D1, X0
+                SHL         D1
+                ADD         D1, #ZP_FORSTK
+
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                POP         D0, XY3             ; var index
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                STORED      D2, [XY0]           ; limit
+                ADD         X0, #2
+                STORED      D3, [XY0]           ; step
+                ADD         X0, #2
+                LOADP       D0, Y3, [#ZP_CURLINE]
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                STORED      D0, [XY0]
+
+                POP         D0, XY3             ; old FOR SP
+                ADD         D0, #1
+                STOREP      D0, Y3, [#ZP_FORSP]
+                RET
+
+.for_err:
+                LOADI       X0, #<STR_FORERR
+                LOADI       Y0, #>STR_FORERR
+                BRA         error_msg
+.for_syn_err2:  POP         D0, XY3
+.for_syn_err:   POP         D0, XY3
+                POP         D0, XY3
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+match_to:
+                CALL        peek_char
+                CMP         D0, #TOK_TO
+                BNE         .mto_fail
+                CALL        get_char             ; consume TO token
+                LOADI       D0, #1
+                RET
+.mto_fail:      LOADI       D0, #0
+                RET
+
+match_step:
+                CALL        peek_char
+                CMP         D0, #TOK_STEP
+                BNE         .mst_fail
+                CALL        get_char             ; consume STEP token
+                LOADI       D0, #1
+                RET
+.mst_fail:      LOADI       D0, #0
+                RET
+
+; --- NEXT ---
+CMD_NEXT:
+                LOADP       D0, Y3, [#ZP_FORSP]
+                CMP         D0, #0
+                BEQ         .next_err
+
+                CALL        skip_spaces
+                CALL        peek_char
+                LOADI       D3, #$FFFF
+
+                CMP         D0, #$41
+                BCC         .next_find
+                CMP         D0, #$5B
+                BCC         .next_hasvar
+                CMP         D0, #$61
+                BCC         .next_find
+                CMP         D0, #$7B
+                BCS         .next_find
+
+.next_hasvar:   CALL        get_char
+                AND         D0, #$DF
+                SUB         D0, #$41
+                MOVE        D3, D0
+
+.next_find:     LOADP       D0, Y3, [#ZP_FORSP]
+                SUB         D0, #1
+
+.next_search:   CMP         D0, #$FFFF
+                BEQ         .next_err
+
+                PUSH        D0, XY3
+                MOVE        D1, D0
+                SHL         D0
+                SHL         D0
+                ADD         D0, D1
+                SHL         D0
+                ADD         D0, #ZP_FORSTK
+
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D1, [XY0]           ; var index
+
+                CMP         D3, #$FFFF
+                BEQ         .next_found
+                CMP         D1, D3
+                BEQ         .next_found
+
+                POP         D0, XY3
+                SUB         D0, #1
+                BRA         .next_search
+
+.next_found:    ADD         X0, #2
+                LOADD       D2, [XY0]           ; limit
+                ADD         X0, #2
+                LOADD       D3, [XY0]           ; step
+
+                ; Get/increment variable
+                MOVE        D0, D1
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                PUSH        X0, XY3
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                ADD         D0, D3
+                STORED      D0, [XY0]
+
+                POP         X0, XY3
+                CMP         D3, #0
+                BLT         .next_neg
+                CMP         D0, D2
+                BGT         .next_done
+                BRA         .next_loop
+.next_neg:      CMP         D0, D2
+                BLT         .next_done
+
+.next_loop:     ADD         X0, #2
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]           ; saved curline
+
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+                ADD         X0, #2
+.next_skipln:   LOADB       D0, [XY0]
+                ADD         X0, #1
+                CMP         D0, #0
+                BNE         .next_skipln
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_CURLINE]
+
+                POP         D0, XY3
+                LOADP       X3, Y3, [#ZP_RUNSP]
+                BRA         run_loop
+
+.next_done:     POP         D0, XY3
+                STOREP      D0, Y3, [#ZP_FORSP]
+                RET
+
+.next_err:
+                LOADI       X0, #<STR_NXTERR
+                LOADI       Y0, #>STR_NXTERR
+                BRA         error_msg
+
+; ============================================================================
+; POKE / DOKE
+; ============================================================================
+
+CMD_POKE:
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$2C
+                BNE         .poke_err
+                CALL        expr
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                RET
+.poke_err:      POP         D0, XY3
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+CMD_DOKE:
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$2C
+                BNE         .doke_err
+                CALL        expr
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                RET
+.doke_err:      POP         D0, XY3
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; ============================================================================
+; DIM
+; ============================================================================
+
+CMD_DIM:
+.dim_loop:      CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$61
+                BCC         .dim_c1
+                AND         D0, #$DF
+.dim_c1:        CMP         D0, #$41
+                BCC         .dim_err
+                CMP         D0, #$5B
+                BCS         .dim_err
+                SUB         D0, #$41
+                PUSH        D0, XY3             ; var index
+
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$28
+                BNE         .dim_err2
+
+                CALL        expr                 ; dimension size
+                CMP         D0, #0
+                BEQ         .dim_bad
+                PUSH        D0, XY3             ; dimension
+
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$29
+                BNE         .dim_err3
+
+                POP         D0, XY3             ; dimension
+                POP         D1, XY3             ; var index
+
+                ; Check not already DIMmed
+                MOVE        D2, D1
+                SHL         D2
+                SHL         D2
+                ADD         D2, #ZP_ARRAYS
+                PUSH        D1, XY3
+                PUSH        D0, XY3
+                PUSH        D2, XY3
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D3, [XY0]
+                CMP         D3, #0
+                BNE         .dim_redef
+
+                ; Allocate: (dim+1) * 2 bytes
+                POP         D2, XY3             ; descriptor addr
+                POP         D0, XY3             ; dimension
+                ADD         D0, #1
+                PUSH        D0, XY3             ; dim+1
+                PUSH        D2, XY3
+
+                MOVE        D1, D0
+                SHL         D1                  ; bytes needed
+                LOADP       D2, Y3, [#ZP_ARRTOP]
+                PUSH        D2, XY3             ; base address
+                ADD         D2, D1
+                LOADP       D3, Y3, [#ZP_STRPOOL]
+                CMP         D2, D3
+                BCS         .dim_mem_err
+                STOREP      D2, Y3, [#ZP_ARRTOP]
+
+                POP         D2, XY3             ; base
+                POP         D3, XY3             ; descriptor addr
+                POP         D0, XY3             ; dim+1
+                POP         D1, XY3             ; discard var index
+
+                ; Store descriptor
+                MOVE        X0, D3
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]           ; dimension
+                ADD         X0, #2
+                STORED      D2, [XY0]           ; base
+
+                ; Zero-fill
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                MOVE        D1, D0
+                LOADI       D0, #0
+.dim_fill:      STORED      D0, [XY0]
+                ADD         X0, #2
+                SUB         D1, #1
+                BNE         .dim_fill
+
+                ; Check for more arrays
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2C
+                BNE         .dim_done
+                CALL        get_char
+                BRA         .dim_loop
+.dim_done:      RET
+
+.dim_mem_err:   POP         D2, XY3
+                POP         D3, XY3
+                POP         D0, XY3
+                POP         D1, XY3
+                LOADI       X0, #<STR_MEMERR
+                LOADI       Y0, #>STR_MEMERR
+                BRA         error_msg
+.dim_redef:     POP         D2, XY3
+                POP         D0, XY3
+                POP         D1, XY3
+.dim_bad:       POP         D0, XY3
+                LOADI       X0, #<STR_DIMERR
+                LOADI       Y0, #>STR_DIMERR
+                BRA         error_msg
+.dim_err3:      POP         D0, XY3
+.dim_err2:      POP         D0, XY3
+.dim_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; ============================================================================
+; ON expr GOTO/GOSUB line1,line2,...
+; ============================================================================
+
+CMD_ON:
+                CALL        expr                 ; selector (1-based)
+                PUSH        D0, XY3
+
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #TOK_GOTO
+                BEQ         .on_got_kw
+                CMP         D0, #TOK_GOSUB
+                BNE         .on_err
+.on_got_kw:     CALL        get_char             ; consume GOTO/GOSUB token
+                PUSH        D0, XY3             ; save token
+
+                ; Count to target
+                POP         D1, XY3             ; token
+                POP         D0, XY3             ; selector
+                PUSH        D1, XY3
+                CMP         D0, #0
+                BEQ         .on_err2
+                MOVE        D2, D0
+
+.on_count:      SUB         D2, #1
+                BEQ         .on_found
+                ; Skip digits
+                CALL        skip_spaces
+.on_skip:       CALL        peek_char
+                CMP         D0, #$30
+                BCC         .on_skip_d
+                CMP         D0, #$3A
+                BCS         .on_skip_d
+                CALL        get_char
+                BRA         .on_skip
+.on_skip_d:     CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2C
+                BNE         .on_over
+                CALL        get_char
+                BRA         .on_count
+
+.on_found:      CALL        expr                 ; target line number
+                CALL        find_line
+                CMP         D0, #$FFFF
+                BEQ         .on_line_err
+
+                POP         D1, XY3             ; token
+                CMP         D1, #TOK_GOSUB
+                BEQ         .on_gosub
+
+                ; GOTO path
+                STOREP      D0, Y3, [#ZP_CURLINE]
+                LOADP       X3, Y3, [#ZP_RUNSP]
+                BRA         run_loop
+
+.on_gosub:      PUSH        D0, XY3             ; save target
+                LOADP       D0, Y3, [#ZP_GOSUBSP]
+                CMP         D0, #GOSUB_MAX
+                BCS         .on_gos_err
+                MOVE        D1, D0
+                SHL         D1
+                SHL         D1
+                ADD         D1, #ZP_GOSUBSTK
+                LOADP       D2, Y3, [#ZP_CURLINE]
+                PUSH        XY0, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D2, [XY0]
+                ADD         X0, #2
+                LOADP       D2, Y3, [#ZP_TXTPOS]
+                STORED      D2, [XY0]
+                POP         XY0, XY3
+                ADD         D0, #1
+                STOREP      D0, Y3, [#ZP_GOSUBSP]
+                POP         D0, XY3             ; target
+                STOREP      D0, Y3, [#ZP_CURLINE]
+                LOADP       X3, Y3, [#ZP_RUNSP]
+                BRA         run_loop
+
+.on_over:       POP         D0, XY3
+                RET
+.on_line_err:   POP         D0, XY3
+                LOADI       X0, #<STR_LINERR
+                LOADI       Y0, #>STR_LINERR
+                BRA         error_msg
+.on_gos_err:    POP         D0, XY3
+                LOADI       X0, #<STR_GOSERR
+                LOADI       Y0, #>STR_GOSERR
+                BRA         error_msg
+.on_err2:       POP         D0, XY3
+.on_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+; ============================================================================
+; READ / RESTORE / DATA helpers
+; ============================================================================
+
+CMD_READ:
+.read_loop:     CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$61
+                BCC         .read_c1
+                AND         D0, #$DF
+.read_c1:       CMP         D0, #$41
+                BCC         .read_err
+                CMP         D0, #$5B
+                BCS         .read_err
+                SUB         D0, #$41
+                PUSH        D0, XY3
+
+                ; Check for string read
+                CALL        peek_char
+                CMP         D0, #$24
+                BEQ         .read_str
+
+                ; Integer read
+                POP         D0, XY3
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                PUSH        D0, XY3
+                CALL        get_data_item
+                POP         D1, XY3
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                BRA         .read_more
+
+.read_str:      CALL        get_char             ; consume '$'
+                POP         D0, XY3
+                SHL         D0
+                SHL         D0
+                ADD         D0, #ZP_STRVARS
+                PUSH        D0, XY3
+
+                CALL        get_data_str         ; result in TMPLEN/TMPPTR
+
+                ; Allocate in pool
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                CALL        str_pool_alloc       ; D2 = ptr, D0 = status
+                CMP         D0, #0
+                BNE         .read_mem_err
+
+                ; Copy from temp to pool
+                MOVE        X0, D2
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X1, D0
+                LOADI       Y1, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                CALL        memcpy
+
+                ; Update descriptor
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                POP         D1, XY3             ; descriptor
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                STORED      D0, [XY0]
+                ADD         X0, #2
+                STORED      D2, [XY0]
+                BRA         .read_more
+
+.read_mem_err:  POP         D0, XY3
+                LOADI       X0, #<STR_MEMERR
+                LOADI       Y0, #>STR_MEMERR
+                BRA         error_msg
+
+.read_more:     CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2C
+                BNE         .read_done
+                CALL        get_char
+                BRA         .read_loop
+.read_done:     RET
+.read_err:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+CMD_RESTORE:
+                LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_DATALINE]
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                RET
+
+; Get next integer DATA item -> D0
+get_data_item:
+                CALL        find_data_pos
+                LOADP       D0, Y3, [#ZP_DATAPOS]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+
+                ; Skip spaces
+.gdi_skip:      LOADB       D0, [XY0]
+                CMP         D0, #$20
+                BNE         .gdi_parse
+                ADD         X0, #1
+                BRA         .gdi_skip
+
+.gdi_parse:     LOADI       D2, #0
+                LOADI       D3, #0
+                CMP         D0, #$2D
+                BNE         .gdi_chex
+                LOADI       D3, #1
+                ADD         X0, #1
+                LOADB       D0, [XY0]
+.gdi_chex:      CMP         D0, #$24
+                BEQ         .gdi_hex
+
+.gdi_num:       LOADB       D0, [XY0]
+                CMP         D0, #$30
+                BCC         .gdi_done
+                CMP         D0, #$3A
+                BCS         .gdi_done
+                MOVE        D1, D2
+                SHL         D2
+                SHL         D2
+                ADD         D2, D1
+                SHL         D2
+                SUB         D0, #$30
+                ADD         D2, D0
+                ADD         X0, #1
+                BRA         .gdi_num
+
+.gdi_hex:       ADD         X0, #1
+.gdi_hl:        LOADB       D0, [XY0]
+                CMP         D0, #$30
+                BCC         .gdi_done
+                CMP         D0, #$3A
+                BCC         .gdi_hd
+                AND         D0, #$DF
+                CMP         D0, #$41
+                BCC         .gdi_done
+                CMP         D0, #$47
+                BCS         .gdi_done
+                SUB         D0, #$37
+                BRA         .gdi_ha
+.gdi_hd:        SUB         D0, #$30
+.gdi_ha:        SHL4        D2
+                OR          D2, D0
+                ADD         X0, #1
+                BRA         .gdi_hl
+
+.gdi_done:      CMP         D3, #0
+                BEQ         .gdi_pos
+                LOADI       D0, #0
+                SUB         D0, D2
+                MOVE        D2, D0
+.gdi_pos:       LOADB       D0, [XY0]
+                CMP         D0, #$2C
+                BNE         .gdi_eod
+                ADD         X0, #1
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                MOVE        D0, D2
+                RET
+.gdi_eod:       LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                CALL        advance_dataline
+                MOVE        D0, D2
+                RET
+
+; Get next string DATA item -> TMPLEN/TMPPTR
+get_data_str:
+                CALL        find_data_pos
+                LOADP       D0, Y3, [#ZP_DATAPOS]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+
+.gds_skip:      LOADB       D0, [XY0]
+                CMP         D0, #$20
+                BNE         .gds_start
+                ADD         X0, #1
+                BRA         .gds_skip
+
+.gds_start:     CMP         D0, #$22
+                BEQ         .gds_quoted
+
+                ; Unquoted
+                LOADI       X1, #TMPSTR_BUF
+                LOADI       Y1, #RAM_PAGE
+                LOADI       D2, #0
+.gds_copy:      LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .gds_done
+                CMP         D0, #$2C
+                BEQ         .gds_done
+                STOREB      D0, [XY1]
+                ADD         X0, #1
+                ADD         X1, #1
+                ADD         D2, #1
+                BRA         .gds_copy
+
+.gds_quoted:    ADD         X0, #1
+                LOADI       X1, #TMPSTR_BUF
+                LOADI       Y1, #RAM_PAGE
+                LOADI       D2, #0
+.gds_qcopy:     LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .gds_done
+                CMP         D0, #$22
+                BEQ         .gds_qend
+                STOREB      D0, [XY1]
+                ADD         X0, #1
+                ADD         X1, #1
+                ADD         D2, #1
+                BRA         .gds_qcopy
+.gds_qend:      ADD         X0, #1
+
+.gds_done:      LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                STOREP      D2, Y3, [#ZP_TMPLEN]
+
+                LOADB       D0, [XY0]
+                CMP         D0, #$2C
+                BNE         .gds_eod
+                ADD         X0, #1
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                RET
+.gds_eod:       LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+                CALL        advance_dataline
+                RET
+
+; Advance DATALINE past current line
+advance_dataline:
+                LOADP       D0, Y3, [#ZP_DATALINE]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+                ADD         X0, #2
+.adl_sk:        LOADB       D0, [XY0]
+                ADD         X0, #1
+                CMP         D0, #0
+                BNE         .adl_sk
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_DATALINE]
+                RET
+
+; Scan for next DATA statement
+find_data_pos:
+                LOADP       D0, Y3, [#ZP_DATAPOS]
+                CMP         D0, #0
+                BNE         .fdp_done
+                LOADP       D0, Y3, [#ZP_DATALINE]
+                MOVE        X0, D0
+                LOADI       Y0, #PROG_PAGE
+
+.fdp_scan:      LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .fdp_ood
+                MOVE        D1, X0
+                ADD         X0, #2
+.fdp_sp:        LOADB       D0, [XY0]
+                CMP         D0, #$20
+                BNE         .fdp_chk
+                ADD         X0, #1
+                BRA         .fdp_sp
+.fdp_chk:       CMP         D0, #TOK_DATA        ; DATA token byte
+                BNE         .fdp_next
+                ADD         X0, #1               ; skip past token byte
+                ; Found DATA
+                STOREP      D1, Y3, [#ZP_DATALINE]
+                MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_DATAPOS]
+.fdp_done:      RET
+
+.fdp_next:      MOVE        X0, D1
+                ADD         X0, #2
+.fdp_sk:        LOADB       D0, [XY0]
+                ADD         X0, #1
+                CMP         D0, #0
+                BNE         .fdp_sk
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                BRA         .fdp_scan
+
+.fdp_ood:
+                LOADI       X0, #<STR_DATERR
+                LOADI       Y0, #>STR_DATERR
+                BRA         error_msg
+
+; ============================================================================
+; FIND_LINE - Find program line by number
+; Input: D0 = line number
+; Output: D0 = offset into PROG_PAGE, or $FFFF if not found
+; ============================================================================
+
+find_line:
+                MOVE        D1, D0
+                LOADI       X0, #$0000
+                LOADI       Y0, #PROG_PAGE
+.fl_loop:       LOADD       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .fl_nf
+                CMP         D0, D1
+                BEQ         .fl_found
+                BCS         .fl_nf
+                ADD         X0, #2
+.fl_skip:       LOADB       D0, [XY0]
+                ADD         X0, #1
+                CMP         D0, #0
+                BNE         .fl_skip
+                ADD         X0, #1
+                AND         X0, #$FFFE
+                BRA         .fl_loop
+.fl_found:      MOVE        D0, X0
+                RET
+.fl_nf:         LOADI       D0, #$FFFF
+                RET
+
+; ============================================================================
+; ARRAY_ADDR - Get address of array element
+; Input: D0 = var index (0-25), D2 = subscript
+; Output: D0 = address in page $00
+; ============================================================================
+
+array_addr:
+                PUSH        D2, XY3
+                MOVE        D1, D0
+                SHL         D1
+                SHL         D1
+                ADD         D1, #ZP_ARRAYS
+                MOVE        X0, D1
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]           ; dimension
+                CMP         D0, #0
+                BEQ         .aa_undim
+                ADD         X0, #2
+                LOADD       D1, [XY0]           ; base
+                POP         D2, XY3
+                CMP         D2, D0
+                BCS         .aa_range
+                SHL         D2
+                ADD         D2, D1
+                MOVE        D0, D2
+                RET
+.aa_undim:      POP         D2, XY3
+                LOADI       X0, #<STR_DIMERR
+                LOADI       Y0, #>STR_DIMERR
+                BRA         error_msg
+.aa_range:
+                LOADI       X0, #<STR_SUBERR
+                LOADI       Y0, #>STR_SUBERR
+                BRA         error_msg
+
+; ============================================================================
+; IS_STRING_EXPR - Check if next token is a string expression
+; Returns D0=1 if string, D0=0 if not
+; ============================================================================
+
+is_string_expr:
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+
+                ; String literal?
+                LOADB       D0, [XY0]
+                CMP         D0, #$22             ; '"'
+                BEQ         .ise_yes
+
+                ; String function token? ($AB-$B0)
+                CMP         D0, #TOK_CHRS
+                BCC         .ise_chkvar
+                CMP         D0, #TOK_MIDS+1
+                BCC         .ise_yes
+
+.ise_chkvar:    ; Check for A$..Z$ variable pattern
+                CMP         D0, #$61
+                BCC         .ise_c1
+                AND         D0, #$DF
+.ise_c1:        CMP         D0, #$41
+                BCC         .ise_no
+                CMP         D0, #$5B
+                BCS         .ise_no
+                ADD         X0, #1
+                LOADB       D0, [XY0]
+                CMP         D0, #$24             ; '$'
+                BEQ         .ise_yes
+
+.ise_no:        LOADI       D0, #0
+                RET
+.ise_yes:       LOADI       D0, #1
+                RET
+
+; ============================================================================
+; NUMERIC EXPRESSION EVALUATOR
+; Recursive descent with precedence levels:
+;   Level 0: OR
+;   Level 1: AND
+;   Level 2: Comparison (= <> < > <= >=)
+;   Level 3: Addition (+, -)
+;   Level 4: Multiplication (*, /, MOD)
+;   Level 5: Unary (-, NOT)
+;   Level 6: Atom (number, variable, function, array, parenthesized)
+; ============================================================================
+
+expr:           BRA         expr_l0
+
+expr_l0:        ; OR
+                CALL        expr_l1
+.l0_loop:       PUSH        D0, XY3             ; save left operand
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #TOK_OR
+                BNE         .l0_done
+                CALL        get_char             ; consume OR token
+                CALL        expr_l1
+                POP         D1, XY3
+                OR          D0, D1
+                BRA         .l0_loop
+.l0_done:       POP         D0, XY3
+                RET
+
+expr_l1:        ; AND / XOR
+                CALL        expr_l2
+.l1_loop:       PUSH        D0, XY3             ; save left operand
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #TOK_AND
+                BEQ         .l1_and
+                CMP         D0, #TOK_XOR
+                BEQ         .l1_xor
+                BRA         .l1_done
+.l1_and:        CALL        get_char             ; consume AND token
+                CALL        expr_l2
+                POP         D1, XY3
+                AND         D0, D1
+                BRA         .l1_loop
+.l1_xor:        CALL        get_char             ; consume XOR token
+                CALL        expr_l2
+                POP         D1, XY3
+                XOR         D0, D1
+                BRA         .l1_loop
+.l1_done:       POP         D0, XY3
+                RET
+
+expr_l2:        ; Comparison - string or numeric
+                ; Check if left side is a string expression
+                CALL        skip_spaces
+                CALL        is_string_expr
+                CMP         D0, #1
+                BEQ         .l2_strcmp
+
+                ; Numeric comparison
+                CALL        expr_l3
+.l2_loop:       PUSH        D0, XY3             ; save left operand
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$3D
+                BEQ         .l2_eq
+                CMP         D0, #$3C
+                BEQ         .l2_lt
+                CMP         D0, #$3E
+                BEQ         .l2_gt
+                CMP         D0, #TOK_LE
+                BEQ         .l2_le
+                CMP         D0, #TOK_GE
+                BEQ         .l2_ge
+                CMP         D0, #TOK_NE
+                BEQ         .l2_ne
+                POP         D0, XY3
+                RET
+
+.l2_eq:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SEQ         D0                  ; D0 = $FFFF if equal, else $0000
+                BRA         .l2_loop
+
+.l2_lt:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SLT         D0                  ; D0 = $FFFF if D1 < D0
+                BRA         .l2_loop
+
+.l2_ne:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SNE         D0                  ; D0 = $FFFF if not equal
+                BRA         .l2_loop
+
+.l2_le:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SLE         D0                  ; D0 = $FFFF if D1 <= D0
+                BRA         .l2_loop
+
+.l2_gt:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SGT         D0                  ; D0 = $FFFF if D1 > D0
+                BRA         .l2_loop
+
+.l2_ge:         CALL        get_char
+                CALL        expr_l3
+                POP         D1, XY3
+                CMP         D1, D0
+                SGE         D0                  ; D0 = $FFFF if D1 >= D0
+                BRA         .l2_loop
+
+; --- String comparison handler ---
+; Evaluates: str_expr OP str_expr  where OP is =, <>, <, >, <=, >=
+; Returns -1 (true) or 0 (false) as numeric
+
+.l2_strcmp:
+                CALL        str_expr             ; left -> TMPLEN/TMPPTR
+                ; Save left string to TMPSTR2_BUF
+                LOADP       D2, Y3, [#ZP_TMPLEN]
+                LOADP       D3, Y3, [#ZP_TMPPTR]
+                PUSH        D2, XY3              ; save len1
+                LOADI       X0, #TMPSTR2_BUF
+                LOADI       Y0, #RAM_PAGE
+                MOVE        X1, D3
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D0, D2
+                CALL        memcpy
+                ; Parse and encode operator as 0-5
+                CALL        skip_spaces
+                CALL        get_char
+                CMP         D0, #$3D             ; '='
+                BEQ         .l2sc_enc_eq
+                CMP         D0, #$3C             ; '<'
+                BEQ         .l2sc_enc_lt
+                CMP         D0, #$3E             ; '>'
+                BEQ         .l2sc_enc_gt
+                CMP         D0, #TOK_NE
+                BEQ         .l2sc_enc_ne
+                CMP         D0, #TOK_LE
+                BEQ         .l2sc_enc_le
+                CMP         D0, #TOK_GE
+                BEQ         .l2sc_enc_ge
+                ; Shouldn't reach here - syntax error
+                POP         D0, XY3
+                LOADI       D0, #0
+                BRA         .l2_loop
+
+.l2sc_enc_eq:   LOADI       D0, #0               ; 0 = EQ
+                BRA         .l2sc_go
+.l2sc_enc_lt:   LOADI       D0, #2               ; 2 = LT (just '<')
+                BRA         .l2sc_go
+.l2sc_enc_ne:   LOADI       D0, #1               ; 1 = NE
+                BRA         .l2sc_go
+.l2sc_enc_le:   LOADI       D0, #4               ; 4 = LE
+                BRA         .l2sc_go
+.l2sc_enc_gt:   LOADI       D0, #3               ; 3 = GT (just '>')
+                BRA         .l2sc_go
+.l2sc_enc_ge:   LOADI       D0, #5               ; 5 = GE
+
+.l2sc_go:       PUSH        D0, XY3              ; save op code
+
+                ; Evaluate right string
+                CALL        skip_spaces
+                CALL        str_expr             ; right -> TMPLEN/TMPPTR
+
+                ; Compare TMPSTR2_BUF(len1) vs TMPPTR(TMPLEN)
+                ; str_compare: left=TMPSTR2_BUF, D2=len1, right=TMPPTR, D3=TMPLEN
+                POP         D1, XY3              ; D1 = op code
+                POP         D2, XY3              ; D2 = len1
+                CALL        str_compare          ; D0 = -1, 0, or 1
+
+                ; Apply operator
+                CMP         D1, #0               ; EQ
+                BEQ         .l2sc_op_eq
+                CMP         D1, #1               ; NE
+                BEQ         .l2sc_op_ne
+                CMP         D1, #2               ; LT
+                BEQ         .l2sc_op_lt
+                CMP         D1, #3               ; GT
+                BEQ         .l2sc_op_gt
+                CMP         D1, #4               ; LE
+                BEQ         .l2sc_op_le
+                                                 ; 5 = GE (fall through)
+.l2sc_op_ge:    CMP         D0, #0
+                SGE         D0
+                BRA         .l2_loop
+.l2sc_op_eq:    CMP         D0, #0
+                SEQ         D0
+                BRA         .l2_loop
+.l2sc_op_ne:    CMP         D0, #0
+                SNE         D0
+                BRA         .l2_loop
+.l2sc_op_lt:    CMP         D0, #0
+                SLT         D0
+                BRA         .l2_loop
+.l2sc_op_gt:    CMP         D0, #0
+                SGT         D0
+                BRA         .l2_loop
+.l2sc_op_le:    CMP         D0, #0
+                SLE         D0
+                BRA         .l2_loop
+
+expr_l3:        ; Addition
+                CALL        expr_l4
+.l3_loop:       PUSH        D0, XY3             ; save left operand
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2B
+                BEQ         .l3_add
+                CMP         D0, #$2D
+                BEQ         .l3_sub
+                POP         D0, XY3
+                RET
+
+.l3_add:        CALL        get_char
+                CALL        expr_l4
+                POP         D1, XY3
+                ADD         D0, D1
+                BRA         .l3_loop
+.l3_sub:        CALL        get_char
+                CALL        expr_l4
+                MOVE        D1, D0
+                POP         D0, XY3
+                SUB         D0, D1
+                BRA         .l3_loop
+
+expr_l4:        ; Multiplication, Division, MOD
+                CALL        expr_l5
+.l4_loop:       PUSH        D0, XY3             ; save left operand
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2A
+                BEQ         .l4_mul
+                CMP         D0, #$2F
+                BEQ         .l4_div
+                CMP         D0, #TOK_MOD
+                BEQ         .l4_mod
+                POP         D0, XY3
+                RET
+
+.l4_mul:        CALL        get_char
+                CALL        expr_l5
+                POP         D1, XY3
+                CALL        mul_16x16
+                BRA         .l4_loop
+
+.l4_div:        CALL        get_char
+                CALL        expr_l5
+                MOVE        D1, D0
+                POP         D0, XY3
+                CMP         D1, #0
+                BEQ         .l4_div0
+                CALL        divide_16
+                BRA         .l4_loop
+
+.l4_mod:        CALL        get_char             ; consume MOD token
+                CALL        expr_l5
+                MOVE        D1, D0
+                POP         D0, XY3
+                CMP         D1, #0
+                BEQ         .l4_div0
+                CALL        umod_16
+                BRA         .l4_loop
+
+.l4_div0:
+                LOADI       X0, #<STR_DIVERR
+                LOADI       Y0, #>STR_DIVERR
+                BRA         error_msg
+
+expr_l5:        ; Unary
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2D
+                BEQ         .l5_neg
+                CMP         D0, #TOK_NOT
+                BEQ         .l5_not
+                BRA         expr_l6
+
+.l5_neg:        CALL        get_char
+                CALL        expr_l6
+                LOADI       D1, #0
+                SUB         D1, D0
+                MOVE        D0, D1
+                RET
+
+.l5_not:        CALL        get_char             ; consume NOT token
+                CALL        expr_l6
+                NOT         D0
+                RET
+
+expr_l6:        ; Atom
+                CALL        skip_spaces
+                CALL        peek_char
+
+                ; Parenthesized
+                CMP         D0, #$28
+                BEQ         .l6_paren
+
+                ; Hex literal
+                CMP         D0, #$24
+                BEQ         .l6_hex
+
+                ; Decimal number
+                CMP         D0, #$30
+                BCC         .l6_nonum
+                CMP         D0, #$3A
+                BCC         .l6_decimal
+
+.l6_nonum:      ; Function token, variable, or array
+
+                ; Check for function tokens ($A3-$B0)
+                CMP         D0, #TOK_ABS
+                BCC         .l6_not_fn
+                CMP         D0, #TOK_VAL+1
+                BCC         .l6_fn_dispatch
+
+.l6_not_fn:     ; Variable or array (A-Z, a-z)
+                CMP         D0, #$61
+                BCC         .l6_uc
+                AND         D0, #$DF
+.l6_uc:         CMP         D0, #$41
+                BCC         .l6_syntax
+                CMP         D0, #$5B
+                BCS         .l6_syntax
+
+                ; Variable or array
+                CALL        get_char
+                AND         D0, #$DF
+                SUB         D0, #$41
+
+                ; Check for array access
+                PUSH        D0, XY3
+                CALL        peek_char
+                CMP         D0, #$28
+                BEQ         .l6_array
+                POP         D0, XY3
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                RET
+
+.l6_array:      CALL        get_char             ; consume '('
+                LOADD       D0, [XY3]             ; var index
+                CALL        expr                 ; subscript
+                MOVE        D2, D0
+                CALL        skip_spaces
+                CALL        get_char             ; consume ')'
+                POP         D0, XY3
+                CALL        array_addr
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                RET
+
+.l6_paren:      CALL        get_char
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char
+                POP         D0, XY3
+                RET
+
+.l6_decimal:    CALL        get_char
+                SUB         D0, #$30
+                MOVE        D2, D0
+.l6_dloop:      CALL        peek_char
+                CMP         D0, #$30
+                BCC         .l6_ddone
+                CMP         D0, #$3A
+                BCS         .l6_ddone
+                CALL        get_char
+                SUB         D0, #$30
+                MOVE        D1, D2
+                SHL         D2
+                SHL         D2
+                ADD         D2, D1
+                SHL         D2
+                ADD         D2, D0
+                BRA         .l6_dloop
+.l6_ddone:      MOVE        D0, D2
+                RET
+
+.l6_hex:        CALL        get_char
+                LOADI       D2, #0
+.l6_hloop:      CALL        peek_char
+                CMP         D0, #$30
+                BCC         .l6_hdone
+                CMP         D0, #$3A
+                BCC         .l6_hdigit
+                AND         D0, #$DF
+                CMP         D0, #$41
+                BCC         .l6_hdone
+                CMP         D0, #$47
+                BCS         .l6_hdone
+                CALL        get_char
+                AND         D0, #$DF
+                SUB         D0, #$37
+                BRA         .l6_haccum
+.l6_hdigit:     CALL        get_char
+                SUB         D0, #$30
+.l6_haccum:     SHL4        D2
+                OR          D2, D0
+                BRA         .l6_hloop
+.l6_hdone:      MOVE        D0, D2
+                RET
+
+.l6_syntax:
+                LOADI       X0, #<STR_SYNERR
+                LOADI       Y0, #>STR_SYNERR
+                BRA         error_msg
+
+
+; --- Function token dispatch ---
+.l6_fn_dispatch:
+                CALL        get_char             ; consume function token
+                CMP         D0, #TOK_ABS
+                BEQ         .l6_abs
+                CMP         D0, #TOK_ASC
+                BEQ         .l6_asc
+                CMP         D0, #TOK_RND
+                BEQ         .l6_rnd
+                CMP         D0, #TOK_SGN
+                BEQ         .l6_sgn
+                CMP         D0, #TOK_PEEK
+                BEQ         .l6_peek
+                CMP         D0, #TOK_DEEK
+                BEQ         .l6_deek
+                CMP         D0, #TOK_LEN
+                BEQ         .l6_len
+                CMP         D0, #TOK_VAL
+                BEQ         .l6_val
+                BRA         .l6_syntax           ; unknown function token
+
+.l6_abs:        CALL        .l6_fn_paren
+                CMP         D0, #0
+                BGE         .l6_abs_pos
+                LOADI       D1, #0
+                SUB         D1, D0
+                MOVE        D0, D1
+.l6_abs_pos:    RET
+
+.l6_asc:        CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                CMP         D0, #0
+                BEQ         .l6_asc_zero
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                RET
+.l6_asc_zero:   LOADI       D0, #0
+                RET
+
+.l6_rnd:        CALL        .l6_fn_paren
+                PUSH        D0, XY3
+                LOADP       D0, Y3, [#ZP_RNDSEED]
+                LOADI       D1, #$6255
+                CALL        mul_16x16
+                ADD         D0, #$3619
+                STOREP      D0, Y3, [#ZP_RNDSEED]
+                POP         D1, XY3
+                CMP         D1, #0
+                BEQ         .l6_rnd_done
+                PUSH        D1, XY3
+                AND         D0, #$7FFF
+                POP         D1, XY3
+                CALL        umod_16
+.l6_rnd_done:   RET
+
+.l6_sgn:        CALL        .l6_fn_paren
+                CMP         D0, #0
+                BEQ         .l6_sgn_z
+                BGT         .l6_sgn_p
+                LOADI       D0, #$FFFF
+                RET
+.l6_sgn_z:      LOADI       D0, #0
+                RET
+.l6_sgn_p:      LOADI       D0, #1
+                RET
+
+.l6_peek:       CALL        .l6_fn_paren
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADB       D0, [XY0]
+                RET
+
+.l6_deek:       CALL        .l6_fn_paren
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                RET
+
+.l6_len:        CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                LOADP       D0, Y3, [#ZP_TMPLEN]
+                RET
+
+.l6_val:        CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                CALL        parse_input_number
+                RET
+.l6_var_fallback:
+                CALL        get_char
+                AND         D0, #$DF
+                SUB         D0, #$41
+                SHL         D0
+                ADD         D0, #ZP_VARS
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D0, [XY0]
+                RET
+
+; Helper: parse expression in parens - consumes '(' expr ')'
+.l6_fn_paren:   CALL        skip_spaces
+                CALL        get_char             ; consume '('
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; consume ')'
+                POP         D0, XY3
+                RET
+
+; ============================================================================
+; STRING EXPRESSION EVALUATOR
+; Result returned in ZP_TMPLEN / ZP_TMPPTR (page $00)
+; Supports: A$, string literals, CHR$, STR$, HEX$, LEFT$, RIGHT$, MID$
+; String concatenation via +
+; ============================================================================
+
+str_expr:
+                CALL        skip_spaces
+                CALL        str_atom
+
+                ; Check for concatenation
+.se_loop:       CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2B
+                BNE         .se_done
+
+                ; Save str1 to TMPSTR2_BUF so str_atom can safely use TMPSTR_BUF
+                LOADP       D2, Y3, [#ZP_TMPLEN]
+                LOADP       D3, Y3, [#ZP_TMPPTR]
+                LOADI       X0, #TMPSTR2_BUF
+                LOADI       Y0, #RAM_PAGE
+                MOVE        X1, D3
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D0, D2
+                CALL        memcpy
+                PUSH        D2, XY3             ; len1
+
+                CALL        get_char             ; consume '+'
+                CALL        skip_spaces
+                CALL        str_atom             ; str2 -> TMPLEN/TMPPTR (may use TMPSTR_BUF)
+
+                ; Concatenate: TMPSTR2_BUF(str1) + TMPPTR(str2) -> TMPSTR_BUF
+                POP         D2, XY3             ; len1
+                LOADP       D3, Y3, [#ZP_TMPLEN] ; len2
+
+                ; Copy str1 from TMPSTR2 to TMPSTR_BUF
+                LOADI       X0, #TMPSTR_BUF
+                LOADI       Y0, #RAM_PAGE
+                LOADI       X1, #TMPSTR2_BUF
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D0, D2
+                PUSH        D2, XY3
+                PUSH        D3, XY3
+                CALL        memcpy
+                POP         D3, XY3
+                POP         D2, XY3
+                ; XY0 now points past str1 in TMPSTR_BUF
+
+                ; Copy str2 from TMPPTR
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X1, D0
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D0, D3
+                CALL        memcpy
+
+                ADD         D2, D3
+                LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                STOREP      D2, Y3, [#ZP_TMPLEN]
+                BRA         .se_loop
+
+.se_done:       RET
+
+str_atom:
+                CALL        skip_spaces
+                CALL        peek_char
+
+                ; String literal
+                CMP         D0, #$22
+                BEQ         .sa_literal
+
+                ; String function tokens ($AB-$B0)
+                CMP         D0, #TOK_CHRS
+                BEQ         .sa_chr
+                CMP         D0, #TOK_STRS
+                BEQ         .sa_str
+                CMP         D0, #TOK_HEXS
+                BEQ         .sa_hex
+                CMP         D0, #TOK_LEFTS
+                BEQ         .sa_left
+                CMP         D0, #TOK_RIGHTS
+                BEQ         .sa_right
+                CMP         D0, #TOK_MIDS
+                BEQ         .sa_mid
+
+                ; Variable A$ (letter followed by $)
+                AND         D0, #$DF
+                CMP         D0, #$41
+                BCC         .sa_err
+                CMP         D0, #$5B
+                BCS         .sa_err
+                CALL        get_char
+                AND         D0, #$DF
+                SUB         D0, #$41
+                PUSH        D0, XY3
+                CALL        get_char             ; consume '$'
+                POP         D0, XY3
+                SHL         D0
+                SHL         D0
+                ADD         D0, #ZP_STRVARS
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADD       D1, [XY0]           ; length
+                ADD         X0, #2
+                LOADD       D2, [XY0]           ; pointer
+                STOREP      D1, Y3, [#ZP_TMPLEN]
+                STOREP      D2, Y3, [#ZP_TMPPTR]
+                RET
+
+.sa_literal:    CALL        get_char             ; consume '"'
+                LOADP       D0, Y3, [#ZP_TXTPOS]
+                MOVE        X0, D0
+                CALL        get_text_page
+
+                LOADI       X1, #TMPSTR_BUF
+                LOADI       Y1, #RAM_PAGE
+                LOADI       D2, #0
+
+.sa_lit_loop:   LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .sa_lit_done
+                CMP         D0, #$22
+                BEQ         .sa_lit_end
+                STOREB      D0, [XY1]
+                ADD         X0, #1
+                ADD         X1, #1
+                ADD         D2, #1
+                BRA         .sa_lit_loop
+
+.sa_lit_end:    ADD         X0, #1
+.sa_lit_done:   MOVE        D0, X0
+                STOREP      D0, Y3, [#ZP_TXTPOS]
+                LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                STOREP      D2, Y3, [#ZP_TMPLEN]
+                RET
+
+.sa_err:        LOADI       X0, #<STR_TYPERR
+                LOADI       Y0, #>STR_TYPERR
+                BRA         error_msg
+
+; --- CHR$(n) ---
+.sa_chr:        CALL        get_char             ; consume CHR$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3
+
+                LOADI       X0, #TMPSTR_BUF
+                LOADI       Y0, #RAM_PAGE
+                STOREB      D0, [XY0]
+                LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                LOADI       D0, #1
+                STOREP      D0, Y3, [#ZP_TMPLEN]
+                RET
+
+; --- STR$(n) ---
+.sa_str:        CALL        get_char             ; consume STR$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3
+                CALL        int_to_str
+                RET
+
+; --- HEX$(n) ---
+.sa_hex:        CALL        get_char             ; consume HEX$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        expr
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3
+                CALL        int_to_hex
+                RET
+
+; --- LEFT$(s$, n) ---
+.sa_left:       CALL        get_char             ; consume LEFT$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ','
+                CALL        expr                 ; n
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3
+
+                LOADP       D1, Y3, [#ZP_TMPLEN]
+                CMP         D0, D1
+                BCC         .left_trunc
+                RET                              ; already <= n
+.left_trunc:    STOREP      D0, Y3, [#ZP_TMPLEN]
+                RET
+
+; --- RIGHT$(s$, n) ---
+.sa_right:      CALL        get_char             ; consume RIGHT$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ','
+                CALL        expr                 ; n
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3
+
+                LOADP       D1, Y3, [#ZP_TMPLEN]
+                CMP         D0, D1
+                BCS         .right_all
+                MOVE        D2, D1
+                SUB         D2, D0
+                LOADP       D1, Y3, [#ZP_TMPPTR]
+                ADD         D1, D2
+                STOREP      D1, Y3, [#ZP_TMPPTR]
+                STOREP      D0, Y3, [#ZP_TMPLEN]
+.right_all:     RET
+
+; --- MID$(s$, start [, len]) ---
+.sa_mid:        CALL        get_char             ; consume MID$ token
+                CALL        skip_spaces
+                CALL        get_char             ; '('
+                CALL        str_expr
+                CALL        skip_spaces
+                CALL        get_char             ; ','
+                CALL        expr                 ; start (1-based)
+                SUB         D0, #1
+                PUSH        D0, XY3             ; 0-based start
+
+                ; Check for optional length
+                CALL        skip_spaces
+                CALL        peek_char
+                CMP         D0, #$2C
+                BEQ         .mid_haslen
+
+                ; No length - take from start to end
+                CALL        get_char             ; ')'
+                POP         D0, XY3             ; start
+                LOADP       D1, Y3, [#ZP_TMPLEN]
+                CMP         D0, D1
+                BCS         .mid_empty
+                SUB         D1, D0
+                LOADP       D2, Y3, [#ZP_TMPPTR]
+                ADD         D2, D0
+                STOREP      D2, Y3, [#ZP_TMPPTR]
+                STOREP      D1, Y3, [#ZP_TMPLEN]
+                RET
+
+.mid_haslen:    CALL        get_char             ; ','
+                CALL        expr                 ; length
+                PUSH        D0, XY3
+                CALL        skip_spaces
+                CALL        get_char             ; ')'
+                POP         D0, XY3             ; length
+                POP         D1, XY3             ; start
+
+                LOADP       D2, Y3, [#ZP_TMPLEN]
+                CMP         D1, D2
+                BCS         .mid_empty
+                SUB         D2, D1
+                CMP         D0, D2
+                BCC         .mid_ok
+                MOVE        D0, D2
+.mid_ok:        LOADP       D2, Y3, [#ZP_TMPPTR]
+                ADD         D2, D1
+                STOREP      D2, Y3, [#ZP_TMPPTR]
+                STOREP      D0, Y3, [#ZP_TMPLEN]
+                RET
+
+.mid_empty:     LOADI       D0, #0
+                STOREP      D0, Y3, [#ZP_TMPLEN]
+                RET
+
+; ============================================================================
+; INT_TO_STR - Convert signed D0 to string in TMPSTR_BUF
+; Sets ZP_TMPLEN, ZP_TMPPTR
+; ============================================================================
+
+int_to_str:
+                LOADI       X0, #TMPSTR_BUF
+                LOADI       Y0, #RAM_PAGE
+                LOADI       D2, #0               ; length counter
+                CMP         D0, #0
+                BGE         .its_pos
+                PUSH        D0, XY3
+                LOADI       D0, #$2D
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                ADD         D2, #1
+                POP         D0, XY3
+                LOADI       D1, #0
+                SUB         D1, D0
+                MOVE        D0, D1
+.its_pos:       PUSH        D2, XY3
+                PUSH        X0, XY3
+                CALL        .its_recur
+                POP         X0, XY3
+                POP         D2, XY3
+                ADD         D2, D0
+                LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                STOREP      D2, Y3, [#ZP_TMPLEN]
+                RET
+
+.its_recur:     CMP         D0, #10
+                BCC         .its_single
+                CALL        div10                ; D0 = quotient, D1 = remainder
+                PUSH        D1, XY3              ; save remainder
+                CALL        .its_recur            ; recurse with quotient
+                MOVE        D3, D0               ; D3 = count
+                POP         D0, XY3              ; remainder digit
+                ADD         D0, #$30
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                MOVE        D0, D3
+                ADD         D0, #1
+                RET
+.its_single:    ADD         D0, #$30
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                LOADI       D0, #1
+                RET
+
+; ============================================================================
+; INT_TO_HEX - Convert D0 to hex string in TMPSTR_BUF
+; Sets ZP_TMPLEN, ZP_TMPPTR
+; ============================================================================
+
+int_to_hex:
+                LOADI       X0, #TMPSTR_BUF
+                LOADI       Y0, #RAM_PAGE
+                PUSH        D0, XY3
+
+                ; Always output 4 hex digits
+                SHR4        D0
+                SHR4        D0
+                SHR4        D0
+                AND         D0, #$0F
+                CALL        .ith_digit
+                LOADD       D0, [XY3]
+                SHR4        D0
+                SHR4        D0
+                AND         D0, #$0F
+                CALL        .ith_digit
+                LOADD       D0, [XY3]
+                SHR4        D0
+                AND         D0, #$0F
+                CALL        .ith_digit
+                POP         D0, XY3
+                AND         D0, #$0F
+                CALL        .ith_digit
+
+                LOADI       D0, #TMPSTR_BUF
+                STOREP      D0, Y3, [#ZP_TMPPTR]
+                LOADI       D0, #4
+                STOREP      D0, Y3, [#ZP_TMPLEN]
+                RET
+
+.ith_digit:     CMP         D0, #10
+                BCS         .ith_af
+                ADD         D0, #$30
+                BRA         .ith_store
+.ith_af:        ADD         D0, #$37
+.ith_store:     STOREB      D0, [XY0]
+                ADD         X0, #1
+                RET
+
+; ============================================================================
+; MEMCPY - Copy D0 bytes from XY1 to XY0 (pages pre-set by caller)
+; Handles D0=0. Clobbers D0, D1. XY0/XY1 advanced past end.
+; ============================================================================
+
+memcpy:
+                CMP         D0, #0
+                BEQ         .mc_done
+.mc_loop:       LOADB       D1, [XY1]
+                STOREB      D1, [XY0]
+                ADD         X0, #1
+                ADD         X1, #1
+                SUB         D0, #1
+                BNE         .mc_loop
+.mc_done:       RET
+
+; ============================================================================
+; STR_POOL_ALLOC - Allocate D0 bytes in string pool with GC retry
+; Input:  D0 = bytes needed
+; Output: D2 = pointer to allocated space
+;         D0 = 0 success, D0 = -1 ($FFFF) out of memory
+; Clobbers D1
+; ============================================================================
+
+str_pool_alloc:
+                LOADP       D2, Y3, [#ZP_STRPOOL]
+                SUB         D2, D0
+                LOADP       D1, Y3, [#ZP_ARRTOP]
+                CMP         D2, D1
+                BCS         .spa_ok
+                ; GC and retry
+                PUSH        D0, XY3
+                CALL        str_gc
+                POP         D0, XY3
+                LOADP       D2, Y3, [#ZP_STRPOOL]
+                SUB         D2, D0
+                LOADP       D1, Y3, [#ZP_ARRTOP]
+                CMP         D2, D1
+                BCC         .spa_fail
+.spa_ok:        STOREP      D2, Y3, [#ZP_STRPOOL]
+                LOADI       D0, #0
+                RET
+.spa_fail:      LOADI       D0, #$FFFF
+                RET
+
+; ============================================================================
+; STR_COMPARE - Lexicographic string comparison
+; Left:  TMPSTR2_BUF, length in D2
+; Right: ZP_TMPPTR, length in ZP_TMPLEN
+; Returns D0: -1 if left<right, 0 if equal, 1 if left>right
+; ============================================================================
+
+str_compare:
+                LOADP       D3, Y3, [#ZP_TMPLEN] ; len2
+                LOADI       X0, #TMPSTR2_BUF
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_TMPPTR]
+                MOVE        X1, D0
+                LOADI       Y1, #RAM_PAGE
+
+                ; Compare min(len1, len2) bytes
+                MOVE        D0, D2
+                CMP         D3, D0
+                BCS         .scmp_loop
+                MOVE        D0, D3               ; D0 = min length
+.scmp_loop:     CMP         D0, #0
+                BEQ         .scmp_lenck
+                PUSH        D0, XY3
+                LOADB       D0, [XY0]
+                LOADB       D1, [XY1]
+                CMP         D0, D1
+                BNE         .scmp_diff
+                POP         D0, XY3
+                ADD         X0, #1
+                ADD         X1, #1
+                SUB         D0, #1
+                BRA         .scmp_loop
+
+.scmp_diff:     POP         D1, XY3              ; discard counter
+                BCC         .scmp_lt             ; unsigned: left byte < right byte
+                BRA         .scmp_gt
+
+.scmp_lenck:    ; All compared bytes equal, compare lengths
+                CMP         D2, D3
+                BEQ         .scmp_eq
+                BCC         .scmp_lt             ; len1 < len2 (unsigned)
+
+.scmp_gt:       LOADI       D0, #1
+                RET
+.scmp_lt:       LOADI       D0, #$FFFF
+                RET
+.scmp_eq:       LOADI       D0, #0
+                RET
+
+; ============================================================================
+; STR_GC - String pool garbage collection (compaction)
+; Walks all 26 string variables and compacts live strings to top of pool.
+; Call when allocation fails; retry allocation after return.
+; Clobbers D0-D3, XY0, XY1
+; ============================================================================
+
+str_gc:
+                ; Reset pool to top
+                LOADI       D0, #STRPOOL_TOP
+                STOREP      D0, Y3, [#ZP_STRPOOL]
+
+                ; Walk A$..Z$ (26 descriptors, 4 bytes each at ZP_STRVARS)
+                LOADI       D3, #0               ; var index 0..25
+
+.sgc_loop:      CMP         D3, #26
+                BCS         .sgc_done
+
+                ; Descriptor address: ZP_STRVARS + index*4
+                MOVE        D0, D3
+                SHL         D0
+                SHL         D0
+                ADD         D0, #ZP_STRVARS
+                PUSH        D0, XY3              ; [stack: desc_addr]
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+
+                ; Read length
+                LOADD       D1, [XY0]           ; D1 = length
+                CMP         D1, #0
+                BEQ         .sgc_skip            ; empty string, skip
+
+                ; Read old pointer
+                ADD         X0, #2
+                LOADD       D2, [XY0]           ; D2 = old pointer
+
+                ; Allocate: new_ptr = STRPOOL - length
+                LOADP       D0, Y3, [#ZP_STRPOOL]
+                SUB         D0, D1               ; D0 = new_ptr
+                STOREP      D0, Y3, [#ZP_STRPOOL]
+
+                ; Same position? Skip copy
+                CMP         D0, D2
+                BEQ         .sgc_update
+
+                ; Copy D1 bytes, direction-aware for overlap safety
+                PUSH        D3, XY3              ; save var index
+                PUSH        D1, XY3              ; save length
+                CMP         D0, D2
+                BCS         .sgc_cpbk            ; new > old: copy backward
+
+                ; Forward copy (new < old): safe low-to-high
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                MOVE        X1, D2
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D3, D1
+.sgc_cpf:       LOADB       D0, [XY1]
+                STOREB      D0, [XY0]
+                ADD         X0, #1
+                ADD         X1, #1
+                SUB         D3, #1
+                BNE         .sgc_cpf
+                BRA         .sgc_cpdn
+
+                ; Backward copy (new > old): safe high-to-low
+.sgc_cpbk:      ADD         D0, D1
+                SUB         D0, #1
+                MOVE        X0, D0               ; dest end
+                LOADI       Y0, #RAM_PAGE
+                MOVE        D0, D2
+                ADD         D0, D1
+                SUB         D0, #1
+                MOVE        X1, D0               ; src end
+                LOADI       Y1, #RAM_PAGE
+                MOVE        D3, D1
+.sgc_cpb:       LOADB       D0, [XY1]
+                STOREB      D0, [XY0]
+                SUB         X0, #1
+                SUB         X1, #1
+                SUB         D3, #1
+                BNE         .sgc_cpb
+
+.sgc_cpdn:      POP         D1, XY3              ; restore length
+                POP         D3, XY3              ; restore var index
+
+                ; Update descriptor pointer
+.sgc_update:    POP         D0, XY3              ; desc addr
+                ADD         D0, #2
+                MOVE        X0, D0
+                LOADI       Y0, #RAM_PAGE
+                LOADP       D0, Y3, [#ZP_STRPOOL]
+                STORED      D0, [XY0]           ; new pointer
+                ADD         D3, #1
+                BRA         .sgc_loop
+
+.sgc_skip:      POP         D0, XY3              ; discard desc addr
+                ADD         D3, #1
+                BRA         .sgc_loop
+
+.sgc_done:      RET
+
+; ============================================================================
+; MATH HELPERS
+; ============================================================================
+
+; mul_16x16: D0 = D0 * D1 (16-bit result)
+; Uses MULB ROM lookup for 8x8->16 partial products.
+; Method: result = (n1L*n2L) + ((n1H*n2L + n1L*n2H) << 8)
+; Clobbers D1, D2, D3.
+mul_16x16:
+                ; Extract bytes
+                MOVE        D2, D0
+                HIGH        D2                  ; D2 = n1H (in high byte)
+                AND         D0, #$FF            ; D0 = n1L
+                MOVE        D3, D1
+                HIGH        D3                  ; D3 = n2H (in high byte)
+                AND         D1, #$FF            ; D1 = n2L
+
+                ; Save n1L, n2L, n1H
+                PUSH        D0, XY3             ; save n1L
+                PUSH        D1, XY3             ; save n2L
+                PUSH        D2, XY3             ; save n1H
+                ; Stack: [0]=n1H, [2]=n2L, [4]=n1L
+
+                ; PP0 = n1L * n2L
+                SHL4        D1
+                SHL4        D1                  ; D1 = n2L << 8
+                OR          D0, D1              ; D0 = (n2L<<8) | n1L
+                MULB        D0                  ; D0 = PP0
+                PUSH        D0, XY3             ; save PP0
+                ; Stack: [0]=PP0, [2]=n1H, [4]=n2L, [6]=n1L
+
+                ; PP1 = n1H * n2L
+                LOADD       D0, [XY3+#2]        ; n1H
+                LOADD       D1, [XY3+#4]        ; n2L
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP1
+                MOVE        D2, D0              ; D2 = PP1
+
+                ; PP2 = n1L * n2H (D3 still has n2H)
+                LOADD       D0, [XY3+#6]        ; n1L
+                SHL4        D3
+                SHL4        D3                  ; D3 = n2H << 8
+                OR          D0, D3
+                MULB        D0                  ; D0 = PP2
+
+                ; middle = PP1 + PP2, shift left 8
+                ADD         D0, D2
+                SHL4        D0
+                SHL4        D0                  ; D0 = middle << 8
+
+                ; result = PP0 + (middle << 8)
+                POP         D1, XY3             ; PP0
+                ADD         D0, D1
+
+                ; Cleanup stack (n1H, n2L, n1L = 6 bytes)
+                ADD         X3, #6
+                RET
+
+; mul_16x16_32: 16x16->32 bit multiply using MULB
+; Input:  D0 = n1, D1 = n2
+; Output: D0 = lo16, D1 = hi16
+; Trashes: D2, D3
+; Method: 4 partial products with carry propagation
+mul_16x16_32:
+                ; Extract bytes
+                MOVE        D2, D0
+                HIGH        D2                  ; D2 = n1H
+                AND         D0, #$FF            ; D0 = n1L
+                MOVE        D3, D1
+                HIGH        D3                  ; D3 = n2H
+                AND         D1, #$FF            ; D1 = n2L
+
+                ; Push all 4 operands
+                PUSH        D3, XY3             ; [SP+0] = n2H
+                PUSH        D2, XY3             ; [SP+2] = n1H
+                PUSH        D1, XY3             ; [SP+4] = n2L
+                PUSH        D0, XY3             ; [SP+6] = n1L
+                ; Stack: n1L=0, n2L=2, n1H=4, n2H=6
+
+                ; PP0 = n1L * n2L
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP0
+                PUSH        D0, XY3             ; [SP+0] = PP0
+                ; Stack: PP0=0, n1L=2, n2L=4, n1H=6, n2H=8
+
+                ; PP1 = n1H * n2L
+                LOADD       D0, [XY3+#6]        ; n1H
+                LOADD       D1, [XY3+#4]        ; n2L
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP1
+                MOVE        D2, D0              ; D2 = PP1
+
+                ; PP2 = n1L * n2H
+                LOADD       D0, [XY3+#2]        ; n1L
+                LOADD       D1, [XY3+#8]        ; n2H
+                SHL4        D1
+                SHL4        D1
+                OR          D0, D1
+                MULB        D0                  ; D0 = PP2
+
+                ; middle = PP1 + PP2
+                ADD         D0, D2              ; D0 = middle
+                SCS         D1                  ; D1 = carry ($FFFF or 0)
+                AND         D1, #1              ; D1 = middle_carry
+                MOVE        D2, D0              ; D2 = middle
+
+                ; PP3 = n1H * n2H
+                LOADD       D0, [XY3+#6]        ; n1H
+                LOADD       D3, [XY3+#8]        ; n2H
+                SHL4        D3
+                SHL4        D3
+                OR          D0, D3
+                MULB        D0                  ; D0 = PP3
+
+                ; Combine: D0=PP3, D1=carry, D2=middle
+                MOVE        D3, D2
+                AND         D3, #$FF            ; D3 = middle_lo
+                HIGH        D2                  ; D2 = middle_hi
+
+                ; hi16 = PP3 + middle_hi + (carry << 8)
+                ADD         D0, D2
+                SHL4        D1
+                SHL4        D1                  ; D1 = carry << 8
+                ADD         D0, D1              ; D0 = hi16
+                MOVE        D1, D0              ; D1 = hi16 (save)
+
+                ; lo16 = PP0 + (middle_lo << 8)
+                SHL4        D3
+                SHL4        D3                  ; D3 = middle_lo << 8
+                POP         D0, XY3             ; D0 = PP0
+                ADD         D0, D3              ; D0 = lo16
+                SCS         D2                  ; D2 = lo_carry
+                AND         D2, #1
+                ADD         D1, D2              ; hi16 += lo_carry
+
+                ; D0 = lo16, D1 = hi16
+                ; Cleanup 4 operands (8 bytes)
+                ADD         X3, #8
+                RET
+
+; divide_16: D0 = D0 / D1 (signed)
+; Uses shift-subtract algorithm for accuracy
+divide_16:
+                LOADI       D3, #0               ; sign flag
+
+                ; Handle signs
+                CMP         D0, #0
+                BGE         .dv_pos1
+                LOADI       D2, #0
+                SUB         D2, D0
+                MOVE        D0, D2
+                XOR         D3, #1
+.dv_pos1:       CMP         D1, #0
+                BGE         .dv_pos2
+                LOADI       D2, #0
+                SUB         D2, D1
+                MOVE        D1, D2
+                XOR         D3, #1
+
+.dv_pos2:       ; Unsigned divide D0 / D1
+                CMP         D1, #0
+                BEQ         .dv_zero
+                PUSH        D3, XY3
+                LOADI       D2, #0               ; remainder
+                LOADI       D3, #16              ; bit counter
+
+.dv_loop:       ADD         D0, D0               ; shift left, sets carry
+                ADC         D2, D2               ; shift carry into remainder
+                CMP         D2, D1
+                BCC         .dv_no
+                SUB         D2, D1
+                OR          D0, #1
+.dv_no:         SUB         D3, #1
+                BNE         .dv_loop
+
+                POP         D3, XY3
+                CMP         D3, #0
+                BEQ         .dv_done
+                LOADI       D1, #0
+                SUB         D1, D0
+                MOVE        D0, D1
+.dv_done:       RET
+
+.dv_zero:
+                LOADI       X0, #<STR_DIVERR
+                LOADI       Y0, #>STR_DIVERR
+                BRA         error_msg
+
+; umod_16: D0 = D0 MOD D1 (unsigned)
+umod_16:
+                PUSH        D0, XY3
+                PUSH        D1, XY3
+                CALL        divide_16
+                MOVE        D2, D0
+                POP         D1, XY3
+                CALL        mul_16x16
+                MOVE        D1, D0
+                POP         D0, XY3
+                SUB         D0, D1
+                RET
+
+; div10: D0 = D0 / 10 (unsigned, reciprocal multiply)
+; Input:  D0 = dividend (0-65535)
+; Output: D0 = quotient, D1 = remainder
+; Trashes: D2, D3
+; Method: q = hi16(n * 52429) >> 3, r = n - q*10
+div10:
+                PUSH        D0, XY3             ; save n
+                LOADI       D1, #52429          ; magic multiplier $CCCD
+                CALL        mul_16x16_32        ; D0=lo16, D1=hi16
+
+                ; quotient = hi16 >> 3
+                MOVE        D0, D1              ; D0 = hi16
+                SHR         D0
+                SHR         D0
+                SHR         D0                  ; D0 = quotient
+
+                ; remainder = n - quotient * 10
+                MOVE        D2, D0              ; D2 = quotient (save)
+                ; q*10 = (q<<3) + (q<<1)
+                MOVE        D1, D0
+                SHL         D1                  ; D1 = q*2
+                SHL         D0
+                SHL         D0
+                SHL         D0                  ; D0 = q*8
+                ADD         D0, D1              ; D0 = q*10
+
+                POP         D1, XY3             ; D1 = original n
+                SUB         D1, D0              ; D1 = remainder
+                MOVE        D0, D2              ; D0 = quotient
+                RET
+
+; ============================================================================
+; I/O HELPERS
+; ============================================================================
+
+emit_char:
+                PUSH        XY0, XY3
+                LOADI       X0, #<TERMINAL
+                LOADI       Y0, #>TERMINAL
+                STOREB      D0, [XY0]
+                POP         XY0, XY3
+                RET
+
+print_newline:
+                PUSH        D0, XY3
+                LOADI       D0, #$0A
+                CALL        emit_char
+                POP         D0, XY3
+                RET
+
+print_string:
+                LOADB       D0, [XY0]
+                CMP         D0, #0
+                BEQ         .ps_done
+                PUSH        XY0, XY3
+                CALL        emit_char
+                POP         XY0, XY3
+                ADD         X0, #1
+                BRA         print_string
+.ps_done:       RET
+
+print_signed:
+                CMP         D0, #0
+                BGE         print_unsigned
+                PUSH        D0, XY3
+                LOADI       D0, #$2D
+                CALL        emit_char
+                POP         D0, XY3
+                LOADI       D1, #0
+                SUB         D1, D0
+                MOVE        D0, D1
+
+print_unsigned:
+                CMP         D0, #10
+                BCC         .pu_single
+                CALL        div10                ; D0 = quotient, D1 = remainder
+                PUSH        D1, XY3             ; save remainder
+                CALL        print_unsigned       ; recurse with quotient
+                POP         D0, XY3             ; get remainder
+.pu_single:     ADD         D0, #$30
+                CALL        emit_char
+                RET
+
+; ============================================================================
+; END OF K16 BASIC V2.0
+; ============================================================================
