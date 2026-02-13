@@ -1,4 +1,4 @@
-# How to getting the K16 CPU running.
+# How to get the K16 CPU up and running.
 
 
 
@@ -15,6 +15,7 @@ When opening **K16 CPU.dig**  Digital automatically loads the following files in
 - **ALU0.hex**
 - **ALU1.hex**
 - **ALU2.hex**
+- **ALU3.hex**
 - **CONTROL0.hex**
 - **CONTROL1.hex**
 - **LOOKUP_LO.hex**
@@ -23,7 +24,7 @@ When opening **K16 CPU.dig**  Digital automatically loads the following files in
 - **ProgramLOW.hex**
 
 
-It is <u>important </u>that these files are located in the same directory as **K16 CPU. dig**
+It is <u>important </u>that these files are located in the same directory as **K16 CPU.dig**
 
 
 
