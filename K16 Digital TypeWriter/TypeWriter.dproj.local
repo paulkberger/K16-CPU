@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BorlandProject>
+	<Transactions>
+    <Transaction>2026/02/12 15:38:05.000.618,=C:\Users\paul\OneDrive\Documents\Embarcadero\Studio\Projects\Unit1.pas</Transaction>
+    <Transaction>2026/02/12 15:39:14.000.909,C:\Users\paul\OneDrive\Documents\Embarcadero\Studio\Projects\Unit1.dfm=C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\Main.dfm</Transaction>
+    <Transaction>2026/02/12 15:39:14.000.909,C:\Users\paul\OneDrive\Documents\Embarcadero\Studio\Projects\Unit1.pas=C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\Main.pas</Transaction>
+    <Transaction>2026/02/12 15:39:23.000.939,C:\Users\paul\OneDrive\Documents\Embarcadero\Studio\Projects\Project1.dproj=C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\TypeWriter.dproj</Transaction>
+    <Transaction>2026/02/12 15:55:54.000.369,=C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\Unit1.pas</Transaction>
+    <Transaction>2026/02/12 15:56:20.000.185,C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\Unit1.pas=C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\DigitalKeyBoard.pas</Transaction>
+    <Transaction>2026/02/12 16:41:56.000.566,C:\Users\paul\iCloudDrive\CPU Play\K16 CPU\TypeWriter\DigitalKeyBoard.pas=</Transaction>
+  </Transactions>
+</BorlandProject>
