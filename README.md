@@ -9,6 +9,7 @@ The K16 is a homebrew CPU designed around ROM-based lookup tables for both ALU o
 **Key Specifications:**
 - 16-bit data bus
 - 24-bit address bus (16MB flat memory space)
+- Little-endian byte ordering
 - Hybrid ROM/Adder ALU architecture
 - 8-level priority interrupt system (74LS148 encoder)
 - Target clock speed: 5-10 MHz
@@ -99,7 +100,7 @@ POP D, XY3          ; Pop all data registers
 | Load | LOADI, LOADD, LOADX, LOADY, LOADB, LOADXY, LOADP, LOADPB |
 | Store | STORED, STOREX, STOREY, STOREB, STOREXY, STOREP, STOREPB |
 | Move | MOVE, SWAP |
-| Arithmetic | ADD, ADC, SUB, SBC, INC, DEC |
+| Arithmetic | ADD, ADC, SUB, SBC, NEG, INC, DEC |
 | Logical | AND, OR, XOR, NOT |
 | Shift/Rotate | SHL, SHR, ASR, ROL, ROR, SWAPB, HIGH, LOW, SHL4, SHR4, ASR4, ASR8, MULB, RECIP, LOOKUP |
 | Address | LEA (24-bit effective address calculation) |
@@ -107,7 +108,8 @@ POP D, XY3          ; Pop all data registers
 | Conditional Set | SEQ, SNE, SCS/SHS, SCC/SLO, SLT, SGT, SGE, SLE (branchless conditionals) |
 | Branch | BEQ, BNE, BCS/BHS, BCC/BLO, BLT, BGT, BGE, BLE, BRA |
 | Jump | JMP, JMP24, JMP16, JMPT, JMPXY |
-| Subroutine | CALL, CALL24, CALL16, CALLR, RET |
+| Subroutine | CALL, CALL24, CALL16, CALLR, CALLXY, RET |
+| Syscall | TRAP (software interrupt via vector table) |
 | Stack | PUSH, POP (supports D, X, Y, XY, D group, immediate) |
 | Control | NOP, HALT, DINT, EINT, RTI |
 
@@ -120,6 +122,7 @@ POP D, XY3          ; Pop all data registers
 | LOADD/X/Y | 2-4 | Depends on addressing mode |
 | STORED/X/Y | 3-4 | Depends on addressing mode |
 | ADD/SUB/AND/OR/XOR | 3-4 | ALU operations |
+| NEG | 3 | Two's complement negate |
 | CMP | 3 | All modes |
 | SHL/SHR/ROL/ROR | 3 | Lookup table operations |
 | MULB/RECIP | 3 | Lookup-based multiply/reciprocal |
@@ -128,6 +131,8 @@ POP D, XY3          ; Pop all data registers
 | Bcc | 3-4 | Short/long branch |
 | JMP | 2-4 | Various modes |
 | CALL | 11-12 | Subroutine call |
+| CALLXY | 10 | Indirect call via XY register |
+| TRAP | 12 | Software syscall |
 | RET | 5 | Return |
 | PUSH/POP | 4-14 | Single to group operations |
 | INT | 15 | Interrupt entry |
@@ -141,9 +146,15 @@ The K16 prioritizes:
 3. **Modern amenities** like 24-bit addressing and priority interrupts
 4. **Practical performance** targeting the 68000 class
 
-## Forth Support
+## Software Stack
 
-K/OS Forth is a complete Forth implementation running natively on the K16:
+### K16Pascal Compiler
+
+A Pascal compiler targeting the K16, ported from PASTA/80. Implements the V2 ABI calling convention (arguments in D0/D1/D2, result in D0, XY2 as frame pointer). Fully tested against a 211-test suite.
+
+### K/OS Forth
+
+A complete Forth implementation running natively on the K16:
 - Indirect Threaded Code (ITC) interpreter
 - 17-cycle inner interpreter with sentinel-based execution
 - 102+ built-in words
@@ -156,12 +167,25 @@ K/OS Forth is a complete Forth implementation running natively on the K16:
 10 CUBE .    \ prints 1000
 ```
 
+### K16 BASIC
+
+K16 BASIC v2.1t — a BASIC interpreter running natively on the K16.
+
+### k/OS
+
+A preemptive multitasking operating system in design, drawing direct heritage from the Applix 1616/OS. Planned features include FAT16 filesystem, syscall via TRAP, 8-level priority interrupts, and 2KB stack per task.
+
 ## Current Status
 
+- ISA complete and verified — all opcodes implemented including NEG, TRAP, CALLXY, RET
 - Hardware design validated in Digital simulator
 - Microcode generator and assembler implemented in Pascal/Delphi
-- K/OS Forth interpreter complete with 102 words
-- Documentation and test suites in active development
+- K16Pascal compiler complete — 211/211 tests passing, V2 ABI + Phase 9 optimisations
+- K/OS Forth interpreter complete with 102+ words
+- K16 BASIC v2.1t complete
+- FPGA implementation in progress — Sipeed Tang Console 138K (Gowin GW5AST-138B) acquired
+- k/OS operating system in design
+- K16 emulator (CLI + IDE) in design
 
 ## License
 
