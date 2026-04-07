@@ -1,12 +1,16 @@
 # K16 Reference Manual
 
-Version 2.8 — January 18, 2026
+Version 3.3 — 7 April 2026
 
 ---
 
 ## 1. Overview
 
 The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based lookup tables for both ALU operations and instruction decoding. This reference manual covers the instruction set architecture, assembly syntax, and programming guidelines.
+
+Designed and implemented in discrete TTL logic by **Paul Berger**.
+
+GitHub: https://github.com/paulkberger/K16-CPU
 
 ### 1.1 Architecture Summary
 
@@ -18,6 +22,7 @@ The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based l
 | Stack pointer | XY3 (hardcoded for CALL/RET/PUSH/POP) |
 | Status flags | C (Carry), Z (Zero), N (Negative), V (Overflow) |
 | Interrupt levels | 8 (IRQ0-IRQ7, priority encoded) |
+| Endianness | Little-endian |
 
 ### 1.2 Memory Map
 
@@ -42,7 +47,7 @@ The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based l
 
 | Opcode | Hex | Mnemonic | Description |
 |--------|-----|----------|-------------|
-| 00000 | $00 | MISC | NOP, HALT |
+| 00000 | $00 | MISC | NOP, HALT, NEG |
 | 00001 | $01 | LOOKUP | SHL, SHR, ASR, ROL, ROR, SWAPB, HIGH, LOW, SHL4, SHR4, ASR4, ASR8, MULB, RECIP |
 | 00010 | $02 | INC/DEC | Increment/Decrement XY pair (24-bit) |
 | 00011 | $03 | LEA | Load Effective Address |
@@ -61,7 +66,7 @@ The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based l
 | 10000 | $10 | CMP | Compare (sets flags, no store) |
 | 10001 | $11 | Bcc | Conditional Branch (BEQ, BNE, BCS, BCC, BLT, BGT, BGE, BLE, BRA) |
 | 10010 | $12 | JMP | Jump (JMP24, JMP16, JMPT, JMPXY) |
-| 10011 | $13 | CALL/RET | Subroutine (CALL24, CALL16, CALLR, RET) |
+| 10011 | $13 | CALL/CALLXY | Subroutine (CALL24, CALL16, CALLR, CALLXY) |
 | 10100 | $14 | LOADD | Load D register from memory |
 | 10101 | $15 | LOADB | Load byte from memory (zero-extended) |
 | 10110 | $16 | LOADX | Load X register from memory |
@@ -72,7 +77,7 @@ The K16 is a 16-bit CPU with a 24-bit address space, designed around ROM-based l
 | 11011 | $1B | STOREX | Store X register to memory |
 | 11100 | $1C | STOREY | Store Y register to memory |
 | 11101 | $1D | STOREI | Store Immediate; STOREXY; STOREP/STOREPB (paged) |
-| 11110 | $1E | — | *spare* |
+| 11110 | $1E | TRAP/RET | Software trap/syscall (TRAP #n); Return from subroutine (RET, RET #nw) |
 | 11111 | $1F | INT | Interrupt control (DINT, EINT, RTI, INT) |
 
 ### 1.4 Instruction Encoding
@@ -83,7 +88,7 @@ Most instructions use a common 16-bit format:
 15  14  13  12  11  10   9   8   7   6   5   4   3   2   1   0
 ├───────────────┼───────┼───────────────────────────────────────┤
 │    OPCODE     │ MODE  │           Operand Fields              │
-│    (5 bits)   │(2 bits)│              (9 bits)                │
+│    5 bits     │ 2 bits│              9 bits                   │
 └───────────────┴───────┴───────────────────────────────────────┘
 ```
 
@@ -112,6 +117,31 @@ start:      ; Define label 'start'
 loop_1:     ; Labels can contain underscores and digits
 _private:   ; Labels can start with underscore
 ```
+
+#### Local Labels
+
+Labels beginning with `.` are **local labels**, scoped to the nearest preceding global label. The same local name may be reused in every subroutine without conflict.
+
+```asm
+func_a:
+        LOADI   D0, #1
+        BEQ     .done       ; resolves to FUNC_A.DONE
+.done:
+        RET
+
+func_b:
+        LOADI   D0, #2
+        BEQ     .done       ; resolves to FUNC_B.DONE — distinct from FUNC_A.DONE
+.done:
+        RET
+```
+
+The assembler stores qualified names in the symbol table (`FUNC_A.DONE`, `FUNC_B.DONE`) so they appear unambiguously in listings and error messages.
+
+**Rules:**
+- A local label must appear after at least one global label in the source file; defining one before any global label is an error.
+- Local labels can be referenced both forward and backward within the same global scope.
+- Local label references in expressions use the same `.name` syntax: `BRA .loop`, `LOADI D0, #.table`.
 
 ### 2.3 Comments
 
@@ -280,6 +310,145 @@ If total byte count is odd, a null byte is added for word alignment (but this is
 .TEXT "C:\\PATH\\FILE", 0 ; String with backslashes
 .TEXT "\x1B[2J", 0        ; ANSI escape sequence
 ```
+
+### 4.6 .BYTE — Define Byte Data
+
+Emits one or more bytes. Values can be numeric literals, string literals, escape sequences, or any mix. Unlike `.TEXT`, the program counter advances by the **exact byte count** — it is not rounded to a word boundary. Use `.ALIGN` (see 4.7) after `.BYTE` if subsequent code or data must be word-aligned.
+
+```asm
+.BYTE   $41, $42            ; 2 bytes: 41 42
+.BYTE   $41, $42, $43       ; 3 bytes: 41 42 43   (PC now odd)
+.BYTE   "Hello"             ; 5 bytes: 48 65 6C 6C 6F
+.BYTE   5, "Hello"          ; 6 bytes: length-prefixed Pascal string
+.BYTE   "K16", 0            ; 4 bytes: null-terminated C string
+.BYTE   "Line1\r\nLine2\0"  ; 13 bytes: escape sequences supported
+```
+
+**Escape sequences** are identical to `.TEXT` (see Section 4.5): `\0`, `\n`, `\r`, `\t`, `\\`, `\"`, `\xHH`.
+
+### 4.7 .ALIGN — Align to Boundary
+
+Advances the program counter to the next multiple of the specified boundary. If the PC is already aligned, nothing is emitted.
+
+```asm
+.ALIGN              ; align to next word boundary (default: 2 bytes)
+.ALIGN  2           ; same — explicit word alignment
+.ALIGN  4           ; align to 4-byte boundary
+.ALIGN  16          ; align to 16-byte boundary
+```
+
+The boundary must be a power of 2. The default (no operand) is 2.
+
+**Typical use:** after `.BYTE` directives with an odd byte count, to restore word alignment before the next instruction or `.WORD` directive.
+
+```asm
+table:  .BYTE   "ABC"       ; 3 bytes — PC now odd
+        .ALIGN              ; pad 1 byte — PC now even
+next:   .WORD   $1234       ; safe: word-aligned
+```
+
+### 4.8 .DS — Define Storage
+
+Reserves a block of bytes, optionally filled with a constant value. The default fill is `$00`.
+
+```asm
+.DS     16              ; 16 zero bytes
+.DS     16, $FF         ; 16 bytes of $FF
+.DS     8w              ; 8 words = 16 bytes (word suffix supported)
+.DS     8w, 0           ; same, explicit zero fill
+.DS     0               ; valid no-op
+```
+
+`.DS` advances the PC by the exact byte count. Use `.ALIGN` afterward if word alignment is required. The fill value must be a byte (0–255).
+
+**Typical use cases:**
+```asm
+LINE_BUF     .DS     80          ; 80-byte line input buffer
+STACK_FRAME  .DS     8w, 0       ; 8-word (16-byte) zeroed stack frame
+CHECKSUM     .DS     2, $FF      ; 2 sentinel bytes
+```
+
+### 4.9 .INCLUDE — Include Source File
+
+Inserts the contents of another assembly source file at the point of the directive. The included file is processed exactly as if its lines appeared inline in the parent file. Includes are resolved before assembly begins.
+
+```asm
+.INCLUDE    "defs.asm"          ; relative to current file's directory
+.INCLUDE    "lib/system.asm"    ; subdirectory
+```
+
+**Path resolution:** relative paths are resolved from the directory of the **file containing the `.INCLUDE`**, not the working directory. This means nested includes resolve correctly from their own file's location.
+
+**Nesting:** includes may be nested up to 8 levels deep. Circular includes are detected and reported as errors.
+
+**Listing:** included content is surrounded by banner comments in the listing output:
+```
+; === BEGIN INCLUDE "defs.asm" ===
+LINE_WIDTH   .EQU   80
+...
+; === END INCLUDE "defs.asm" ===
+```
+
+**Error reporting:** errors within an included file are reported with the included filename and its original line number.
+
+**Symbols:** all labels and constants defined in included files share the same symbol table as the main file. Local labels (Section 2.2) defined in an included file are scoped to the global label immediately preceding them, whether that global label is in the included file or the parent file.
+
+### 4.10 .IF / .ENDIF — Conditional Assembly
+
+Conditionally assembles a block of code based on the value of a previously defined constant. Used by the Pascal compiler's smart-link (`--dep`) mode to omit unreferenced procedures from the output.
+
+```asm
+FLAG    .EQU    1
+
+        .IF FLAG
+include_me:
+        LOADI   D0, #42
+        RET
+        .ENDIF
+
+SKIP    .EQU    0
+
+        .IF SKIP
+excluded:               ; label NOT added to symbol table
+        LOADI   D0, #0  ; not assembled
+        RET
+        .ENDIF
+```
+
+**Syntax:**
+
+```
+        .IF  symbol
+        ...
+        .ENDIF
+```
+
+The operand must be a single symbol name. Expression evaluation is not supported in the condition.
+
+**Behaviour:**
+
+- If the symbol's value is **non-zero**, the block is assembled normally.
+- If the symbol's value is **zero**, all lines between `.IF` and `.ENDIF` are skipped — no instructions are emitted and no labels are added to the symbol table.
+- The symbol must be defined somewhere in the file (before or after the `.IF` — the assembler pre-scans all `.EQU` definitions before beginning the main assembly pass).
+- If the symbol is not defined, it is an error in Pass 2. In Pass 1 the block is treated as included so labels are still collected.
+
+**Nesting:** `.IF`/`.ENDIF` blocks may be nested. The assembler supports arbitrary nesting depth.
+
+**No `ELSE`:** there is no `.ELSE` or `.ELSEIF` directive.
+
+**Pascal compiler usage:** the compiler emits `__USE_procname .EQU 1` (or `0`) at file scope, then wraps each procedure body:
+
+```asm
+__USE_myfunc    .EQU    1
+
+                .IF __USE_myfunc
+myfunc:
+                ; ... body ...
+                RET
+                .ENDIF
+```
+
+Setting a constant to `0` causes the entire procedure — including its entry label — to be absent from the assembled output.
 
 ---
 
@@ -816,6 +985,54 @@ INC and DEC on XY pairs corrupt all CPU flags (C, Z, N, V). Do not place INC/DEC
 not_equal:
 ```
 
+**⚠ WARNING: INC XYn defaults to +2 (word), not +1 (byte)**
+
+`INC XYn` without an immediate increments by 2 — the natural word step for K16. For byte array or string traversal, always use `INC XYn, #1`:
+
+```asm
+; WRONG - skips every other byte!
+        LOADB   D0, [XY0]
+        INC     XY0             ; advances by 2, skips a byte
+
+; CORRECT - byte-by-byte traversal
+        LOADB   D0, [XY0]
+        INC     XY0, #1         ; advances by 1
+
+; CORRECT - word-by-word traversal (explicit is clearer)
+        LOADD   D0, [XY0]
+        INC     XY0             ; advances by 2 (or INC XY0, #2)
+```
+
+#### NEG — Two's Complement Negate
+
+Negates a register (two's complement). Equivalent to `0 - src`.
+
+**Opcode:** $00, **Mode:** 11
+
+| Mode | Syntax | Operation | Cycles | Words |
+|------|--------|-----------|--------|-------|
+| 11 | `NEG dst, src` | dst ← -src | 3 | 1 |
+| 11 | `NEG dst` | dst ← -dst (in-place, src=dst) | 3 | 1 |
+
+**Flags:** C, Z, N, V
+
+| Flag | Condition |
+|------|-----------|
+| Z | Set if result = 0 |
+| N | Set if result bit 15 = 1 |
+| C | Clear if src ≠ 0 (borrow); Set if src = 0 |
+| V | Set if src = $8000 (overflow: -(-32768) unrepresentable) |
+
+```asm
+NEG     D0              ; D0 ← -D0  (in-place)
+NEG     D0, D1          ; D0 ← -D1
+NEG     D0, D2          ; D0 ← -D2
+```
+
+**Note:** Equivalent to `NOT dst; ADD dst, #1` but in a single instruction.
+
+---
+
 ### 6.4 Logical Operations
 
 Bitwise logical operations on registers and memory.
@@ -1072,15 +1289,14 @@ JMPXY   XY0             ; Indirect: PC ← XY0
 
 Subroutine call and return using XY3 as the hardcoded stack pointer.
 
-**Opcode:** $13
+**Opcode:** $13 (CALL/CALLXY)
 
 | Mode | Syntax | Operation | Cycles | Words |
 |------|--------|-----------|--------|-------|
 | 00 | `CALL24 addr` | push PC; PC ← addr24 | 11 | 3 |
 | 01 | `CALL16 addr` | push PC; PC[15:0] ← addr16 | 11 | 2 |
 | 10 | `CALLR addr` | push PC; PC ← PC + offset | 12 | 2 |
-| 11 | `RET` | PC ← pop; SP += imm5 | 5 | 1 |
-| 11 | `RET #n` | PC ← pop; SP += n (cleanup) | 5 | 1 |
+| 11 | `CALLXY XYn` | push PC; PC ← XYn | 10 | 1 |
 
 **Flags:** Not affected
 
@@ -1089,11 +1305,114 @@ CALL    subroutine      ; 24-bit absolute (alias for CALL24)
 CALL24  subroutine      ; 24-bit absolute address
 CALL16  subroutine      ; 16-bit, current codepage
 CALLR   subroutine      ; PC-relative
-RET                     ; Return, no cleanup
-RET     #4              ; Return, pop 4 extra bytes
+CALLXY  XY0             ; Indirect call via XY register
 ```
 
-### 6.11 Stack Operations
+**Note:** All CALL variants push a 24-bit return address to XY3 and return with `RET` (opcode $1E mode 11). See section 6.11.
+
+### 6.11 TRAP and RET
+
+Software syscall and return from subroutine.
+
+**Opcode:** $1E (TRAP/RET)
+
+| Mode | Syntax | Operation | Cycles | Words |
+|------|--------|-----------|--------|-------|
+| 00 | `TRAP #n` | push PC; PC ← vector[n] | 12 | 1 |
+| 11 | `RET` | PC ← pop; SP += 4 | 5 | 1 |
+| 11 | `RET #nw` | PC ← pop; SP += 4 + (n×2) | 5 | 1 |
+
+**Flags:** Not affected
+
+#### TRAP Encoding
+
+IR[7:0] = n×2, n in 0..127. Instruction word = `$F000 or (n*2)`.
+
+| Instruction | Encoding |
+|-------------|----------|
+| `TRAP #0` | `$F000` |
+| `TRAP #1` | `$F002` |
+| `TRAP #9` | `$F012` |
+| `TRAP #127` | `$F0FE` |
+
+#### RET Encoding
+
+Opcode `$1E` mode `11`. IMM5 = 4 + (cleanup_words × 2). Base word = `$F66C` (no cleanup).
+
+| Instruction | Encoding | Stack adjustment |
+|-------------|----------|-----------------|
+| `RET` | `$F66C` | SP += 4 |
+| `RET #1w` | `$F66E` | SP += 6 |
+| `RET #2w` | `$F670` | SP += 8 |
+| `RET #4w` | `$F674` | SP += 12 |
+
+#### Vector Table
+
+Each entry is 4 bytes in the stack page [Y3]: page byte at offset+0 (word-aligned, high byte unused), address word at offset+2. Vector for TRAP #n is at [Y3: n×4].
+
+```
+[Y3:$0000]  TRAP #0    INT dispatcher (microcode also jumps here on hardware INT)
+[Y3:$0004]  TRAP #1    IRQ0 handler (lowest priority)
+[Y3:$0008]  TRAP #2    IRQ1 handler
+[Y3:$000C]  TRAP #3    IRQ2 handler
+[Y3:$0010]  TRAP #4    IRQ3 handler
+[Y3:$0014]  TRAP #5    IRQ4 handler
+[Y3:$0018]  TRAP #6    IRQ5 handler
+[Y3:$001C]  TRAP #7    IRQ6 handler
+[Y3:$0020]  TRAP #8    IRQ7 handler (highest priority, typically timer)
+[Y3:$0024]  TRAP #9    first syscall
+...
+[Y3:$01FC]  TRAP #127  last syscall
+```
+
+#### Stack Effect
+
+```
+Before TRAP:          After TRAP:
+                      [X3+0]: PC[23:16]  ← new top
+                      [X3+2]: PC[15:0]
+[old X3]              [old X3]
+```
+
+SP decremented by 4. No SR pushed, IE unchanged. Handler returns with `RET`.
+
+#### Syscall Convention
+
+TRAP handlers follow the K16 V2 calling convention:
+
+| Register | Role |
+|----------|------|
+| D0 | 1st argument / return value |
+| D1 | 2nd argument |
+| D2 | 3rd argument |
+| XY0, XY1 | Caller-saved scratch |
+| XY2 | Callee-saved frame pointer cache |
+
+4th+ arguments pushed to XY3 stack at [X3+4] after TRAP pushes return address.
+
+#### Example — Installing and Calling a Handler
+
+```asm
+; OS boot: install TRAP #9 handler (putchar)
+        LOADI   Y0, #$00
+        LOADI   X0, #$0024
+        LOADI   D0, #>putchar
+        STORED  D0, [XY0]           ; store page byte
+        LOADI   X0, #$0026
+        LOADI   D0, #<putchar
+        STORED  D0, [XY0]           ; store address word
+
+; User code: call putchar via TRAP
+        LOADI   D0, #'A'
+        TRAP    #9                  ; putchar(D0)
+
+; Handler
+putchar:
+        STOREB  D0, [XY1]           ; write to terminal
+        RET
+```
+
+### 6.12 Stack Operations
 
 Push and pop operations for saving/restoring registers.
 
@@ -1122,7 +1441,7 @@ POP  D, XY3             ; Pop D3-D0 (reverse order)
 POP  XY0, XY3           ; Pop XY pair
 ```
 
-### 6.12 Control
+### 6.13 Control
 
 Processor control instructions.
 
@@ -1133,8 +1452,10 @@ Processor control instructions.
 | 00 | `NOP` | No operation | 2 | 1 |
 | 01 | `HALT` | Stop processor | 2 | 1 |
 | 01 | `HALT #n` | Stop with code n | 2 | 1 |
+| 11 | `NEG dst, src` | dst ← -src | 3 | 1 |
+| 11 | `NEG dst` | dst ← -dst (in-place) | 3 | 1 |
 
-**Flags:** Not affected
+**Flags (NOP, HALT):** Not affected
 
 ```asm
 NOP                     ; Do nothing
@@ -1144,7 +1465,9 @@ HALT #$FF               ; Stop with debug code
 
 **Debug:** HALT displays D0 on ALU-A bus for debugging.
 
-### 6.13 Interrupts
+**Note:** `NEG` shares opcode $00 but is documented in Section 6.3 (Arithmetic Operations).
+
+### 6.14 Interrupts
 
 Interrupt control instructions for the 8-level priority interrupt system.
 
@@ -1172,6 +1495,36 @@ RTI                     ; Return from interrupt handler
 | 7 | IE - Interrupt Enable |
 | 6:4 | Current priority level |
 | 3:0 | CPU flags (N, Z, C, V) |
+
+**INT and the TRAP #0 vector:**
+
+Hardware interrupts (INT) jump via the TRAP #0 vector at `[Y3:$0000]`. The microcode reads the handler address from this vector entry and jumps there — the same entry point used by `TRAP #0`. The OS must install an INT dispatcher at boot:
+
+```asm
+; Install INT dispatcher at TRAP #0 vector
+        LOADI   Y0, #$00
+        LOADI   X0, #$0000
+        LOADI   D0, #>isr_entry
+        STORED  D0, [XY0]           ; page byte
+        LOADI   X0, #$0002
+        LOADI   D0, #<isr_entry
+        STORED  D0, [XY0]           ; address word
+        EINT                        ; enable interrupts
+
+; INT dispatcher — reads IRQ level from SR, vectors to handler
+isr_entry:
+        PUSH    D0, XY3
+        MOVE    D0, SR              ; D0 = SR (level in bits 6:4)
+        SHR4    D0                  ; bits 6:4 → bits 2:0
+        AND     D0, #$0007          ; D0 = IRQ level 0-7
+        ADD     D0, #1              ; D0 = TRAP# 1-8
+        SHL     D0                  ; × 2
+        SHL     D0                  ; × 4 = vector offset $04..$20
+        JMPT    XY3, D0             ; PC ← [Y3:D0]
+        ; IRQ handlers are at TRAP #1-#8 vectors, return with RTI
+```
+
+**Note:** TRAP handlers return with `RET`; IRQ handlers invoked via the INT dispatcher return with `RTI` (which also restores SR and re-enables interrupts).
 
 ---
 
@@ -1265,11 +1618,364 @@ BCS     .non_printable        ; >= $7F is non-printable
 
 ---
 
-## 8. Zero Page Programming
+## 8. Endianness
+
+### 8.1 Definition
+
+The K16 CPU uses **little-endian** byte ordering for all data memory
+operations. When a 16-bit word is stored to or loaded from RAM:
+
+- The **low byte (D7–D0) is placed at the lower address**
+- The **high byte (D15–D8) is placed at the upper address**
+
+```
+Word $1234 stored at address $010000:
+
+  Address    Byte     Description
+  $010000    $34      low byte  (D7–D0)
+  $010001    $12      high byte (D15–D8)
+```
+
+**Hardware verification** — confirmed on physical K16 hardware:
+
+```asm
+LOADI   D0, #$1234
+STORED  D0, [XY0]       ; XY0 = $010000
+LOADB   D1, [XY0]       ; read single byte from $010000
+; D1 = $34  →  low byte at lower address  →  little-endian confirmed
+```
+
+**Microcode verification** — confirmed in ALU microcode source files.
+STORED writes D[7:0] to `[XYn+0]` and D[15:8] to `[XYn+1]`.
+LOADD reads D[7:0] from `[XYn+0]` and D[15:8] from `[XYn+1]`.
+
+---
+
+### 8.2 Word Operations — STORED / LOADD / STOREX / LOADX
+
+All 16-bit word store and load operations are little-endian.
+
+```
+STORED D0, [XY0]   with D0 = $AABB, XY0 = $010000:
+
+  $010000    $BB    low byte  (D7–D0)
+  $010001    $AA    high byte (D15–D8)
+```
+
+```
+LOADD D0, [XY0]:
+
+  D0 = Mem[$010000] or (Mem[$010001] shl 8)
+     = $BB or ($AA shl 8)
+     = $AABB
+```
+
+STOREX/LOADX behave identically — X registers are 16-bit, same layout.
+
+---
+
+### 8.3 Byte Operations — STOREB / LOADB / STOREY / LOADY
+
+Single-byte operations involve only one address — no endianness applies.
+
+```
+STOREB D0, [XY0]   →  Mem[XY0] := D0 and $FF   (low byte of D0 only)
+LOADB  D0, [XY0]   →  D0 := Mem[XY0]           (zero-extended to 16 bits)
+
+STOREY Y0, [XY0]   →  Mem[XY0] := Y0            (Y is 8-bit)
+LOADY  Y0, [XY0]   →  Y0 := Mem[XY0] and $FF
+```
+
+---
+
+### 8.4 XY Pair Operations — STOREXY / LOADXY
+
+**Verified from microcode source:**
+`ALU_Opcode_x1D_STOREI.pas` and `ALU_Opcode_x18_LOADI.pas`.
+
+STOREXY and LOADXY use a specific layout where **Y is stored first**
+(at the lower address) and **X is stored second** (at the higher address).
+This is not natural 24-bit little-endian — it is a deliberate hardware
+design reflecting the internal register structure (Y = high byte, X = low word).
+
+#### STOREXY microcode sequence:
+
+```
+Step 1: srcY (ABHi) → ORDB
+Step 2: ORDB → Memory[destXY+0]     Y stored at lower address
+Step 3: srcX (ABLo) → ORDB
+Step 4: destX + 2 → ORAB
+Step 5: ORDB → Memory[ORAB:destY]   X stored at higher address
+```
+
+#### STOREXY memory layout:
+
+```
+STOREXY XY0, [XY1]   with XY0 = $FF1234, XY1 = $020000:
+
+  Address    Byte    Description
+  $020000    $FF     Y0 (address bits 23–16), low byte
+  $020001    $00     Y0 high byte (always $00 — Y is 8-bit, zero-extended)
+  $020002    $34     X0 low byte  (address bits 7–0)
+  $020003    $12     X0 high byte (address bits 15–8)
+```
+
+#### LOADXY microcode sequence:
+
+```
+Step 1: Memory[srcXY+0] → destY     Y loaded from lower address
+Step 2: srcX + 2 → ORAB
+Step 3: Memory[ORAB:srcY] → destX   X loaded from higher address
+```
+
+#### LOADXY example:
+
+```
+LOADXY XY0, [XY1]   reading from $020000:
+
+  Y0 := Mem[$020000] and $FF  =  $FF   (address bits 23–16)
+  X0 := MemWord[$020002]      =  $1234 (address bits 15–0, little-endian)
+
+  XY0 = $FF1234  ✓
+```
+
+**Summary — STOREXY / LOADXY layout:**
+
+| Offset | Width | Content |
+|--------|-------|---------|
+| +0 | 2 bytes | Y register (8-bit value, zero-extended to word, little-endian) |
+| +2 | 2 bytes | X register (16-bit value, little-endian) |
+
+Total: 4 bytes. Y first, X second.
+
+**Naming note — easy source of confusion:**
+Y holds the *high* byte of the 24-bit address (bits 23–16), but it is
+stored at the *lower* memory address. X holds the *low* 16 bits (bits 15–0)
+but sits at the *higher* memory address. So "high address byte" ends up
+at the "low memory address". This is consistent across STOREXY, LOADXY,
+PUSH XY, and POP XY — Y is always written/pushed last, so it always
+lands at the lowest address of the pair.
+
+---
+
+### 8.5 Stack Layout — CALL24 / RET
+
+The XY3 stack is descending — it grows toward lower addresses.
+PUSH pre-decrements SP by 2 before writing. POP reads then post-increments
+SP by 2. All stack words are little-endian.
+
+#### CALL24 push order
+
+**Verified from JSR microcode (`K16_JSR_RTS_Complete_Specification_V4.md`):**
+
+CALL24 pushes **PC[15:0] first** (lands at the higher address),
+then **PC[23:16]** (lands at the lower address). After the call,
+X3 points to the PC[23:16] word at the lowest address.
+
+```
+CALL24 $FF1234   with X3 = $BFF0:
+
+  Step 1: X3 - 2 → ORAB = $BFEE;  Memory[$BFEE] = $1234 (PC[15:0], little-endian)
+  Step 2: X3 - 4 → ORAB = $BFEC;  Memory[$BFEC] = $00FF (PC[23:16], zero-extended)
+  Step 3: ORAB ($BFEC) → X3
+
+  Memory layout after CALL:
+  Address    Byte    Description
+  $BFEC      $FF     PC[23:16] low byte    ← X3 points here
+  $BFED      $00     PC[23:16] high byte   (always $00, zero-extended)
+  $BFEE      $34     PC[15:0]  low byte
+  $BFEF      $12     PC[15:0]  high byte
+  $BFF0               (previous stack top)
+
+  X3 = $BFEC
+```
+
+#### RET pop order
+
+**Verified from RTS microcode.**
+
+RET pops **PC[15:0] from [X3]** first, then **PC[23:16] from [X3+2]**,
+then sets X3 := X3 + 4.
+
+The CALL/RET pair is symmetric — whatever CALL24 pushes, RET pops correctly.
+The internal microcode field assignments account for the push order automatically,
+restoring the correct PC regardless of the swap. Use CALL24/RET as a matched pair
+without needing to track internal details.
+
+---
+
+### 8.6 Stack Layout — PUSH XY / POP XY
+
+**Verified from PUSH/POP pair microcode (`K16_PUSHPOP_Spec_V3.1.md`).**
+
+PUSH XY pushes **X first** (higher address), then **Y** (lower address).
+This matches STOREXY's layout — Y at the lower address, X at the higher.
+
+```
+PUSH XY0, XY3   with XY0 = $FF1234, X3 = $BFF0:
+
+  Step 1: X3 - 2 → ORAB = $BFEE;  Memory[$BFEE] = $1234 (X0, little-endian)
+  Step 2: X3 - 4 → ORAB = $BFEC;  Memory[$BFEC] = $00FF (Y0, zero-extended)
+  Step 3: ORAB → X3 = $BFEC
+
+  Memory layout:
+  Address    Byte    Description
+  $BFEC      $FF     Y0 low byte   ← X3 points here
+  $BFED      $00     Y0 high byte  (zero-extended)
+  $BFEE      $34     X0 low byte
+  $BFEF      $12     X0 high byte
+```
+
+```
+POP XY0, XY3   with X3 = $BFEC:
+
+  Reads Y0 from [X3]   = $00FF → Y0 = $FF
+  Reads X0 from [X3+2] = $1234 → X0 = $1234
+  X3 += 4 → $BFF0
+
+  XY0 = $FF1234  ✓
+```
+
+**PUSH XY and STOREXY produce identical memory layouts** — Y at lower
+address, X at higher. This means a value saved with STOREXY can be
+loaded with LOADXY, and a value pushed with PUSH XY can be popped with
+POP XY, consistently.
+
+**Reminder:** Y (the high byte of the address, bits 23–16) ends up at
+the lower memory address. X (the low 16 bits, bits 15–0) ends up at
+the higher memory address.
+
+---
+
+### 8.7 PUSH / POP — Single Register
+
+Single register PUSH/POP stores/loads one 16-bit word, little-endian.
+
+```
+PUSH D0, XY3   with D0 = $ABCD, X3 = $BFF0:
+
+  X3 -= 2  →  X3 = $BFEE
+  Mem[$BFEE] = $CD   (low byte)
+  Mem[$BFEF] = $AB   (high byte)
+
+POP D0, XY3:
+
+  D0 = Mem[$BFEE] or (Mem[$BFEF] shl 8) = $ABCD
+  X3 += 2  →  X3 = $BFF0
+```
+
+---
+
+### 8.8 TRAP — Push Return Address
+
+TRAP pushes the return address using the same sequence as CALL24:
+PC[15:0] first (higher address), PC[23:16] second (lower address).
+RTI pops in the matching reverse order.
+
+The interrupt/TRAP vector table entry is a single 16-bit word in the
+Y3 page — read as a little-endian word, no special handling.
+
+---
+
+### 8.9 String and Byte Data
+
+Strings (`.TEXT`) and raw byte arrays are stored sequentially —
+one byte per address, in ascending address order. No endianness
+consideration applies. Use `LOADB`/`STOREB` with `INC XYn, #1`
+for byte-by-byte traversal:
+
+```asm
+PRINT_STR:
+        MOVE    X0, D0          ; D0 = low word of string address
+.loop:  LOADB   D0, [XY0]       ; load one character byte
+        CMP     D0, #0
+        BEQ     .done
+        STOREB  D0, [XY1]       ; write to terminal ($D00000)
+        INC     XY0, #1         ; advance pointer by one byte
+        JMP     .loop
+.done:  RET
+```
+
+---
+
+### 8.10 Instruction ROM Encoding
+
+Instruction words in the ROM are not subject to byte-level endianness
+in the data sense. The K16 hardware uses two physical ROM chips simultaneously
+— one supplies D15–D8, the other D7–D0. The CPU always receives a complete
+16-bit word in a single memory cycle.
+
+For the **flat binary (.bin) emulator format**, instruction words are stored
+little-endian (low byte first) to match the emulator's uniform memory model.
+The assembler `.bin` export swaps bytes automatically when generating this
+file. The Digital simulator ROM files (ProgramHIGH.hex / ProgramLOW.hex)
+are unaffected by this swap.
+
+---
+
+### 8.11 Complete Memory Layout Reference
+
+All entries verified by hardware test or microcode inspection.
+
+#### 8.11.1 Single word store/load
+
+| Operation | Addr | Byte | Notes |
+|-----------|------|------|-------|
+| `STORED D0` ($AABB) at $N | $N+0 | $BB | low byte ✓ hardware |
+| | $N+1 | $AA | high byte |
+| `STOREX X0` ($CCDD) at $N | $N+0 | $DD | low byte ✓ microcode |
+| | $N+1 | $CC | high byte |
+| `STOREY Y0` ($EE) at $N | $N+0 | $EE | single byte ✓ microcode |
+| `STOREB D0` ($xxBB) at $N | $N+0 | $BB | low byte only ✓ microcode |
+
+#### 8.11.2 XY pair — STOREXY / LOADXY
+
+| Operation | Addr | Byte | Notes |
+|-----------|------|------|-------|
+| `STOREXY XY0` ($FF1234) at $N | $N+0 | $FF | Y low byte ✓ microcode |
+| | $N+1 | $00 | Y high byte (always $00) |
+| | $N+2 | $34 | X low byte |
+| | $N+3 | $12 | X high byte |
+
+#### 8.11.3 Stack after CALL24 / PUSH XY
+
+With SP=$BFF0, XY0=$FF1234:
+
+| Operation | Addr | Byte | Notes |
+|-----------|------|------|-------|
+| `CALL24 $FF1234` or `PUSH XY0` | $BFEC | $FF | Y / PC[23:16] low ✓ microcode |
+| | $BFED | $00 | Y / PC[23:16] high |
+| | $BFEE | $34 | X / PC[15:0] low |
+| | $BFEF | $12 | X / PC[15:0] high |
+| | X3 = $BFEC | | SP after push |
+
+---
+
+### 8.12 Toolchain Summary
+
+| Component | Byte order | Implementation |
+|-----------|-----------|----------------|
+| K16 hardware data RAM | **Little-endian** | Verified by hardware test |
+| K16 instruction ROM | N/A | Parallel byte ROMs, full word presented to CPU |
+| Assembler `.bin` export | **Little-endian** | Auto byte-swap from internal big-endian |
+| Assembler Digital ROM files | N/A | Split ProgramHIGH/LOW.hex |
+| Emulator `MemReadWord` | **Little-endian** | `Mem[a] or (TWord(Mem[a+1]) shl 8)` |
+| Emulator `MemWriteWord` | **Little-endian** | `Mem[a]:=lo; Mem[a+1]:=hi` |
+| Emulator `ExecSTOREXY` | Y first, X second | `WriteWord(addr, Y); WriteWord(addr+2, X)` |
+| Emulator `ExecLOADXY` | Y first, X second | `Y:=ReadWord(addr) and $FF; X:=ReadWord(addr+2)` |
+| Emulator `StackPush24` | PC[15:0] first | Matches CALL24 microcode |
+| Emulator `StackPop24` | PC[15:0] first | Matches RET microcode |
+| k/OS data structures | **Little-endian** | Must match hardware |
+| K16Pascal compiler | **Little-endian** | Stack frames, heap, pointers |
+| `SWAPB` lookup op | Byte reversal | `$1234 → $3412`, explicit endian conversion |
+
+---
+
+## 9. Zero Page Programming
 
 The K16 provides efficient "zero page" style access to frequently-used variables using the LOADP/STOREP instructions. This technique saves significant cycles compared to indexed addressing.
 
-### 8.1 Concept
+### 9.1 Concept
 
 Traditional indexed access requires loading a base address into an XY pair before accessing memory. Zero page access uses Y3 (the stack page register) as an implicit base, allowing direct access to any location in the stack segment with a single instruction.
 
@@ -1282,133 +1988,159 @@ Traditional indexed access requires loading a base address into an XY pair befor
 
 **Savings:** 3 cycles per load (50% faster), plus XY registers remain free for other work.
 
-### 8.2 Memory Map (Page $00)
+### 9.2 Memory Map (Page $00)
 
 The stack segment at page $00 is organized for both stack operations and zero page variables:
 
 | Address Range | Offset | Size | Purpose |
 |---------------|--------|------|---------|
-| $00_0000-$00_0003 | $0000 | 4 bytes | Interrupt vector |
-| $00_0004-$00_00FF | $0004 | 252 bytes | System variables |
-| $00_0100-$00_017F | $0100 | 128 bytes | Forth interpreter reserved |
-| $00_0180-$00_01FF | $0180 | 128 bytes | Pascal/compiler reserved |
-| $00_0200-$00_0FFF | $0200 | ~3.5KB | Application zero page |
+| $00_0000-$00_01FF | $0000 | 512 bytes | TRAP/INT vector table (128 entries × 4 bytes) |
+| $00_0200-$00_02FF | $0200 | 256 bytes | System variables |
+| $00_0300-$00_037F | $0300 | 128 bytes | Forth interpreter reserved |
+| $00_0380-$00_03FF | $0380 | 128 bytes | Pascal/compiler reserved |
+| $00_0400-$00_0FFF | $0400 | ~3KB | Application zero page |
 | $00_1000-$00_FFFF | $1000 | ~60KB | Stack space (grows down) |
 
-### 8.3 Stack Layout
+**Vector table layout:** Each entry is 4 bytes — page byte at offset+0, address word at offset+2. TRAP #n vector is at offset n×4.
 
 ```
-$00FFFF ─┬─ Stack top (XY3 initialized to $00:FFF0)
+[Y3:$0000]  TRAP #0    INT dispatcher (also hardware INT entry point)
+[Y3:$0004]  TRAP #1    IRQ0 handler (lowest priority)
+[Y3:$0008]  TRAP #2    IRQ1 handler
+[Y3:$000C]  TRAP #3    IRQ2 handler
+[Y3:$0010]  TRAP #4    IRQ3 handler
+[Y3:$0014]  TRAP #5    IRQ4 handler
+[Y3:$0018]  TRAP #6    IRQ5 handler
+[Y3:$001C]  TRAP #7    IRQ6 handler
+[Y3:$0020]  TRAP #8    IRQ7 handler (highest priority, typically timer)
+[Y3:$0024]  TRAP #9    first syscall
+...
+[Y3:$01FC]  TRAP #127  last syscall
+```
+
+### 9.3 Stack Layout
+
+```
+$00FFFF ─┬─ Stack top (XY3 initialized to $00:BFF0)
          │  Stack grows DOWN
-$00F000 ─┼─ 
-         │  ~60KB stack space
 $001000 ─┼─
-         │
+         │  ~60KB stack space
 $000FFF ─┼─ Application ZP top
-         │  Application variables (~3.5KB)
-$000200 ─┼─ Application ZP base
+         │  Application variables (~3KB)
+$000400 ─┼─ Application ZP base
          │
-$0001FF ─┼─ Pascal/compiler (128 bytes)
-$000180 ─┼─
+$0003FF ─┼─ Pascal/compiler (128 bytes)
+$000380 ─┼─
          │
-$00017F ─┼─ Forth reserved (128 bytes)
-$000100 ─┼─
+$00037F ─┼─ Forth reserved (128 bytes)
+$000300 ─┼─
          │
-$0000FF ─┼─ System variables (~252 bytes)
-$000004 ─┼─
+$0002FF ─┼─ System variables (256 bytes)
+$000200 ─┼─
          │
-$000000 ─┴─ Interrupt vector (4 bytes)
+$0001FF ─┼─ Vector table top
+         │  TRAP/INT vectors (512 bytes, 128 × 4 bytes)
+$000000 ─┴─ Vector table base (TRAP #0 / INT dispatcher)
 ```
 
-### 8.4 Accessing Zero Page Variables
+### 9.4 Accessing Zero Page Variables
 
 Use LOADP/STOREP with Y3 as the page register:
 
 ```asm
 ; Define zero page variable locations
-ZP_COUNTER   .EQU    $0200
-ZP_FLAGS     .EQU    $0202
-ZP_TEMP      .EQU    $0204
+ZP_COUNTER   .EQU    $0400
+ZP_FLAGS     .EQU    $0402
+ZP_TEMP      .EQU    $0404
 
 ; Load from zero page (3 cycles)
-LOADP   D0, Y3, [#ZP_COUNTER]   ; D0 ← [$00:0200]
-LOADP   D1, Y3, [#ZP_FLAGS]     ; D1 ← [$00:0202]
+LOADP   D0, Y3, [#ZP_COUNTER]   ; D0 ← [$00:0400]
+LOADP   D1, Y3, [#ZP_FLAGS]     ; D1 ← [$00:0402]
 
 ; Store to zero page (5 cycles)
-STOREP  D0, Y3, [#ZP_TEMP]      ; [$00:0204] ← D0
+STOREP  D0, Y3, [#ZP_TEMP]      ; [$00:0404] ← D0
 
 ; Byte access (3 cycles load, 5 cycles store)
 LOADPB  D0, Y3, [#ZP_FLAGS]     ; Load byte, zero-extended
 STOREPB D0, Y3, [#ZP_FLAGS]     ; Store low byte only
 ```
 
-### 8.5 Reserved Allocations
+### 9.5 Reserved Allocations
 
-#### System Variables ($0000-$00FF)
-
-```asm
-INT_VECTOR_PAGE  .EQU    $0000       ; ISR page (required)
-INT_VECTOR_ADDR  .EQU    $0002       ; ISR address (required)
-SYS_TICKS        .EQU    $0004       ; System tick counter
-SYS_FLAGS        .EQU    $0006       ; System status flags
-```
-
-#### Forth Interpreter ($0100-$017F)
+#### TRAP/INT Vector Table ($0000-$01FF)
 
 ```asm
-ZP_LATEST    .EQU    $0100           ; Dictionary head (Y)
-ZP_LATEST_X  .EQU    $0102           ; Dictionary head (X)
-ZP_HERE      .EQU    $0104           ; Next free byte (Y)
-ZP_HERE_X    .EQU    $0106           ; Next free byte (X)
-ZP_STATE     .EQU    $0108           ; Compile state (0=interpret)
-ZP_TOIN      .EQU    $010A           ; >IN parse position
-ZP_NUMTIB    .EQU    $010C           ; #TIB character count
-ZP_BASE      .EQU    $010E           ; Number base (default 10)
+TRAP0_VEC    .EQU    $0000       ; TRAP #0 / INT dispatcher page byte
+             .EQU    $0002       ; TRAP #0 / INT dispatcher addr word
+TRAP1_VEC    .EQU    $0004       ; TRAP #1 / IRQ0 handler
+; ... entries at n*4 for TRAP #n ...
+TRAP9_VEC    .EQU    $0024       ; TRAP #9 / first syscall
+TRAP127_VEC  .EQU    $01FC       ; TRAP #127 / last syscall
 ```
 
-#### Pascal/Compiler Runtime ($0180-$01FF)
+#### System Variables ($0200-$02FF)
 
 ```asm
-PAS_FRAME    .EQU    $0180           ; Frame pointer backup
-PAS_HEAP     .EQU    $0182           ; Heap pointer
-PAS_TEMP1    .EQU    $0184           ; Expression temporary 1
-PAS_TEMP2    .EQU    $0186           ; Expression temporary 2
+SYS_TICKS    .EQU    $0200       ; System tick counter
+SYS_FLAGS    .EQU    $0202       ; System status flags
 ```
 
-### 8.6 Application Variables ($0200-$0FFF)
+#### Forth Interpreter ($0300-$037F)
+
+```asm
+ZP_LATEST    .EQU    $0300       ; Dictionary head (Y)
+ZP_LATEST_X  .EQU    $0302       ; Dictionary head (X)
+ZP_HERE      .EQU    $0304       ; Next free byte (Y)
+ZP_HERE_X    .EQU    $0306       ; Next free byte (X)
+ZP_STATE     .EQU    $0308       ; Compile state (0=interpret)
+ZP_TOIN      .EQU    $030A       ; >IN parse position
+ZP_NUMTIB    .EQU    $030C       ; #TIB character count
+ZP_BASE      .EQU    $030E       ; Number base (default 10)
+```
+
+#### Pascal/Compiler Runtime ($0380-$03FF)
+
+```asm
+PAS_FRAME    .EQU    $0380       ; Frame pointer backup
+PAS_HEAP     .EQU    $0382       ; Heap pointer
+PAS_TEMP1    .EQU    $0384       ; Expression temporary 1
+PAS_TEMP2    .EQU    $0386       ; Expression temporary 2
+```
+
+### 9.6 Application Variables ($0400-$0FFF)
 
 Organize by usage frequency — place most-used variables at lower addresses:
 
 ```asm
 ; High-frequency variables
-APP_COUNT    .EQU    $0200           ; Loop counter
-APP_TEMP_A   .EQU    $0202           ; Temporary A
-APP_TEMP_B   .EQU    $0204           ; Temporary B
-APP_RESULT   .EQU    $0206           ; Result
+APP_COUNT    .EQU    $0400           ; Loop counter
+APP_TEMP_A   .EQU    $0402           ; Temporary A
+APP_TEMP_B   .EQU    $0404           ; Temporary B
+APP_RESULT   .EQU    $0406           ; Result
 
 ; 24-bit pointers (stored as Y at offset, X at offset+2)
-APP_PTR1_Y   .EQU    $0300           ; Pointer 1 page
-APP_PTR1_X   .EQU    $0302           ; Pointer 1 offset
+APP_PTR1_Y   .EQU    $0500           ; Pointer 1 page
+APP_PTR1_X   .EQU    $0502           ; Pointer 1 offset
 
 ; Application state
-APP_MODE     .EQU    $0400           ; Current mode
-APP_STATUS   .EQU    $0402           ; Status flags
+APP_MODE     .EQU    $0600           ; Current mode
+APP_STATUS   .EQU    $0602           ; Status flags
 
 ; Buffers and arrays
-APP_BUFFER   .EQU    $0500           ; 256-byte work buffer
+APP_BUFFER   .EQU    $0700           ; 256-byte work buffer
 ```
 
-### 8.7 Example: Complete Program
+### 9.7 Example: Complete Program
 
 ```asm
 ;=====================================================
 ; Zero Page Definitions
 ;=====================================================
-ZP_COUNT     .EQU    $0200
-ZP_SUM       .EQU    $0202
-ZP_PTR_X     .EQU    $0204
-ZP_PTR_Y     .EQU    $0206
-SYS_TICKS    .EQU    $0004
+ZP_COUNT     .EQU    $0400
+ZP_SUM       .EQU    $0402
+ZP_PTR_X     .EQU    $0404
+ZP_PTR_Y     .EQU    $0406
+SYS_TICKS    .EQU    $0200
 
 ;=====================================================
 ; Program Code (in ROM)
@@ -1452,20 +2184,22 @@ ISR:
         RTI
 ```
 
-### 8.8 Best Practices
+### 9.8 Best Practices
 
-1. **Reserve $0000-$00FF for system use** — interrupt vector and OS variables
-2. **Allocate frequently-used variables first** — keep hot variables in $0100-$02FF
-3. **Group related variables** — improves code readability
-4. **Use .EQU for all addresses** — makes code maintainable
-5. **Document variable usage** — zero page is a shared resource
-6. **Use LOADP/STOREP consistently** — 3 cycles vs 6 for indexed load (50% faster)
+1. **Reserve $0000-$01FF for the vector table** — TRAP/INT vectors; do not use for variables
+2. **Reserve $0200-$03FF for system/runtime use** — OS variables, Forth, Pascal runtime
+3. **Allocate application variables from $0400** — keep hot variables at lower addresses within this range
+4. **Use .EQU for all addresses** — makes code maintainable and relocatable
+5. **Group related variables** — improves code readability
+6. **Document variable usage** — zero page is a shared resource across all tasks
+7. **Use LOADP/STOREP consistently** — 3 cycles vs 6 for indexed load (50% faster)
+8. **Use `INC XYn, #1` for byte/string traversal** — `INC XYn` defaults to +2 (word step); omitting the `#1` silently skips every other byte
 
 ---
 
-## 9. Special Features
+## 10. Special Features
 
-### 9.1 Word Suffix (w)
+### 10.1 Word Suffix (w)
 
 The 'w' suffix multiplies a value by 2, converting word counts to byte counts. Useful for structure field offsets and stack cleanup.
 
@@ -1477,7 +2211,7 @@ STRUCT_SIZE  .EQU   8w  ; = 16 bytes
 LOADI D0, #10 + 2w      ; = 14 (10 + 4)
 ```
 
-### 9.2 Derivative Operators (24-bit Address Handling)
+### 10.2 Derivative Operators (24-bit Address Handling)
 
 The K16 uses 24-bit addresses but registers are 8-bit (Y) or 16-bit (X). These operators extract portions of 24-bit addresses for loading into XY register pairs.
 
@@ -1517,11 +2251,11 @@ LOADI X2, #<ROM_TABLE   ; X2 = $8000
 
 ---
 
-## 10. Expression Evaluation
+## 11. Expression Evaluation
 
 The assembler supports arithmetic expressions in immediate values, .EQU directives, and .WORD directives.
 
-### 10.1 Operators
+### 11.1 Operators
 
 | Operator | Description | Precedence |
 |----------|-------------|------------|
@@ -1530,7 +2264,7 @@ The assembler supports arithmetic expressions in immediate values, .EQU directiv
 | * / | Multiplication, Division | Medium |
 | + - | Addition, Subtraction | Low |
 
-### 10.2 Examples
+### 11.2 Examples
 
 ```asm
 SIZE         .EQU    256
@@ -1546,9 +2280,102 @@ LOADI D1, #(TOTAL / 4)              ; = 68
 
 ---
 
-## 11. Warnings and Errors
+## 12. Calling Convention (V2 ABI)
 
-### 11.1 Word Alignment Warning
+The K16 V2 ABI is the standard calling convention for K16 assembly and the Pascal compiler. All subroutines — whether called via CALL24, CALLXY, or TRAP — follow this convention unless otherwise noted.
+
+### 12.1 Register Roles
+
+| Register | Role | Saved by |
+|----------|------|----------|
+| D0 | 1st argument / return value | Caller |
+| D1 | 2nd argument | Caller |
+| D2 | 3rd argument | Caller |
+| D3 | Scratch / callee-saved | Callee |
+| X0, Y0 | Scratch (XY0) | Caller |
+| X1, Y1 | Scratch (XY1) | Caller |
+| X2, Y2 | Frame pointer cache (XY2) | Callee |
+| X3, Y3 | Call stack pointer (XY3) | — (managed by CALL/RET) |
+
+**XY2 as frame pointer cache:** XY2 is reserved for the callee to cache a frequently-used pointer (typically a frame or object base address) across calls. Callers must not assume XY2 is preserved across a call they make.
+
+### 12.2 Argument Passing
+
+Up to 3 arguments are passed in registers D0, D1, D2. The 4th and subsequent arguments are pushed to the XY3 stack before the call, right-to-left (last argument pushed first):
+
+```asm
+; Call with 3 register args — no stack args needed
+        LOADI   D0, #arg1
+        LOADI   D1, #arg2
+        LOADI   D2, #arg3
+        CALL24  subroutine
+
+; Call with 5 args — args 4 and 5 on stack
+        PUSH    #arg5, XY3          ; push last arg first
+        PUSH    #arg4, XY3
+        LOADI   D0, #arg1
+        LOADI   D1, #arg2
+        LOADI   D2, #arg3
+        CALL24  subroutine
+        ; caller does NOT clean up stack (callee uses RET #Nw)
+```
+
+### 12.3 Return Value
+
+Returned in D0. For values larger than 16 bits, the caller pre-allocates a result slot on the stack and passes its address (or uses XY2 by convention).
+
+### 12.4 Stack Frame Layout
+
+CALL24 pushes a 4-byte return address. Stack-passed arguments (4th+) are pushed before the call. At entry to the callee:
+
+```
+[X3+0]   return address low   (pushed last by CALL)
+[X3+2]   return address high
+[X3+4]   arg4                 (if present)
+[X3+6]   arg5                 (if present)
+...
+```
+
+### 12.5 Callee Responsibilities
+
+The callee must preserve D3 and XY2 if it uses them, and must clean up any stack arguments it declared using `RET #Nw`:
+
+```asm
+myfunc:                         ; args: D0=a, D1=b, stack=[X3+4]=c
+        PUSH    D3, XY3         ; save D3 if used
+        ; ... body ...
+        POP     D3, XY3         ; restore D3
+        RET     #1w             ; return + pop 1 stack arg (2 bytes)
+```
+
+**RET #Nw limit:** Due to a hardware oscillation bug, `RET #Nw` is safe up to `#4w` (8 bytes). For larger cleanups use `ADD X3, #N` followed by plain `RET`:
+
+```asm
+        ADD     X3, #10         ; pop 5 stack args (10 bytes)
+        RET                     ; then return
+```
+
+### 12.6 TRAP Convention
+
+TRAP handlers follow the same V2 ABI. D0/D1/D2 carry arguments in, D0 carries the return value out. The TRAP instruction pushes 4 bytes to XY3, so stack-passed arguments (if any) are at `[X3+4]` on entry to the handler. Handlers return with plain `RET`.
+
+### 12.7 Forth Runtime
+
+Forth uses an entirely separate register convention and must not be mixed with V2 ABI code:
+
+| Register | Forth role |
+|----------|-----------|
+| XY1 | Interpreter pointer (IP) |
+| XY2 | Data stack pointer |
+| XY3 | Return stack pointer |
+
+Forth and Pascal are separate runtime environments. Do not call between them without an explicit adapter.
+
+---
+
+## 13. Warnings and Errors
+
+### 13.1 Word Alignment Warning
 
 Word operations (LOADD, STORED, etc.) with odd offsets generate warnings:
 
@@ -1558,7 +2385,16 @@ LOADD D0, [XY0+#3]      ; WARNING: odd offset may cause misalignment
 
 The code is still assembled, but may not work correctly on hardware.
 
-### 11.2 Common Errors
+The word-alignment check for labels is now a **warning** (not an error). A label at an odd address is legitimate when used to reference byte data within a `.BYTE` or `.DS` block, but would cause a bus error if used as a code branch target or word memory access.
+
+```asm
+data:   .BYTE   $41, $42, $43   ; 3 bytes
+odd_label:                       ; WARNING: odd address — OK for byte access
+        .ALIGN
+even_label:                      ; no warning
+```
+
+### 13.2 Common Errors
 
 | Error | Cause |
 |-------|-------|
@@ -1568,12 +2404,18 @@ The code is still assembled, but may not work correctly on hardware.
 | .ORG address is odd | K16 requires even addresses |
 | Branch target out of range | Short branch (±127) exceeded; use .L suffix |
 | Invalid destination register | ALU dest must be D0-D3, X0-X3, or Y0-Y3 (not ORDB/SR/PCH/PCL) |
+| Local label before any global label | `.done:` defined before the first global label in the file |
+| .DS count must be >= 0 | Negative count passed to `.DS` |
+| .ALIGN boundary must be a power of 2 | e.g. `.ALIGN 3` |
+| .INCLUDE file not found | Resolved path does not exist |
+| Circular include detected | File includes itself directly or indirectly |
+| .INCLUDE nesting exceeds maximum depth (8) | Include chain too deep |
 
 ---
 
-## 12. Output
+## 14. Output
 
-### 12.1 Listing File
+### 14.1 Listing File
 
 The assembler generates a detailed listing showing address, machine code, and source:
 
@@ -1585,7 +2427,7 @@ Addr     OpCode   Imm     Decode    Source
 
 **Decode format:** Opcode.Mode.Words — The mode field shows which addressing mode was selected (e.g., mode 0 = IMM5, mode 3 = IMM16 for LOADI).
 
-### 12.2 Symbol Table
+### 14.2 Symbol Table
 
 Shows all defined labels and constants with their values:
 
@@ -1597,16 +2439,16 @@ Symbol Table:
 
 ---
 
-## 13. Quick Reference
+## 15. Quick Reference
 
-### 13.1 Instruction Summary
+### 15.1 Instruction Summary
 
 | Category | Instructions |
 |----------|--------------|
 | Load | LOADI, LOADD, LOADX, LOADY, LOADB, LOADXY, LOADP, LOADPB |
 | Store | STORED, STOREX, STOREY, STOREB, STOREXY, STOREP, STOREPB |
 | Move | MOVE, SWAP |
-| Arithmetic | ADD, ADC, SUB, SBC, INC, DEC |
+| Arithmetic | ADD, ADC, SUB, SBC, NEG, INC, DEC |
 | Logical | AND, OR, XOR, NOT |
 | Shift/Rotate | SHL, SHR, ASR, ROL, ROR, SWAPB, HIGH, LOW, SHL4, SHR4, ASR4, ASR8, MULB, RECIP, LOOKUP |
 | Address | LEA |
@@ -1614,17 +2456,18 @@ Symbol Table:
 | Conditional Set | SEQ, SNE, SCS, SCC, SMI, SPL, SAL |
 | Branch | BEQ, BNE, BCS/BHS, BCC/BLO, BLT, BGT, BGE, BLE, BRA |
 | Jump | JMP, JMP24, JMP16, JMPT, JMPXY |
-| Subroutine | CALL, CALL24, CALL16, CALLR, RET |
+| Subroutine | CALL, CALL24, CALL16, CALLR, CALLXY, TRAP, RET |
 | Stack | PUSH, POP (supports D, X, Y, XY, D group, immediate) |
 | Control | NOP, HALT, DINT, EINT, RTI |
 
-### 13.2 Cycle Count Reference
+### 15.2 Cycle Count Reference
 
 | Instruction | Mode 00 | Mode 01 | Mode 10 | Mode 11 | Notes |
 |-------------|---------|---------|---------|---------|-------|
-| **Control** |
+| **Control ($00)** |
 | NOP | 2 | — | — | — | No operation |
 | HALT | — | 2 | — | — | Stop processor |
+| NEG | — | — | — | 3 | Two's complement negate |
 | **LOOKUP ($01)** |
 | SHL/SHR/ASR/ROL/ROR | 3 | 3 | 3 | 3 | Mode selects operation |
 | SWAPB/HIGH/LOW | 3 | 3 | 3 | 3 | Mode selects operation |
@@ -1669,7 +2512,7 @@ Symbol Table:
 | CALL24 | 11 | — | — | — | 24-bit absolute |
 | CALL16 | — | 11 | — | — | 16-bit, current page |
 | CALLR | — | — | 12 | — | PC-relative |
-| RET | — | — | — | 5 | Return (+ optional cleanup) |
+| CALLXY | — | — | — | 10 | Indirect via XY register |
 | **Load ($14-$18)** |
 | LOADD/X/Y | 2 | 3 | 4 | 3 | [XY] / [XY+D] / [PC+imm16] / [XY+imm5] |
 | LOADB | 2 | 3 | 4 | 3 | Byte load (same as LOADD) |
@@ -1682,17 +2525,21 @@ Symbol Table:
 | STOREI | 2 | 3 | — | — | IMM5 / IMM16 |
 | STOREXY | — | — | 6 | — | Store XY pair |
 | STOREP | — | — | — | 5 | Paged memory |
+| **TRAP/RET ($1E)** |
+| TRAP | 12 | — | — | — | Software syscall |
+| RET | — | — | — | 5 | Return (+ optional cleanup) |
 | **Interrupt ($1F)** |
 | DINT | 2 | — | — | — | Disable interrupts |
 | EINT | — | 2 | — | — | Enable interrupts |
 | RTI | — | — | 8 | — | Return from interrupt |
 | INT | — | — | — | 16 | Hardware interrupt |
 
-### 13.3 Flags Affected
+### 15.3 Flags Affected
 
 | Category | Instructions | C | Z | N | V |
 |----------|--------------|---|---|---|---|
 | Arithmetic | ADD, ADC, SUB, SBC | ✓ | ✓ | ✓ | ✓ |
+| Negate | NEG | ✓ | ✓ | ✓ | ✓ |
 | Compare | CMP | ✓ | ✓ | ✓ | ✓ |
 | Logical | AND, OR, XOR, NOT | ✓* | ✓ | ✓ | — |
 | INC/DEC XY | INC, DEC (XY pairs) | ✗ | ✗ | ✗ | ✗ |
@@ -1710,15 +2557,21 @@ Symbol Table:
 
 **Warning:** INC/DEC on XY pairs trashes all flags as a side effect of internal ALU operations. Do not use INC/DEC XY between a comparison and a conditional branch.
 
-### 13.4 Directive Summary
+### 15.4 Directive Summary
 
-| Directive | Usage |
-|-----------|-------|
-| .ORG | `.ORG address` — Set assembly origin |
-| .BASE | `.BASE address` — Set ROM image base address |
-| .EQU | `SYMBOL .EQU value` — Define constant |
-| .WORD | `.WORD value [,value...]` — Emit data words |
-| .TEXT | `.TEXT "string"` — Emit ASCII string (use `\0` or `, 0` for null terminator) |
+| Directive | Syntax | Description |
+|-----------|--------|-------------|
+| `.ORG` | `.ORG address` | Set assembly origin |
+| `.BASE` | `.BASE address` | Set ROM image base address |
+| `.EQU` | `SYMBOL .EQU value` | Define constant |
+| `.WORD` | `.WORD value [,value...]` | Emit 16-bit data words |
+| `.TEXT` | `.TEXT "string" [,bytes...]` | Emit ASCII string (word-aligned, use `\0` or `, 0` for null) |
+| `.BYTE` | `.BYTE value [,value...]` | Emit bytes; PC advances by exact byte count |
+| `.ALIGN` | `.ALIGN [boundary]` | Pad PC to boundary (default 2); boundary must be power of 2 |
+| `.DS` | `.DS count [,fill]` | Reserve bytes with fill value (default `$00`) |
+| `.INCLUDE` | `.INCLUDE "filename"` | Insert source file inline |
+| `.IF` | `.IF symbol` | Begin conditional block (assemble if symbol ≠ 0) |
+| `.ENDIF` | `.ENDIF` | End conditional block |
 
 ---
 
@@ -1737,7 +2590,7 @@ This example demonstrates C-style calling conventions, parameter passing, stack 
 ;   - Byte-level memory access
 ;   - Subroutine calls with callee cleanup
 ; 
-; Version: 3.1 (January 2026)
+; Version: 3.1 (April 2026)
 ; Updated for new memory map:
 ;   - Reset vector at $FF0000
 ;   - Stack/ZP at page $00
@@ -1784,8 +2637,8 @@ Start:
 ;   AAAAAA: XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX  ................
 ;
 ; Stack frame at entry:
-;   [X3+0]  = return address high
-;   [X3+2]  = return address low
+;   [X3+0]  = return address low   (pushed last = top of stack)
+;   [X3+2]  = return address high
 ;   [X3+4]  = param1: start_low
 ;   [X3+6]  = param2: start_high
 ;   [X3+8]  = param3: end_low
@@ -2046,24 +2899,29 @@ DumpEnd:
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | December 2025 | Initial release |
-| 1.1 | December 17, 2025 | Updated ALU to 2-operand format; added SWAP, STOREXY, LOADXY; full JMP family (JMP16, JMPT, JMPI); updated CMP modes; clarified MOVE modes |
-| 1.2 | December 22, 2025 | Added LOADP/STOREP and LOADPB/STOREPB paged memory instructions; verified MOVE PC for indirect jumps; renamed JMPI to JMPXY; renamed SWAP (lookup) to SWAPB; added byte operations section |
-| 1.3 | December 24, 2025 | Updated branch instructions: added BLT, BGT, BLE, BHS/BLO aliases; removed BMI/BPL; short branch range now 0-31 bytes |
-| 1.4 | January 4, 2026 | Added extended LOOKUP operations (SHL4, SHR4, ASR4, ASR8, MULB, RECIP); fixed HIGH description; LOOKUP now 3 cycles |
-| 1.5 | January 4, 2026 | Added interrupt system documentation (DINT, EINT, RTI, INT); vector table dispatch example; nested interrupts; renamed to K16 Reference Manual |
-| 1.6 | January 6, 2026 | Added Conditional Set (Scc) instructions: SEQ, SNE, SCS, SCC, SMI, SPL, SAL |
-| 1.7 | January 6, 2026 | Added INC/DEC instructions: dedicated opcode $02 for XY pairs with 24-bit carry/borrow; D/X/Y register syntax sugar |
-| 1.8 | January 6, 2026 | Added LEA instruction (opcode $03): 4 modes for address calculation with 24-bit carry propagation; expanded Section 1 with architecture summary, memory map, and opcode table |
-| 1.9 | January 6, 2026 | Added cycle count quick reference (12.2) and flags affected summary (12.3) |
-| 2.0 | January 7, 2026 | Updated all cycle counts from verified microcode; fixed LOADI modes (00/01 not 10/11); corrected CALL cycles (11-12), JMPT (4), JMPXY (3), branch (3-4), stack ops |
-| 2.1 | January 7, 2026 | Reformatted all Section 6 instruction descriptions with consistent format: heading, brief description, opcode, mode/syntax/operation/cycles/words table, flags, examples |
-| 2.2 | January 7, 2026 | Fixed Scc conditions to match Branch (SLT/SGT/SGE/SLE instead of SMI/SPL/SAL); Scc always 2 words |
-| 2.3 | January 10, 2026 | Added Section 9: Zero Page Programming (memory map, stack layout, variable allocation, LOADP/STOREP usage); renumbered sections 9-12 → 10-13 |
-| 2.4 | January 10, 2026 | Fixed Zero Page cycle counts (LOADP=3, not 1); reorganized sections: Byte Operations→7, Zero Page→8, Special Features→9, Expression Evaluation→10 |
-| 2.5 | January 12, 2026 | Fixed Scc conditions in opcode map to match Branch (SLT/SGT/SGE/SLE, not SMI/SPL/SAL) |
-| 2.6 | January 17, 2026 | Updated memory map: RAM at $00-$BF, I/O at $C0-$DF, ROM at $E0-$FF; reset vector $FF0000; Zero Page now page $00; LOOKUP tables at $E0-$FA |
-| 2.7 | January 17, 2026 | Added .BASE directive; clarified .TEXT requires explicit `, 0` for null termination; updated Appendix A sample |
-| 2.8 | January 18, 2026 | Converted all .EQU examples to symbol-first format (`SYMBOL .EQU value`) |
+| 1.1 | 17 December 2025 | Updated ALU to 2-operand format; added SWAP, STOREXY, LOADXY; full JMP family (JMP16, JMPT, JMPI); updated CMP modes; clarified MOVE modes |
+| 1.2 | 22 December 2025 | Added LOADP/STOREP and LOADPB/STOREPB paged memory instructions; verified MOVE PC for indirect jumps; renamed JMPI to JMPXY; renamed SWAP (lookup) to SWAPB; added byte operations section |
+| 1.3 | 24 December 2025 | Updated branch instructions: added BLT, BGT, BLE, BHS/BLO aliases; removed BMI/BPL; short branch range now 0-31 bytes |
+| 1.4 | 4 January 2026 | Added extended LOOKUP operations (SHL4, SHR4, ASR4, ASR8, MULB, RECIP); fixed HIGH description; LOOKUP now 3 cycles |
+| 1.5 | 4 January 2026 | Added interrupt system documentation (DINT, EINT, RTI, INT); vector table dispatch example; nested interrupts; renamed to K16 Reference Manual |
+| 1.6 | 6 January 2026 | Added Conditional Set (Scc) instructions: SEQ, SNE, SCS, SCC, SMI, SPL, SAL |
+| 1.7 | 6 January 2026 | Added INC/DEC instructions: dedicated opcode $02 for XY pairs with 24-bit carry/borrow; D/X/Y register syntax sugar |
+| 1.8 | 6 January 2026 | Added LEA instruction (opcode $03): 4 modes for address calculation with 24-bit carry propagation; expanded Section 1 with architecture summary, memory map, and opcode table |
+| 1.9 | 6 January 2026 | Added cycle count quick reference (12.2) and flags affected summary (12.3) |
+| 2.0 | 7 January 2026 | Updated all cycle counts from verified microcode; fixed LOADI modes (00/01 not 10/11); corrected CALL cycles (11-12), JMPT (4), JMPXY (3), branch (3-4), stack ops |
+| 2.1 | 7 January 2026 | Reformatted all Section 6 instruction descriptions with consistent format: heading, brief description, opcode, mode/syntax/operation/cycles/words table, flags, examples |
+| 2.2 | 7 January 2026 | Fixed Scc conditions to match Branch (SLT/SGT/SGE/SLE instead of SMI/SPL/SAL); Scc always 2 words |
+| 2.3 | 10 January 2026 | Added Section 9: Zero Page Programming (memory map, stack layout, variable allocation, LOADP/STOREP usage); renumbered sections 9-12 → 10-13 |
+| 2.4 | 10 January 2026 | Fixed Zero Page cycle counts (LOADP=3, not 1); reorganized sections: Byte Operations→7, Zero Page→8, Special Features→9, Expression Evaluation→10 |
+| 2.5 | 12 January 2026 | Fixed Scc conditions in opcode map to match Branch (SLT/SGT/SGE/SLE, not SMI/SPL/SAL) |
+| 2.6 | 17 January 2026 | Updated memory map: RAM at $00-$BF, I/O at $C0-$DF, ROM at $E0-$FF; reset vector $FF0000; Zero Page now page $00; LOOKUP tables at $E0-$FA |
+| 2.7 | 17 January 2026 | Added .BASE directive; clarified .TEXT requires explicit `, 0` for null termination; updated Appendix A sample |
+| 2.8 | 18 January 2026 | Converted all .EQU examples to symbol-first format (`SYMBOL .EQU value`) |
+| 2.9 | March 2026 | Added directives: `.BYTE`, `.ALIGN`, `.DS`, `.INCLUDE`; added local labels scoped to enclosing global label; odd-address label check downgraded from error to warning |
+| 3.0 | March 2026 | Added conditional assembly directives `.IF` / `.ENDIF` (Section 4.10); updated directive summary table |
+| 3.1 | April 2026 | Added CALLXY (opcode $13 mode 11): indirect call via XY register, 10 cycles; added TRAP (opcode $1E mode 00): software syscall with vector table, 12 cycles; relocated RET from $13 mode 11 to $1E mode 11; updated opcode table, instruction summary, cycle count table, new section 6.11 (TRAP/RET); updated zero page memory map — vector table now $0000-$01FF (512 bytes), system variables $0200, Forth $0300, Pascal $0380, application ZP $0400; added INC XYn byte traversal warnings (section 6.3 and 8.8); added INT/TRAP #0 dispatcher note (section 6.14); added Section 11 V2 ABI calling convention; fixed Appendic A stack frame comment and version date |
+| 3.2 | April 2026 | Added NEG instruction (opcode $00 mode 11): two's complement negate, 3 cycles, documented in section 6.3 (Arithmetic); cross-reference in section 6.13; updated opcode table, instruction summary, cycle count table, flags table |
+| 3.3 | 7 April 2026 | Added Section 8 (Endianness): complete little-endian reference for all memory operations; covers STORED/LOADD, STOREX/LOADX, STOREB/LOADB, STOREXY/LOADXY, CALL24/RET stack layout, PUSH/POP single and XY, TRAP, string/byte data, instruction ROM encoding, and toolchain summary; all entries verified by hardware test or microcode inspection; renumbered sections 8–14 → 9–15 |
 
 ---
 
