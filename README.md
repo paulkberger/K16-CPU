@@ -148,11 +148,11 @@ The K16 prioritizes:
 
 ## Software Stack
 
-### K16Pascal Compiler
+### K16 Pascal Compiler
 
 A Pascal compiler targeting the K16, ported from PASTA/80. Implements the V2 ABI calling convention (arguments in D0/D1/D2, result in D0, XY2 as frame pointer). Fully tested against a 211-test suite.
 
-### K/OS Forth
+### K16 Forth
 
 A complete Forth implementation running natively on the K16:
 - Indirect Threaded Code (ITC) interpreter
