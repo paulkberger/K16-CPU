@@ -1,0 +1,69 @@
+;===============================================================================
+; K16 Assembler Enhancement Demo
+; Demonstrates: .INCLUDE  .BYTE  .ALIGN  .DS  Local Labels
+;===============================================================================
+             .BASE       $F00000
+             .ORG        $FF0000
+
+             .INCLUDE    "defs.asm"
+
+;-------------------------------------------------------------------------------
+; Reset vector — must be first at $FF0000
+;-------------------------------------------------------------------------------
+RESET:
+             LOADI       X3, #<$010000       ; Stack pointer low
+             LOADI       Y3, #>$010000       ; Stack pointer high
+             LOADI       D0, #0
+             LOADI       D1, #0
+             LOADI       D2, #0
+             LOADI       D3, #0
+             JMP         MAIN
+
+;-------------------------------------------------------------------------------
+; String Table  (.BYTE and .ALIGN)
+;-------------------------------------------------------------------------------
+STR_HELLO:   .BYTE       "Hello from the K16 CPU!\r\n\0"
+             .ALIGN                          ; word-align after odd string
+STR_READY:   .BYTE       "System ready.\r\n\0"
+             .ALIGN
+STR_VER:     .BYTE       1, "v1.0"           ; Pascal-style length-prefixed string
+             .ALIGN
+
+;-------------------------------------------------------------------------------
+; Variables  (.DS)
+;-------------------------------------------------------------------------------
+LINE_BUF:    .DS         BUF_SIZE, 0         ; 82-byte line input buffer
+             .ALIGN
+CURSOR_X:    .DS         2, 0                ; Current cursor column (1 word)
+CURSOR_Y:    .DS         2, 0                ; Current cursor row    (1 word)
+
+;-------------------------------------------------------------------------------
+; PrintStr — print null-terminated string at [XY0]
+;-------------------------------------------------------------------------------
+PRINTSTR:
+             LOADI       X1, #<TERMINAL      ; Terminal port address
+             LOADI       Y1, #>TERMINAL
+.next:
+             LOADB       D0, [XY0]           ; Load next byte
+             CMP         D0, #NULL           ; End of string?
+             BEQ         .done
+             STOREB      D0, [XY1]           ; Output byte to terminal
+             INC         XY0                 ; Advance pointer
+             JMP         .next
+.done:
+             RET
+
+;-------------------------------------------------------------------------------
+; Main
+;-------------------------------------------------------------------------------
+MAIN:
+             LOADI       X0, #<STR_HELLO
+             LOADI       Y0, #>STR_HELLO
+             CALL        PRINTSTR
+
+             LOADI       X0, #<STR_READY
+             LOADI       Y0, #>STR_READY
+             CALL        PRINTSTR
+
+.loop:
+             JMP         .loop               ; Idle

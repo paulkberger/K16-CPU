@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Default"/>
+    <Units>
+      <Unit>
+        <Filename Value="K16EmuIDE.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <CursorPos Y="12"/>
+        <UsageCount Value="29"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main.pas"/>
+        <IsPartOfProject Value="True"/>
+        <ComponentName Value="frmMain"/>
+        <HasResources Value="True"/>
+        <ResourceBaseClass Value="Form"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="55"/>
+        <CursorPos X="40" Y="73"/>
+        <UsageCount Value="29"/>
+        <Loaded Value="True"/>
+        <LoadedDesigner Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="cpu_thread.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="29"/>
+      </Unit>
+      <Unit>
+        <Filename Value="emu_io_gui.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="29"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_types.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="29"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\include\customform.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="2016"/>
+        <CursorPos Y="2037"/>
+        <UsageCount Value="9"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main - Copy.pas"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="385"/>
+        <CursorPos X="12" Y="57"/>
+        <UsageCount Value="14"/>
+        <Loaded Value="True"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="29">
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="73" Column="20" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="20" TopLine="53"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="71" Column="40" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="70" Column="40" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="71" Column="40" TopLine="54"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="72" Column="40" TopLine="55"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode=""/>
+    </RunParams>
+  </ProjectSession>
+</CONFIG>

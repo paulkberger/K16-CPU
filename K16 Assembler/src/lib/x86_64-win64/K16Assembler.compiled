@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Compiler Value="C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe" Date="1533565110"/>
+  <Params Value="-MObjFPC -Scghi -O2 -WG -l -vewnhibq &quot;-FiC:\K16 CPU\K16 Assembler\src\lib\x86_64-win64&quot; &quot;-FuC:\K16 CPU\K16 Assembler\src\&quot; -FuC:\lazarus\components\synedit\units\x86_64-win64\win32 -FuC:\lazarus\components\lazcontrols\lib\x86_64-win64\win32 -FuC:\lazarus\lcl\units\x86_64-win64\win32 -FuC:\lazarus\lcl\units\x86_64-win64 -FuC:\lazarus\components\lazedit\lib\x86_64-win64 -FuC:\lazarus\components\freetype\lib\x86_64-win64 -FuC:\lazarus\components\lazutils\lib\x86_64-win64 -FuC:\lazarus\packager\units\x86_64-win64 &quot;-FUC:\K16 CPU\K16 Assembler\src\lib\x86_64-win64\&quot; &quot;-FEC:\K16 CPU\K16 Assembler\&quot; &quot;-oC:\K16 CPU\K16 Assembler\K16Assembler.exe&quot; -dLCL -dLCLwin32 K16Assembler.lpr"/>
+</CONFIG>

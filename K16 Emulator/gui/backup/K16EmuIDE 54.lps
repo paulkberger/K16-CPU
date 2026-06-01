@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Default"/>
+    <Units>
+      <Unit>
+        <Filename Value="K16EmuIDE.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <CursorPos Y="12"/>
+        <UsageCount Value="90"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main.pas"/>
+        <IsPartOfProject Value="True"/>
+        <ComponentName Value="frmMain"/>
+        <HasResources Value="True"/>
+        <ResourceBaseClass Value="Form"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="208"/>
+        <CursorPos X="5" Y="230"/>
+        <UsageCount Value="90"/>
+        <Loaded Value="True"/>
+        <LoadedDesigner Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="cpu_thread.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="112"/>
+        <CursorPos X="5" Y="158"/>
+        <UsageCount Value="90"/>
+      </Unit>
+      <Unit>
+        <Filename Value="emu_io_gui.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="90"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_types.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="120"/>
+        <CursorPos X="5" Y="166"/>
+        <UsageCount Value="90"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\include\customform.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="2016"/>
+        <CursorPos Y="2037"/>
+        <UsageCount Value="4"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main - Copy.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="337"/>
+        <CursorPos X="12" Y="57"/>
+        <UsageCount Value="28"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_decode.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="38"/>
+        <CursorPos X="5" Y="154"/>
+        <UsageCount Value="9"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_mem.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="201"/>
+        <CursorPos X="5" Y="247"/>
+        <UsageCount Value="9"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\interfaces\win32\win32callback.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="2756"/>
+        <CursorPos Y="2779"/>
+        <UsageCount Value="9"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="354"/>
+        <CursorPos X="5" Y="400"/>
+        <UsageCount Value="17"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <EditorIndex Value="3"/>
+        <TopLine Value="1124"/>
+        <CursorPos X="5" Y="1170"/>
+        <UsageCount Value="17"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_alu.pas"/>
+        <EditorIndex Value="4"/>
+        <TopLine Value="215"/>
+        <CursorPos X="5" Y="261"/>
+        <UsageCount Value="15"/>
+        <Loaded Value="True"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="29">
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1025" Column="58" TopLine="1015"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="14" Column="17"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1051" Column="50" TopLine="1028"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1054" Column="50" TopLine="1035"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="366" Column="40" TopLine="349"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="394" Column="5" TopLine="348"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="430" Column="56" TopLine="407"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="52" Column="25" TopLine="29"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="430" Column="56" TopLine="407"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="34" Column="27" TopLine="29"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="894" Column="18" TopLine="881"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="902" Column="37" TopLine="881"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="904" Column="45" TopLine="883"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1059" Column="47" TopLine="1045"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="900" Column="23" TopLine="892"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="357" Column="23" TopLine="349"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1066" Column="57" TopLine="1046"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="372" Column="40" TopLine="349"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="377" Column="26" TopLine="355"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <Caret Line="1140" Column="27" TopLine="1125"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_alu.pas"/>
+        <Caret Line="15" Column="30"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="907" Column="42" TopLine="881"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="911" Column="42" TopLine="882"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="897" Column="18" TopLine="886"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="894" Column="10" TopLine="889"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="931" Column="5" TopLine="886"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="872" Column="15" TopLine="852"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="912" Column="28" TopLine="890"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="215" Column="13" TopLine="208"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="899" Column="58" TopLine="890"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode=""/>
+    </RunParams>
+  </ProjectSession>
+</CONFIG>

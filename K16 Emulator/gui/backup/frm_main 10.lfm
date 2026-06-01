@@ -1,0 +1,538 @@
+object frmMain: TfrmMain
+  Left = 200
+  Height = 1215
+  Top = 100
+  Width = 1696
+  Caption = 'K16 Emulator IDE'
+  ClientHeight = 1215
+  ClientWidth = 1696
+  DesignTimePPI = 144
+  LCLVersion = '4.4.0.0'
+  Scaled = False
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  object FToolBarPanel: TPanel
+    Left = 0
+    Height = 60
+    Top = 1155
+    Width = 1696
+    Align = alBottom
+    ClientHeight = 60
+    ClientWidth = 1696
+    ParentBackground = False
+    ParentColor = False
+    TabOrder = 0
+    object FBtnLoad: TBitBtn
+      Left = 16
+      Height = 45
+      Top = 8
+      Width = 113
+      Caption = 'Load .bin'
+      TabOrder = 0
+      OnClick = BtnLoadClick
+    end
+    object FBtnRun: TBitBtn
+      Left = 136
+      Height = 45
+      Top = 8
+      Width = 113
+      Caption = 'Run >'
+      TabOrder = 1
+      OnClick = BtnRunClick
+    end
+    object FBtnStep: TBitBtn
+      Left = 256
+      Height = 45
+      Top = 8
+      Width = 113
+      Caption = 'Step'
+      TabOrder = 2
+      OnClick = BtnStepClick
+    end
+    object FBtnStop: TBitBtn
+      Left = 376
+      Height = 45
+      Top = 8
+      Width = 113
+      Caption = 'Stop'
+      TabOrder = 3
+      OnClick = BtnStopClick
+    end
+    object FBtnReset: TBitBtn
+      Left = 496
+      Height = 45
+      Top = 8
+      Width = 113
+      Caption = 'Reset'
+      TabOrder = 4
+      OnClick = BtnResetClick
+    end
+    object EditMhz: TEdit
+      Left = 784
+      Height = 33
+      Top = 16
+      Width = 58
+      AutoSize = False
+      NumbersOnly = True
+      TabOrder = 5
+      Text = '10'
+    end
+    object ComboBox1: TComboBox
+      Left = 656
+      Height = 33
+      Top = 16
+      Width = 120
+      AutoDropDown = True
+      ItemHeight = 25
+      ItemIndex = 0
+      Items.Strings = (
+        'Fast'
+        'MHz'
+        'Hz'
+      )
+      TabOrder = 6
+      Text = 'Fast'
+    end
+    object CheckBoxBP: TCheckBox
+      Left = 888
+      Height = 29
+      Top = 20
+      Width = 68
+      Alignment = taLeftJustify
+      Caption = 'Break'
+      TabOrder = 7
+      OnChange = ChkBPChange
+    end
+    object EditBP: TEdit
+      Left = 976
+      Height = 33
+      Top = 16
+      Width = 95
+      AutoSize = False
+      NumbersOnly = True
+      TabOrder = 8
+      Text = 'FF0000'
+    end
+    object EditMemAddress: TEdit
+      Left = 1576
+      Height = 33
+      Top = 16
+      Width = 95
+      Anchors = [akTop, akRight]
+      AutoSize = False
+      NumbersOnly = True
+      TabOrder = 9
+      Text = 'FF0000'
+      OnChange = EdMemAddrChange
+    end
+    object Label15: TLabel
+      Left = 1424
+      Height = 25
+      Top = 20
+      Width = 137
+      Anchors = [akTop, akRight]
+      Caption = 'Memory Address'
+    end
+  end
+  object FLeftPanel: TPanel
+    Left = 0
+    Height = 1155
+    Top = 0
+    Width = 1076
+    Align = alClient
+    Caption = 'FLeftPanel'
+    ClientHeight = 1155
+    ClientWidth = 1076
+    TabOrder = 1
+    object GroupBox1: TGroupBox
+      Left = 1
+      Height = 315
+      Top = 839
+      Width = 1074
+      Align = alClient
+      Caption = 'Terminal'
+      ClientHeight = 285
+      ClientWidth = 1070
+      TabOrder = 0
+      object MemoTerminal: TMemo
+        Left = 0
+        Height = 285
+        Top = 0
+        Width = 1070
+        Align = alClient
+        TabOrder = 0
+      end
+    end
+    object GroupBox2: TGroupBox
+      Left = 1
+      Height = 838
+      Top = 1
+      Width = 1074
+      Align = alTop
+      Caption = 'Video Output'
+      ClientHeight = 808
+      ClientWidth = 1070
+      TabOrder = 1
+      object pbVideo: TPaintBox
+        Left = 16
+        Height = 768
+        Top = 16
+        Width = 1024
+        Color = clWhite
+        ParentColor = False
+        OnPaint = PbVideoPaint
+      end
+    end
+  end
+  object FRightPanel: TPanel
+    Left = 1084
+    Height = 1155
+    Top = 0
+    Width = 612
+    Align = alRight
+    Caption = 'FRightPanel'
+    ClientHeight = 1155
+    ClientWidth = 612
+    TabOrder = 2
+    object GroupBoxRegisters: TGroupBox
+      Left = 1
+      Height = 286
+      Top = 1
+      Width = 610
+      Align = alTop
+      Caption = 'Registers'
+      ClientHeight = 256
+      ClientWidth = 606
+      TabOrder = 0
+      object LabelD0: TLabel
+        Left = 16
+        Height = 32
+        Top = 8
+        Width = 130
+        AutoSize = False
+        Caption = 'D0 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clGreen
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelD1: TLabel
+        Left = 160
+        Height = 32
+        Top = 8
+        Width = 130
+        AutoSize = False
+        Caption = 'D1 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clGreen
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelD2: TLabel
+        Left = 304
+        Height = 32
+        Top = 8
+        Width = 130
+        AutoSize = False
+        Caption = 'D2 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clGreen
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelD3: TLabel
+        Left = 442
+        Height = 32
+        Top = 8
+        Width = 130
+        AutoSize = False
+        Caption = 'D3 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clGreen
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelX0: TLabel
+        Left = 16
+        Height = 32
+        Top = 48
+        Width = 130
+        AutoSize = False
+        Caption = 'X0 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clBlue
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelX1: TLabel
+        Left = 160
+        Height = 32
+        Top = 48
+        Width = 130
+        AutoSize = False
+        Caption = 'X1 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clBlue
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelX2: TLabel
+        Left = 304
+        Height = 32
+        Top = 48
+        Width = 130
+        AutoSize = False
+        Caption = 'X2 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clBlue
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelX3: TLabel
+        Left = 442
+        Height = 32
+        Top = 48
+        Width = 130
+        AutoSize = False
+        Caption = 'X3 $0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clBlue
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelY0: TLabel
+        Left = 16
+        Height = 32
+        Top = 88
+        Width = 130
+        AutoSize = False
+        Caption = 'Y0 $00'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clRed
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelY1: TLabel
+        Left = 160
+        Height = 32
+        Top = 88
+        Width = 130
+        AutoSize = False
+        Caption = 'Y1 $00'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clRed
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelY2: TLabel
+        Left = 304
+        Height = 32
+        Top = 88
+        Width = 130
+        AutoSize = False
+        Caption = 'Y2 $00'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clRed
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelY3: TLabel
+        Left = 442
+        Height = 32
+        Top = 88
+        Width = 130
+        AutoSize = False
+        Caption = 'Y3 $00'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Color = clRed
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelPC: TLabel
+        Left = 16
+        Height = 32
+        Top = 128
+        Width = 274
+        AutoSize = False
+        Caption = 'PC $FF0000'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabelSR: TLabel
+        Left = 304
+        Height = 32
+        Top = 128
+        Width = 274
+        AutoSize = False
+        Caption = 'SR [--------]'
+        Color = clWhite
+        Font.CharSet = ANSI_CHARSET
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentColor = False
+        ParentFont = False
+        Transparent = False
+      end
+      object LabeLCycles: TLabel
+        Left = 16
+        Height = 32
+        Top = 168
+        Width = 140
+        Caption = 'Cycles = 0'
+        Font.CharSet = ANSI_CHARSET
+        Font.Height = -24
+        Font.Name = 'Cascadia Mono PL'
+        Font.Pitch = fpFixed
+        Font.Quality = fqDraft
+        ParentFont = False
+      end
+      object LabelStatus: TLabel
+        Left = 16
+        Height = 25
+        Top = 216
+        Width = 252
+        Caption = 'Ready - Load a .bin file to begin'
+      end
+    end
+    object GBoxDisassembly: TGroupBox
+      Left = 1
+      Height = 545
+      Top = 287
+      Width = 610
+      Align = alClient
+      Caption = 'Disassembly'
+      ClientHeight = 515
+      ClientWidth = 606
+      TabOrder = 1
+      object StringGridDisasm: TStringGrid
+        Left = 0
+        Height = 515
+        Top = 0
+        Width = 606
+        Align = alClient
+        RowCount = 20
+        TabOrder = 0
+      end
+    end
+    object GBoxMemory: TGroupBox
+      Left = 1
+      Height = 322
+      Top = 832
+      Width = 610
+      Align = alBottom
+      Caption = 'Memory'
+      ClientHeight = 292
+      ClientWidth = 606
+      TabOrder = 2
+      object StringGridMemory: TStringGrid
+        Left = 0
+        Height = 292
+        Top = 0
+        Width = 606
+        Align = alClient
+        ColCount = 9
+        DefaultRowHeight = 30
+        RowCount = 20
+        TabOrder = 0
+      end
+    end
+  end
+  object Splitter1: TSplitter
+    Left = 1076
+    Height = 1155
+    Top = 0
+    Width = 8
+    Align = alRight
+    ResizeAnchor = akRight
+  end
+  object OpenDialog: TOpenDialog
+    Left = 646
+    Top = 928
+  end
+  object TimerRefresh: TTimer
+    OnTimer = TmrRefresh
+    Left = 795
+    Top = 928
+  end
+end

@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Default"/>
+    <Units>
+      <Unit>
+        <Filename Value="K16EmuIDE.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <CursorPos Y="12"/>
+        <UsageCount Value="73"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main.pas"/>
+        <IsPartOfProject Value="True"/>
+        <ComponentName Value="frmMain"/>
+        <HasResources Value="True"/>
+        <ResourceBaseClass Value="Form"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="799"/>
+        <CursorPos X="5" Y="844"/>
+        <UsageCount Value="73"/>
+        <Loaded Value="True"/>
+        <LoadedDesigner Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="cpu_thread.pas"/>
+        <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="112"/>
+        <CursorPos X="5" Y="158"/>
+        <UsageCount Value="73"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="emu_io_gui.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="73"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_types.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="73"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\include\customform.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="2016"/>
+        <CursorPos Y="2037"/>
+        <UsageCount Value="5"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main - Copy.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="337"/>
+        <CursorPos X="12" Y="57"/>
+        <UsageCount Value="29"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="29">
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="146" Column="47" TopLine="129"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="155" Column="50" TopLine="139"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="152" Column="25" TopLine="139"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="799" Column="19" TopLine="787"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="136" Column="21" TopLine="122"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="812" Column="24" TopLine="800"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="130" Column="18" TopLine="120"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="825" Column="23" TopLine="802"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="848" Column="5" TopLine="803"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="125" Column="20" TopLine="119"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="150" Column="34" TopLine="122"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="848" Column="5" TopLine="803"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="156" Column="26" TopLine="128"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="13" Column="14"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="151" Column="31" TopLine="128"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="13" Column="14"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="151" Column="31" TopLine="128"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="132" Column="12" TopLine="128"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="10" Column="13"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="163" Column="5" TopLine="117"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="155" Column="31" TopLine="132"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="152" Column="33" TopLine="132"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="133" Column="34" TopLine="118"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="826" Column="14" TopLine="807"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="827" Column="40" TopLine="802"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="115" Column="34" TopLine="103"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="822" Column="27" TopLine="806"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="123" Column="28" TopLine="103"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="829" Column="32" TopLine="805"/>
+      </Position>
+      <Position>
+        <Filename Value="cpu_thread.pas"/>
+        <Caret Line="119" Column="29" TopLine="103"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode=""/>
+    </RunParams>
+  </ProjectSession>
+</CONFIG>

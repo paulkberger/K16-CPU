@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Default"/>
+    <Units>
+      <Unit>
+        <Filename Value="K16EmuIDE.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <CursorPos Y="12"/>
+        <UsageCount Value="171"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main.pas"/>
+        <IsPartOfProject Value="True"/>
+        <ComponentName Value="frmMain"/>
+        <HasResources Value="True"/>
+        <ResourceBaseClass Value="Form"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="549"/>
+        <CursorPos Y="575"/>
+        <UsageCount Value="171"/>
+        <Loaded Value="True"/>
+        <LoadedDesigner Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="cpu_thread.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="112"/>
+        <CursorPos X="5" Y="158"/>
+        <UsageCount Value="171"/>
+      </Unit>
+      <Unit>
+        <Filename Value="emu_io_gui.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="171"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_types.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="122"/>
+        <CursorPos X="5" Y="168"/>
+        <UsageCount Value="171"/>
+      </Unit>
+      <Unit>
+        <Filename Value="frm_main - Copy.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="337"/>
+        <CursorPos X="12" Y="57"/>
+        <UsageCount Value="20"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_decode.pas"/>
+        <EditorIndex Value="5"/>
+        <TopLine Value="111"/>
+        <CursorPos X="5" Y="157"/>
+        <UsageCount Value="30"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_mem.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="205"/>
+        <CursorPos X="5" Y="251"/>
+        <UsageCount Value="27"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\interfaces\win32\win32callback.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="2756"/>
+        <CursorPos Y="2779"/>
+        <UsageCount Value="1"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="4"/>
+        <TopLine Value="268"/>
+        <CursorPos Y="291"/>
+        <UsageCount Value="11"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_opcodes.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="1124"/>
+        <CursorPos X="5" Y="1170"/>
+        <UsageCount Value="10"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\core\emu_alu.pas"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="215"/>
+        <CursorPos X="5" Y="261"/>
+        <UsageCount Value="8"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <UnitName Value="Grids"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="8494"/>
+        <CursorPos Y="8530"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\components\lazutils\dynamicarray.pas"/>
+        <UnitName Value="DynamicArray"/>
+        <EditorIndex Value="3"/>
+        <TopLine Value="38"/>
+        <CursorPos Y="64"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="29">
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="573" TopLine="549"/>
+      </Position>
+      <Position>
+        <Filename Value="frm_main.pas"/>
+        <Caret Line="575" TopLine="549"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11418" TopLine="11395"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11419" TopLine="11395"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10335" TopLine="10312"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10337" TopLine="10312"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10338" TopLine="10312"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10447" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10448" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10449" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10452" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10453" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10454" TopLine="10424"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10340" TopLine="10317"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\components\lazutils\dynamicarray.pas"/>
+        <Caret Line="61" TopLine="38"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\components\lazutils\dynamicarray.pas"/>
+        <Caret Line="63" TopLine="38"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\components\lazutils\dynamicarray.pas"/>
+        <Caret Line="64" TopLine="38"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="10341" TopLine="10317"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11420" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11421" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11422" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11423" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11424" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11408" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11409" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="11414" TopLine="11397"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="8517" TopLine="8494"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="8518" TopLine="8494"/>
+      </Position>
+      <Position>
+        <Filename Value="C:\lazarus\lcl\grids.pas"/>
+        <Caret Line="8530" TopLine="8494"/>
+      </Position>
+      <Position>
+        <Filename Value="..\core\emu_debug.pas"/>
+        <Caret Line="291" TopLine="268"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode=""/>
+    </RunParams>
+  </ProjectSession>
+</CONFIG>

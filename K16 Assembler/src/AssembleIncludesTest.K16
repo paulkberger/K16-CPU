@@ -1,0 +1,6 @@
+.INCLUDE "defs.asm"
+             .ORG     $FF0000
+MAIN:
+             LOADI    D0, #LINE_WIDTH    ; should be 80
+             LOADI    D1, #SCREEN_SIZE   ; should be 2000
+             HALT
