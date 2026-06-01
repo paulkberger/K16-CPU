@@ -1,10 +1,12 @@
 # K16 CPU
 
-A 16-bit discrete logic CPU with 24-bit addressing, built from approximately 60 TTL chips and 6 ROMs.
+A 16-bit discrete logic CPU with 24-bit addressing, built from approximately 80 chips (excluding external RAM/ROM).
 
 ## Overview
 
 The K16 is a homebrew CPU designed around ROM-based lookup tables for both ALU operations and instruction decoding. Rather than using traditional hardwired logic, the K16 leverages high-density flash ROMs to implement complex functionality while keeping the chip count reasonable.
+
+The full design runs today in two environments: a gate-level **Digital** logic simulator (the hardware reference build) and a **Pascal/Lazarus emulator** with an integrated IDE and VT100 terminal. On top of these runs **k/OS**, a preemptive multitasking OS with its re-entrant shell **kosh**, alongside native **Forth** and **BASIC** interpreters that also load as k/OS shells.
 
 **Key Specifications:**
 - 16-bit data bus
@@ -12,7 +14,7 @@ The K16 is a homebrew CPU designed around ROM-based lookup tables for both ALU o
 - Little-endian byte ordering
 - Hybrid ROM/Adder ALU architecture
 - 8-level priority interrupt system (74LS148 encoder)
-- Target clock speed: 5-10 MHz
+- Target clock speed: 10 MHz (100 ns/cycle)
 
 ## Architecture Highlights
 
@@ -97,8 +99,8 @@ POP D, XY3          ; Pop all data registers
 
 | Category | Instructions |
 |----------|--------------|
-| Load | LOADI, LOADD, LOADX, LOADY, LOADB, LOADXY, LOADP, LOADPB |
-| Store | STORED, STOREX, STOREY, STOREB, STOREXY, STOREP, STOREPB |
+| Load | LOADI, LOADD, LOADX, LOADY, LOADB, LOADXY, LOADP, LOADPB, LOADZ, LOADZB |
+| Store | STORED, STOREX, STOREY, STOREB, STOREI, STOREXY, STOREP, STOREPB, STOREZ, STOREZB |
 | Move | MOVE, SWAP |
 | Arithmetic | ADD, ADC, SUB, SBC, NEG, INC, DEC |
 | Logical | AND, OR, XOR, NOT |
@@ -106,9 +108,9 @@ POP D, XY3          ; Pop all data registers
 | Address | LEA (24-bit effective address calculation) |
 | Compare | CMP |
 | Conditional Set | SEQ, SNE, SCS/SHS, SCC/SLO, SLT, SGT, SGE, SLE (branchless conditionals) |
-| Branch | BEQ, BNE, BCS/BHS, BCC/BLO, BLT, BGT, BGE, BLE, BRA |
+| Branch | BEQ, BNE, BCS/BHS, BCC/BLO, BLT, BGT, BGE, BLE, BHI, BLS, BRA |
 | Jump | JMP, JMP24, JMP16, JMPT, JMPXY |
-| Subroutine | CALL, CALL24, CALL16, CALLR, CALLXY, RET |
+| Subroutine | CALL, CALL24, CALL16, CALLR, CALLXY, RET, RETCC, RETCS |
 | Syscall | TRAP (software interrupt via vector table) |
 | Stack | PUSH, POP (supports D, X, Y, XY, D group, immediate) |
 | Control | NOP, HALT, DINT, EINT, RTI |
@@ -141,20 +143,28 @@ POP D, XY3          ; Pop all data registers
 ## Design Philosophy
 
 The K16 prioritizes:
-1. **Minimal chip count** (~60 TTL + 6 ROMs) without sacrificing capability
+1. **Minimal chip count** (~80 chips, excluding external RAM/ROM) without sacrificing capability
 2. **Flexibility** via ROM-based microcode—personality changes without rewiring
 3. **Modern amenities** like 24-bit addressing and priority interrupts
 4. **Practical performance** targeting the 68000 class
 
 ## Software Stack
 
-### K16 Pascal Compiler
+### k/OS
 
-A Pascal compiler targeting the K16, ported from PASTA/80. Implements the V2 ABI calling convention (arguments in D0/D1/D2, result in D0, XY2 as frame pointer). Fully tested against a 211-test suite.
+A preemptive multitasking operating system built from the ground up for the K16, now booting and running on both targets. Core features:
+
+- **Preemptive scheduler** driven by the timer IRQ, with monotonically-incrementing task IDs (Unix PID semantics — never reused)
+- **Per-task memory pages** (user pages `$02–$1F`) with a 2KB stack per task
+- **FAT16 filesystem** with multi-volume support, file descriptors, and `.com` program loading
+- **TRAP-based syscalls**: leaf calls return carry-on-error (`C=0` ok / `C=1` error); non-leaf calls schedule and exit via `RTI`
+- **8-level priority interrupts** (74LS148) with nested-interrupt support
+
+**kosh** — the k/OS shell — is fully re-entrant (all command scratch lives in the task page, not page `$00`) and boots to an interactive prompt with a full set of disk and filesystem commands (`dir`, `ps`, `vol`, drive selection, etc.). Forth and BASIC both register as loadable `.com` shells.
 
 ### K16 Forth
 
-A complete Forth implementation running natively on the K16:
+A complete Forth implementation (v3.0), now running as a k/OS `.com` program:
 - Indirect Threaded Code (ITC) interpreter
 - 17-cycle inner interpreter with sentinel-based execution
 - 102+ built-in words
@@ -169,23 +179,24 @@ A complete Forth implementation running natively on the K16:
 
 ### K16 BASIC
 
-K16 BASIC v2.1t — a BASIC interpreter running natively on the K16.
+A BASIC interpreter (v2.5), now running as a k/OS `.com` program — SAVE/LOAD/DIR/DRIVE, per-task current drive, registers as a shell via TRAP_REGISTER_SHELL.
 
-### k/OS
+### K16 Pascal Compiler
 
-A preemptive multitasking operating system in design, drawing direct heritage from the Applix 1616/OS. Planned features include FAT16 filesystem, syscall via TRAP, 8-level priority interrupts, and 2KB stack per task.
+A Pascal compiler targeting the K16, ported from PASTA/80. Implements the V2 ABI calling convention (arguments in D0/D1/D2, result in D0, XY2 as frame pointer). Fully tested against a 291-test suite, with all optimisation phases through Phase 9 complete.
 
 ## Current Status
 
 - ISA complete and verified — all opcodes implemented including NEG, TRAP, CALLXY, RET
 - Hardware design validated in Digital simulator
 - Microcode generator and assembler implemented in Pascal/Delphi
-- K16Pascal compiler complete — 211/211 tests passing, V2 ABI + Phase 9 optimisations
-- K/OS Forth interpreter complete with 102+ words
-- K16 BASIC v2.1t complete
+- K16Pascal compiler complete — 291/291 tests passing, V2 ABI + Phase 9 optimisations
+- K16 Forth interpreter complete (v3.0, 102+ words, k/OS `.com`)
+- K16 BASIC complete — v2.5 (k/OS `.com`)
+- k/OS operating system running — preemptive multitasking, FAT16, TRAP syscalls, re-entrant shell (kosh)
+- K16 emulator complete — Pascal/Lazarus IDE with VT100 terminal
+- Reference Manual at v3.16
 - FPGA implementation in progress — Sipeed Tang Console 138K (Gowin GW5AST-138B) acquired
-- k/OS operating system in design
-- K16 emulator (CLI + IDE) in design
 
 ## License
 
