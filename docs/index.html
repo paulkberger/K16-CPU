@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>K16 web emulator</title>
+<link rel="icon" href="icons/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="manifest" href="icons/site.webmanifest">
+<meta name="theme-color" content="#16a34a">
 <style>
   /* K16 web emulator — front-end shell (UI only; core is stubbed).
      Native framebuffer 1280x720, displayed 2x if it fits else 1x (floor). */
@@ -1093,7 +1099,7 @@ function parseDocLink(href){
   h=h.replace(/^https?:\/\/raw\.githubusercontent\.com\/paulkberger\/K16-CPU\/[^/]+\//i,"");
   if(/^https?:\/\//i.test(h)) return null;        // some other absolute URL
   h=h.replace(/^\.?\//,"");                        // drop leading ./ or /
-  if(!/\.md$/i.test(h) || h.indexOf("/")>=0) return null;  // top-level .md only
+  if(!/\.md$/i.test(h) || /(^|\/)\.\.(?=\/|$)/.test(h)) return null;  // repo .md, subdirs ok, block ..
   return { doc:h, anchor:anchor };
 }
 
