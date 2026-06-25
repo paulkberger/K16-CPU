@@ -16,13 +16,13 @@ This page is the home for the K16 manuals. Select a document to read it here in 
 
 ## Operating system
 
-- [k/OS Reference Manual](kOS_Reference_Manual_v0_23.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
-- [k/OS Filesystem Reference](kOS_FS_Reference_v1_18.md) — the VFAT/LFN filesystem, directory layout, and disk on-media format.
+- [k/OS Reference Manual](K16%20OS/docs/kOS_Reference_Manual_v0_22.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
+- [k/OS Filesystem Reference](K16%20OS/kfs/kOS_FS_Reference_v1_14.md) — the VFAT/LFN filesystem, directory layout, and disk on-media format.
 
 ## Libraries and graphics
 
-- [KLIB Reference](kOS_KLIB_Reference_v1_6.md) — the shared library jump table and its routines.
-- [KGFX Reference](KGFX_Reference.md) — the graphics library: regions, fonts, drawing, and scrolling.
+- [KLIB Reference](K16%20OS/klib/kOS_KLIB_Reference_v1_6.md) — the shared library jump table and its routines.
+- [KGFX Reference](KGFX_Reference.md) — **not uploaded yet** the graphics library: regions, fonts, drawing, and scrolling.
 
 ## Languages
 
