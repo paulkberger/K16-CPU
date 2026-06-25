@@ -26,8 +26,8 @@ This page is the home for the K16 manuals. Select a document to read it here in 
 
 ## Languages
 
-- [K16 Forth](K16_Forth_v2_24.md) — the Forth environment and word set.
-- [K16 BASIC](K16_BASIC_v2_4.md) — the BASIC interpreter and commands.
+- [K16 Forth](K16 Forth/K16_Forth_v3_0_Reference_Manual.md) — the Forth environment and word set.
+- [K16 BASIC](K16 Basic/K16_BASIC_v2_3_Commands.md) — the BASIC interpreter and commands.
 
 ---
 
