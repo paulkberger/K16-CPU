@@ -22,7 +22,7 @@ This page is the home for the K16 manuals. Select a document to read it here in 
 ## Libraries and graphics
 
 - [KLIB Reference](K16%20OS/klib/kOS_KLIB_Reference_v1_6.md) — the shared library jump table and its routines.
-- [KGFX Reference](KGFX_Reference.md) — **not uploaded yet** the graphics library: regions, fonts, drawing, and scrolling.
+- [KGFX Reference](KGFX_Reference.md) — the graphics library: regions, fonts, drawing, and scrolling. **(not uploaded yet)** 
 
 ## Languages
 
