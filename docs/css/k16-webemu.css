@@ -40,6 +40,7 @@
 
   .bar{ display:flex; align-items:center; gap:10px; padding:11px 14px;
         border-bottom:0.5px solid var(--hair); flex-wrap:wrap; }
+  .barbreak{ display:none; }
   .logo{ font-family:var(--mono); font-weight:600; letter-spacing:1px; font-size:16px; }
   .logo b{ color:var(--head,var(--accent)); }
   .logo .lc{ margin-left:0.28em; letter-spacing:0; font-weight:500; }
@@ -404,3 +405,25 @@
   .gh{ margin-left:auto; display:inline-flex; align-items:center; gap:5px; color:var(--muted); text-decoration:none; }
   .gh:hover{ color:var(--ink); }
   .gh svg{ width:14px; height:14px; }
+
+  /* ---- Mobile "boot and visible" slice -------------------------------------
+     Placed last so these overrides win over the base layout rules on equal
+     specificity. Keeps the machine inside the viewport, stacks the inspector
+     full-width, and stops wide monospace panels (disasm/memory) from expanding
+     the grid track on narrow phones (the min-content blow-out). */
+  @media (max-width:820px){
+    body{ padding:0; }
+    .machine{ width:100%; max-width:100%; border:none; border-radius:0; }
+    .term{ padding:14px 6px; }
+    .bar .barbreak{ display:block; flex-basis:100%; height:0; }
+    .main, .main.stack, .screenwrap, .insp{ min-width:0; }
+    .main.stack .insp{ grid-template-columns:1fr; }
+    .main.stack .insp .card{ min-width:0; }
+    .mlist, .memdump{ overflow-x:auto; }
+    /* refbar can't fit one row on a phone: wrap, and let the find field flex */
+    .refbar{ height:auto; flex-wrap:wrap; row-gap:8px; padding:8px 12px; }
+    .refbar .refbar-r{ margin-left:0; flex:1 1 100%; }
+    .refbar .reffind, .refbar .reffind-box{ flex:1; min-width:0; }
+    .refbar .reffind input{ width:100%; }
+    .refbar #ref-gh{ display:none; }   /* redundant with the footer GitHub link; give find the room */
+  }
