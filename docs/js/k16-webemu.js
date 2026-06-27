@@ -22,9 +22,10 @@ function sizeGfx(){
   if(mode===0||mode>3){ gfxRes="\u2014"; gfxScale=1; return; }
   const sw = mode===1?1280:640, sh = mode===1?720:480;
   const ww=wrap.clientWidth||sw, wh=wrap.clientHeight||sh;
-  const k=Math.max(1, Math.floor(Math.min(ww/sw, wh/sh)));
+  const fit=Math.min(ww/sw, wh/sh);
+  const k = fit>=1 ? Math.floor(fit) : fit;   // integer upscale (desktop) / fractional fit (mobile)
   c.style.width=(sw*k)+"px"; c.style.height=(sh*k)+"px";
-  gfxRes=sw+"\u00d7"+sh; gfxScale=k;
+  gfxRes=sw+"\u00d7"+sh; gfxScale = k>=1 ? k : Math.round(k*100)/100;
 }
 let lastSpeedT=0, frames=0, frameCount=0, memBase=Core.BASE, log=[];
 let lastSpeedCyc=0, fastBudget=500000;   // adaptive fast-mode budget (cycles/frame), auto-tuned
@@ -34,10 +35,52 @@ const NW=1280, NH=720;
 Core.reset();
 
 /* size 1280x720: 2x if it fits, else 1x floor (never smaller). */
+// Advance width of the terminal mono font as a fraction of font-size, measured
+// once. Used to size the mobile terminal so all 80 columns fit the viewport.
+let _chRatio=0;
+function charRatio(){
+  if(_chRatio) return _chRatio;
+  const p=document.createElement("span");
+  p.style.cssText="position:absolute;visibility:hidden;white-space:pre;font-family:var(--mono);font-size:100px;";
+  p.textContent="0000000000";
+  document.body.appendChild(p);
+  _chRatio=(p.getBoundingClientRect().width/10)/100 || 0.6;
+  p.remove();
+  return _chRatio;
+}
+
 function layoutScreen(){
   const main=$("main"), sw=$("screenwrap");
-  const sideBySide = window.innerWidth >= 1740;
+  const insp=document.querySelector(".insp");
+  const MOBILE = window.innerWidth <= 820;
+  const sideBySide = !MOBILE && window.innerWidth >= 1740;
   main.classList.toggle("stack", !sideBySide);
+
+  if(MOBILE){
+    // "Boot and visible" slice: fill the grid cell exactly (border-box, no overflow),
+    // size the terminal font so every column fits the width (option B), and fill the
+    // height down to the bottom of the viewport for one clean screenful.
+    sw.style.width = "100%";
+    const availW = sw.clientWidth || (window.innerWidth - 45);
+    const cols = (vt?vt.cols:80);
+    let tfs = (availW - 12) / (cols * charRatio());             // fill width (minus 6px L/R padding)
+    tfs = Math.max(6, Math.min(14, Math.round(tfs*100)/100));   // fractional ok; integer lineH avoids drift
+    const lineH = Math.round(tfs*LH);
+    const onRef = $("tab-ref").getAttribute("aria-selected")==="true";
+    if(onRef){
+      const top = sw.getBoundingClientRect().top;               // docs want a full-viewport reader
+      sw.style.height = Math.max(320, Math.min(window.innerHeight-12,
+                          Math.round(window.innerHeight - Math.max(0,top) - 12)))+"px";
+    } else {
+      sw.style.height = (lineH*40 + 28)+"px";                   // cap ~40 rows; inspector follows below
+    }
+    $("term").style.fontSize = tfs+"px";
+    if(insp) insp.style.height = "";
+    scaleLabel = "fit";
+    alignLegend();
+    return;
+  }
+
   const inspReserve = sideBySide ? 396 : 0;
   const availW = window.innerWidth - 32 - 28 - inspReserve;
   let scale = (availW >= NW*2 && window.innerHeight >= NH*2 + 240) ? 2 : 1;
@@ -46,7 +89,7 @@ function layoutScreen(){
   if(sideBySide){ h = Math.max(minH, window.innerHeight - 176); }  // grow to window height
   sw.style.width = w+"px"; sw.style.height = h+"px";
   $("term").style.fontSize = (14*scale)+"px";        // constant font; more height = more rows
-  const insp=document.querySelector(".insp"); if(insp) insp.style.height = sideBySide ? h+"px" : "";
+  if(insp) insp.style.height = sideBySide ? h+"px" : "";
   scaleLabel = scale>=2 ? "2x" : "1x";
   alignLegend();
 }
@@ -243,7 +286,7 @@ function renderStatus(){
   const onRef=$("tab-ref").getAttribute("aria-selected")==="true";
   const kbw=$("s-gfxkbwrap"); if(kbw) kbw.hidden=onRef;
   $("s-gfx").textContent = onRef ? ""
-    : onGfx ? (lastVidMode===0 ? "no gfx" : gfxRes+" x"+gfxScale)
+    : onGfx ? (lastVidMode===0 ? "no gfx" : gfxRes+(gfxScale>=1 ? " x"+gfxScale : ""))
     : ((vt?vt.cols:80)+"\u00d7"+(vt?vt.rows:25));
   $("s-run").textContent=running?"running":"stopped"; $("s-run").classList.toggle("on",running); }
 function tickSpeed(ts){ frames++;
@@ -387,6 +430,7 @@ function selectTab(which){ gfxActive=(which==="gfx");
   $("term").style.display    = which==="term" ? "block":"none";
   $("gfxwrap").style.display = which==="gfx"  ? "flex":"none";
   $("refwrap").style.display = which==="ref"  ? "flex":"none";
+  if(window.innerWidth<=820) layoutScreen();          // tab-aware screen height on mobile
   if(which==="ref" && !refLoaded) loadDoc(HOME_DOC);
   if(which==="gfx"){ sizeGfx(); const g=$("gfx"); if(g) setTimeout(()=>g.focus(),0); }
   if(which==="term"){ const t=$("term"); if(t){ renderTerm(true); t.scrollTop=t.scrollHeight; setTimeout(()=>t.focus(),0); } }
