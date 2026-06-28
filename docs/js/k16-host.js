@@ -639,6 +639,16 @@
       const hexUrl     = opts.hexUrl     || SYS_HEX;
       const romdiskUrl = opts.romdiskUrl || SYS_ROMDISK;
 
+      // 0. Cold boot: wipe RAM before staging ROM. loadHex/loadRomDisk only
+      //    write their own byte ranges, and core.reset() clears CPU regs only,
+      //    so without this the 16 MB image survives across a Boot — page-$00
+      //    kernel globals, the TCB pool, user pages and the RAM disk all carry
+      //    over. That warm-boot state surfaces stale-global bugs (e.g. a leftover
+      //    FOREGROUND_TCB hanging shell bring-up). Zeroing here makes "cold boot"
+      //    honest and the dev loop deterministic; b-reset stays a warm reset
+      //    (RAM preserved) for testing reset-line robustness.
+      this._m.mem.fill(0);
+
       // 1. ROM disk (A:) — staged before the kernel, matching frm_main.
       try {
         const rd = new Uint8Array(await (await fetch(romdiskUrl)).arrayBuffer());
