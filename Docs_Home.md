@@ -16,7 +16,7 @@ This page is the home for the K16 manuals. Select a document to read it here in 
 
 ## Operating system
 
-- [k/OS Reference Manual](K16%20OS/Docs/kOS_Reference_Manual_v0_22.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
+- [k/OS Reference Manual](K16%20OS/Docs/kOS_Reference_Manual_v0_24.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
 - [k/OS Filesystem Reference](K16%20OS/kfs/kOS_FS_Reference_v1_14.md) — the VFAT/LFN filesystem, directory layout, and disk on-media format.
 
 ## Libraries and graphics
