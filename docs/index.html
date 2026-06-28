@@ -69,6 +69,16 @@
     <div class="setrow">
       <label class="chk"><input type="checkbox" id="set-disklog"> Log disk activity</label>
     </div>
+    <div class="setsep"></div>
+    <div class="setrow">
+      <label>Graphics</label>
+      <select id="set-gfxscale">
+        <option value="integer">Integer (sharp)</option>
+        <option value="device">Integer (device-pixel sharp)</option>
+        <option value="fractional">Fractional (fill pane)</option>
+      </select>
+    </div>
+    <p class="refnote" style="margin-top:2px">integer: whole CSS multiples, even only at 100%/200%. integer device-pixel: whole device-pixel multiples, even at any zoom (smaller picture when zoomed in). fractional: fills the pane, soft.</p>
   </div>
 
   <div class="popover drives" id="drives-pop" hidden>
