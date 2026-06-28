@@ -44,7 +44,11 @@
   // Host management commands (port of emu_disk HOST_CMD_*).
   const HOST_CMD_MOUNT=0x0001, HOST_CMD_UNMOUNT=0x0002, HOST_CMD_LIST=0x0003,
         HOST_CMD_CREATE=0x0004, HOST_CMD_DELETE=0x0005, HOST_CMD_RENAME=0x0006,
-        HOST_CMD_BAYNAME=0x0007;
+        HOST_CMD_BAYNAME=0x0007,
+        // Part 25 r6 host-file load surface (port of emu_disk). One file open at
+        // a time; `load` reads from the web's uploads/ folder (== FPC LoadFolder).
+        HOST_CMD_FOPEN=0x0008, HOST_CMD_FREAD=0x0009, HOST_CMD_FCLOSE=0x000A;
+  const HOST_FILE_MAX = 0x10000;   // 64 KB cap (one k/OS page) — matches FPC
 
   const RES_OK=0x0000, RES_NO_MEDIA=0x0001, RES_BAD_LBA=0x0002,
         RES_RO=0x0003, RES_IO_ERR=0x0004, RES_BUSY=0x0005, RES_FULL=0x0006,
@@ -137,6 +141,14 @@
       // rename) so the UI can persist to OPFS and re-render. (sector writes
       // fire onBayDirty.)
       this.onDiskChange = null;
+
+      // Host-file load surface (port of emu_disk LoadFolder). The UI mirrors the
+      // Files-tab uploads/ folder in here via loadFilesSet(); `load` reads them
+      // through HOST_CMD_FOPEN/FREAD/FCLOSE. Names kept verbatim (extension and
+      // case preserved); FOPEN matches case-insensitively. Singleton: one file
+      // open at a time, _loadOpen = { name, data, pos } or null.
+      this._loadFiles = [];
+      this._loadOpen  = null;
 
       // Framebuffer palettes + offscreen scratch.
       this._palVga     = buildVgaPalette();
@@ -299,6 +311,9 @@
             case HOST_CMD_DELETE:  this._doHostDelete();  break;
             case HOST_CMD_RENAME:  this._doHostRename();  break;
             case HOST_CMD_BAYNAME: this._doHostBayName(); break;
+            case HOST_CMD_FOPEN:   this._doHostFOpen();   break;
+            case HOST_CMD_FREAD:   this._doHostFRead();   break;
+            case HOST_CMD_FCLOSE:  this._doHostFClose();  break;
             default:               this._dsk.result = RES_BAD_CMD; break;
           }
           break;
@@ -425,6 +440,56 @@
       return this._catalogue.map(e => ({ name: e.name, data: e.data, ro: e.ro }));
     }
 
+    // ---- Host-file load surface (port of emu_disk HostFOpen/FRead/FClose) ---
+    // Public: UI mirrors the uploads/ folder in here. `data` is a Uint8Array.
+    // Names kept verbatim. Replacing the set does NOT disturb an open file
+    // (kosh always FCLOSEs); a stale handle simply keeps serving its snapshot.
+    loadFilesSet(list) {
+      this._loadFiles = (list || [])
+        .filter(e => e && e.name && e.data)
+        .map(e => ({ name: String(e.name), data: e.data }));
+    }
+    loadFiles() {
+      return this._loadFiles.map(e => ({ name: e.name, size: e.data.length }));
+    }
+
+    // FOPEN: case-insensitive basename lookup in the load set. Returns a result
+    // code; on RES_OK, size = file length (<= 64 KB). Mirrors FPC HostFOpen:
+    // RES_BUSY (already open) / RES_BAD_NAME (empty / >15 / path chars) /
+    // RES_NOT_FOUND / RES_FULL (>64 KB).
+    hostFOpen(name) {
+      if (this._loadOpen) return { res: RES_BUSY, size: 0 };
+      name = (name || '').trim();
+      if (name === '' || name.length > MAX_NAME_LEN) return { res: RES_BAD_NAME, size: 0 };
+      if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 ||
+          name.indexOf(':') >= 0 || name.indexOf('..') >= 0)
+        return { res: RES_BAD_NAME, size: 0 };
+      const key = name.toUpperCase();
+      const e = this._loadFiles.find(f => f.name.toUpperCase() === key);
+      if (!e) return { res: RES_NOT_FOUND, size: 0 };
+      if (e.data.length > HOST_FILE_MAX) return { res: RES_FULL, size: 0 };
+      this._loadOpen = { name: e.name, data: e.data, pos: 0 };
+      this._log('[disk] FOPEN ' + e.name + ' (' + e.data.length + ' bytes)');
+      return { res: RES_OK, size: e.data.length };
+    }
+    // FREAD: copy up to maxBytes from the open cursor into K16 RAM at dest.
+    // Returns { res, got }; got = 0 means EOF. RES_NO_MEDIA if nothing open.
+    hostFRead(dest, maxBytes) {
+      if (!this._loadOpen) return { res: RES_NO_MEDIA, got: 0 };
+      if (maxBytes <= 0) return { res: RES_OK, got: 0 };       // valid no-op
+      const o = this._loadOpen, M = this._m.mem;
+      const got = Math.min(maxBytes, o.data.length - o.pos);
+      for (let i = 0; i < got; i++) M[(dest + i) & ADDR_MASK] = o.data[o.pos + i];
+      o.pos += got;
+      return { res: RES_OK, got };
+    }
+    hostFClose() {
+      if (!this._loadOpen) return RES_NO_MEDIA;
+      this._log('[disk] FCLOSE ' + this._loadOpen.name);
+      this._loadOpen = null;
+      return RES_OK;
+    }
+
     hostMount(name, bay) {
       name = this._normaliseName(name);
       if (bay < 0 || bay >= MAX_DRIVES) return RES_NO_MEDIA;
@@ -495,6 +560,23 @@
       this._writeStr(buf, this._bays[d.drive].name);
       d.result = RES_OK;
     }
+
+    // FOPEN: filename in BUF (verbatim, extension kept — no _normaliseName).
+    // On RES_OK, SECCOUNT = file size in bytes.
+    _doHostFOpen() {
+      const d = this._dsk;
+      const r = this.hostFOpen(this._readStr(this._curBufAddr(), MAX_NAME_LEN));
+      d.result = r.res;
+      if (r.res === RES_OK) d.seccount = r.size & 0xFFFF;
+    }
+    // FREAD: up to SECCOUNT bytes -> BUF; SECCOUNT updated to bytes read (0=EOF).
+    _doHostFRead() {
+      const d = this._dsk;
+      const r = this.hostFRead(this._curBufAddr(), d.seccount);
+      d.result = r.res;
+      d.seccount = r.got & 0xFFFF;
+    }
+    _doHostFClose() { this._dsk.result = this.hostFClose(); }
 
     // LIST: name\0bay\0name\0bay\0...\0\0 into BUF; bay byte = 0..3 or $FF;
     // names sorted case-insensitively. Capped at LIST_BUF_BYTES.
@@ -695,8 +777,29 @@
     // Renders the current video mode into an offscreen canvas at native source
     // resolution, then blits (nearest-neighbour) to the visible canvas.
     drawGfx(ctx, _t) {
+      const canvas = ctx.canvas;
       const mode = this._m.videoMode & 0xFFFF;
-      const W = ctx.canvas.width, H = ctx.canvas.height;
+
+      // Device-pixel backing: size the drawing buffer to the element's on-screen
+      // device pixels (CSS size x dpr) so the browser blits backing->screen 1:1
+      // and WE own the nearest-neighbour upscale from native res. Keeps 1bpp art
+      // pixel-perfect at integer dpr (and as even as the panel allows at
+      // fractional dpr) with no browser-side filtering on top. Guarded because
+      // assigning width/height clears the canvas — only touch it on a change.
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;            // not laid out / hidden
+      const dpr  = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+      // Backing = CSS size x dpr, read from the FRACTIONAL bounding rect (not the
+      // integer clientWidth) so device-scale mode lands on an exact whole-number
+      // multiple of native at any dpr. Clamped: guards against any state where the
+      // measured width tracks the backing (a x dpr feedback loop to the 16M cap).
+      const CAP = 8192;
+      const devW = Math.min(CAP, Math.max(1, Math.round(rect.width  * dpr)));
+      const devH = Math.min(CAP, Math.max(1, Math.round(rect.height * dpr)));
+      if (canvas.width  !== devW) canvas.width  = devW;
+      if (canvas.height !== devH) canvas.height = devH;
+      const W = canvas.width, H = canvas.height;
+
       if (mode === 0 || mode > 3) {
         ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
         return;
@@ -732,12 +835,11 @@
       }
 
       octx.putImageData(img, 0, 0);
-      // Match the visible canvas to the mode's native resolution so dots stay
-      // square; the UI scales the element by an integer factor via CSS. (Old
-      // emu switched canvas res per mode — same idea.)
-      if (ctx.canvas.width !== sw || ctx.canvas.height !== sh) { ctx.canvas.width = sw; ctx.canvas.height = sh; }
+      // Native -> device backing, nearest-neighbour (smoothing off). Aspect is
+      // preserved: the CSS size sizeGfx set is sw*k by sh*k, so devW/devH carry
+      // the same ratio as sw/sh and the blit never stretches.
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off, 0, 0);
+      ctx.drawImage(off, 0, 0, sw, sh, 0, 0, W, H);
     }
 
     _ensureOff(w, h) {

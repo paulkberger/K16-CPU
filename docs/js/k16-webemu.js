@@ -19,18 +19,46 @@ let gfxRes="\u2014", gfxScale=1;   // graphics resolution + integer display scal
 function sizeGfx(){
   const c=$("gfx"), wrap=$("gfxwrap"); if(!c||!wrap) return;
   const mode=(typeof Core!=="undefined"&&Core)?Core.videoMode:0;
-  if(mode===0||mode>3){ gfxRes="\u2014"; gfxScale=1; return; }
-  const sw = mode===1?1280:640, sh = mode===1?720:480;
+  const active = !(mode===0||mode>3);
+  // mode 0 / invalid has no live framebuffer, but the canvas STILL needs a pinned
+  // CSS size: with none, its display size tracks its own backing store and
+  // drawGfx's device resize feeds back into a runaway (white screen, 16M cap).
+  // Size it as a 1280x720 reference so it stays a stable black panel.
+  const sw = (active && mode!==1)?640:1280, sh = (active && mode!==1)?480:720;
   const ww=wrap.clientWidth||sw, wh=wrap.clientHeight||sh;
-  const fit=Math.min(ww/sw, wh/sh);
-  const k = fit>=1 ? Math.floor(fit) : fit;   // integer upscale (desktop) / fractional fit (mobile)
-  c.style.width=(sw*k)+"px"; c.style.height=(sh*k)+"px";
-  gfxRes=sw+"\u00d7"+sh; gfxScale = k>=1 ? k : Math.round(k*100)/100;
+  const dpr=window.devicePixelRatio||1;
+  const SNAP=2;
+  let cssW, cssH;
+  if(gfxScaleMode==="fractional"){
+    // Fill the pane: binding axis exact, other letterboxed. No wasted space, but
+    // pixels are not square at fractional scales.
+    const fit=Math.min(ww/sw, wh/sh); cssW=sw*fit; cssH=sh*fit;
+  } else if(gfxScaleMode==="device"){
+    // Largest integer DEVICE-pixel multiple, then back-compute CSS = backing/dpr
+    // so the element's device box equals the backing 1:1. The native->backing
+    // upscale is then a whole number -> perfectly even pixels at ANY dpr (the
+    // trade is a smaller picture when dpr is high). Falls back to fractional fill
+    // if the pane can't hold even 1x of device pixels.
+    const kd=Math.min(Math.floor((ww*dpr+SNAP)/sw), Math.floor((wh*dpr+SNAP)/sh));
+    if(kd<1){ const fit=Math.min(ww/sw, wh/sh); cssW=sw*fit; cssH=sh*fit; }
+    else    { cssW=(sw*kd)/dpr; cssH=(sh*kd)/dpr; }
+  } else {
+    // "integer" (default): largest integer CSS multiple within SNAP px on BOTH
+    // axes. Sharp square pixels; perfectly even only at integer dpr. SNAP rescues
+    // the ~1px the .screenwrap borders steal (native 1280 stays 1x, not 0.999x)
+    // and snaps 1.998 up to 2x; pixel-based so a genuinely short axis never lifts.
+    let k=Math.min(Math.floor((ww+SNAP)/sw), Math.floor((wh+SNAP)/sh));
+    if(k<1){ const fit=Math.min(ww/sw, wh/sh); k=fit; }
+    cssW=sw*k; cssH=sh*k;
+  }
+  c.style.width=cssW+"px"; c.style.height=cssH+"px";
+  gfxRes = active ? (sw+"\u00d7"+sh) : "\u2014";
+  gfxScale = Math.round((cssW/sw)*100)/100;          // actual displayed CSS scale
 }
 let lastSpeedT=0, frames=0, frameCount=0, memBase=Core.BASE, log=[];
 let lastSpeedCyc=0, fastBudget=500000;   // adaptive fast-mode budget (cycles/frame), auto-tuned
 let lastFrameTs=0;                        // wall-clock pacing for target-MHz mode
-let mhz=10, disUpdate=true, diskLog=false;
+let mhz=10, disUpdate=true, diskLog=false, gfxScaleMode="integer";   // integer | fractional | device
 const NW=1280, NH=720;
 Core.reset();
 
@@ -87,9 +115,15 @@ function layoutScreen(){
   const w = NW*scale, minH = NH*scale;               // width floored at native 1280
   let h = minH;
   if(sideBySide){ h = Math.max(minH, window.innerHeight - 176); }  // grow to window height
-  sw.style.width = w+"px"; sw.style.height = h+"px";
+  // .screenwrap is box-sizing:border-box with a 0.5px border, so style.width=w
+  // would give a (w - border) content area — the gfxwrap (width:100%) then lands
+  // ~1px under native and the canvas can't sit 1:1. Add the border back, read
+  // from the DOM so CSS stays the single source of truth (no hardcoded 1px).
+  const bw = Math.max(0, sw.offsetWidth  - sw.clientWidth);   // L+R border px
+  const bh = Math.max(0, sw.offsetHeight - sw.clientHeight);  // T+B border px
+  sw.style.width = (w+bw)+"px"; sw.style.height = (h+bh)+"px";
   $("term").style.fontSize = (14*scale)+"px";        // constant font; more height = more rows
-  if(insp) insp.style.height = sideBySide ? h+"px" : "";
+  if(insp) insp.style.height = sideBySide ? (h+bh)+"px" : "";   // match screenwrap outer height
   scaleLabel = scale>=2 ? "2x" : "1x";
   alignLegend();
 }
@@ -532,6 +566,40 @@ $("tab-ref").onclick=()=>selectTab("ref");
     const onGfx=$("tab-gfx").getAttribute("aria-selected")==="true";
     const el=$(onGfx?"gfx":"term"); if(el) el.focus();
   });
+  // Debug aid: refresh the focus hint with the canvas's live on-screen size,
+  // but only as the pointer arrives (the tip is a hover-only ::after — no point
+  // rewriting it every frame). gfxwrap is display:none off-tab, so clientW/H
+  // are only meaningful on the Gfx tab.
+  const kbw=$("s-gfxkbwrap");
+  if(kbw) kbw.addEventListener("pointerenter",()=>{
+    const FOCUS="Focus keyboard input";
+    const FOOT="\n"+"\u2500".repeat(22)+"\n"+FOCUS;     // divider + label under the debug lines
+    const onGfx=$("tab-gfx").getAttribute("aria-selected")==="true";
+    if(!onGfx){ kbw.setAttribute("data-tip",FOCUS); return; }
+    const g=$("gfx"), w=$("gfxwrap");
+    const gr=g?g.getBoundingClientRect():null, wr=w?w.getBoundingClientRect():null;
+    const cw=gr?Math.round(gr.width*100)/100:0, ch=gr?Math.round(gr.height*100)/100:0;
+    const mode=(typeof Core!=="undefined"&&Core)?Core.videoMode:0;
+    // No active gfx mode: sizeGfx left the canvas at its intrinsic buffer size,
+    // so a fit calc would be meaningless. Say so rather than invent ratios.
+    if(mode===0||mode>3){
+      kbw.setAttribute("data-tip","canvas "+cw+"\u00d7"+ch+" \u00b7 no active gfx mode (vid="+mode+")"+FOOT);
+      return;
+    }
+    // Show the ACTUAL displayed scale (measured), plus the device-pixel scale,
+    // plus the active mode — accurate for all three scale modes.
+    const sw=mode===1?1280:640, sh=mode===1?720:480;
+    const ww=wr?wr.width:0, wh=wr?wr.height:0;
+    const fx=sw?ww/sw:0, fy=sh?wh/sh:0;
+    const r1=v=>Math.round(v*10)/10, r3=v=>Math.round(v*1000)/1000;
+    const dpr=window.devicePixelRatio||1;
+    const cssK=sw?cw/sw:0, devK=sw?(cw*dpr)/sw:0;
+    kbw.setAttribute("data-tip",
+      "canvas "+cw+"\u00d7"+ch+" \u00b7 native "+sw+"\u00d7"+sh+"\n"+
+      "wrap "+r1(ww)+"\u00d7"+r1(wh)+" \u00b7 fit W"+r3(fx)+"/H"+r3(fy)+"\n"+
+      "scale \u00d7"+r3(cssK)+" css / \u00d7"+r3(devK)+" dev \u00b7 "+gfxScaleMode+"\n"+
+      "dpr "+r3(dpr)+" \u2192 dev "+Math.round(cw*dpr)+"\u00d7"+Math.round(ch*dpr)+FOOT);
+  });
 })();
 
 /* ---- Reference tab: Docs_Home hub + in-panel .md navigation ---- */
@@ -759,6 +827,7 @@ $("spd-val").addEventListener("change",e=>{ mhz=Math.max(1,Math.min(50,parseInt(
 
 $("set-disupd").onchange=e=>{ disUpdate=e.target.checked; Core.setTrace(disUpdate); if(disUpdate) renderDisasm(); saveIni(); };
 $("set-disklog").onchange=e=>{ diskLog=e.target.checked; logPush("disk logging "+(diskLog?"on":"off")); saveIni(); };
+$("set-gfxscale").onchange=e=>{ gfxScaleMode=e.target.value; sizeGfx(); renderStatus(); saveIni(); };
 
 $("b-gear").onclick=(e)=>{ e.stopPropagation(); closeDrives(); closeFiles(); const p=$("settings-pop");
   p.hidden=!p.hidden; $("b-gear").classList.toggle("active",!p.hidden); };
@@ -798,11 +867,16 @@ function renderFiles(){
       '<span class="fx-size">'+fmtBytes(fl.size)+'</span></div>').join("");
     list.querySelectorAll(".fx-row").forEach(r=>{
       r.onclick=()=>{ selFile=r.dataset.name; renderFiles(); };
-      r.ondblclick=()=>{ logPush("LOAD "+r.dataset.name+"   (LOAD wires to the core)"); };
+      r.ondblclick=()=>{ selectTab("term"); queuePaste("load "+r.dataset.name+"\n"); };
     });
   }
   const rm=$("fx-remove"); if(rm) rm.disabled=!(selFile && uploads.find(u=>u.name===selFile));
 }
+/* Mirror the uploads/ folder into the host so kosh `load` (HOST_CMD_FOPEN/
+   FREAD/FCLOSE) can read it. Shares the byte arrays; called after every
+   uploads[] mutation. */
+function syncLoadFiles(){ Core.loadFilesSet(uploads.map(u=>({name:u.name,data:u.bytes}))); }
+
 function addUploads(fileList){
   let pending=fileList.length; if(!pending) return;
   Array.from(fileList).forEach(file=>{
@@ -811,12 +885,12 @@ function addUploads(fileList){
       const ex=uploads.find(u=>u.name===file.name);
       if(ex){ ex.size=bytes.length; ex.bytes=bytes; } else uploads.push({name:file.name,size:bytes.length,bytes});
       saveUpload(file.name,bytes); logPush("uploaded "+file.name+" ("+fmtBytes(bytes.length)+")");
-      if(--pending===0) renderFiles(); };
+      if(--pending===0){ syncLoadFiles(); renderFiles(); } };
     r.readAsArrayBuffer(file);
   });
 }
 function removeFile(name){ uploads=uploads.filter(u=>u.name!==name); if(selFile===name) selFile=null;
-  deleteUpload(name); logPush("removed "+name); renderFiles(); }
+  deleteUpload(name); syncLoadFiles(); logPush("removed "+name); renderFiles(); }
 
 async function activeDir(create){
   if(linkedDir) return linkedDir;
@@ -828,7 +902,8 @@ async function saveUpload(name,bytes){ try{ const d=await activeDir(true);
 async function deleteUpload(name){ try{ const d=await activeDir(false); await d.removeEntry(name); }catch(e){} }
 async function loadUploads(){ try{ const d=await activeDir(false); uploads=[];
   for await (const [n,h] of d.entries()){ if(h.kind==="file"){ const fl=await h.getFile();
-    uploads.push({name:n,size:fl.size,bytes:new Uint8Array(await fl.arrayBuffer())}); } } }catch(e){ uploads=[]; } }
+    uploads.push({name:n,size:fl.size,bytes:new Uint8Array(await fl.arrayBuffer())}); } } }catch(e){ uploads=[]; }
+  syncLoadFiles(); }
 
 /* persist the linked directory handle across sessions (IndexedDB) */
 function idbHandle(method,key,val){ return new Promise((res,rej)=>{
@@ -1131,7 +1206,7 @@ document.addEventListener("click",(e)=>{ const p=$("drives-pop");
 /* ---- k16.ini in the OPFS bay (best-effort; no-ops on file://) ---- */
 function serializeIni(){
   let t="[display]\npalette="+$("set-term").value+"\nspeed="+(fast?"fast":"mhz")+
-        "\nmhz="+mhz+"\nupdate_disasm="+(disUpdate?1:0)+"\ndisk_log="+(diskLog?1:0)+"\n\n[bay]\n";
+        "\nmhz="+mhz+"\nupdate_disasm="+(disUpdate?1:0)+"\ndisk_log="+(diskLog?1:0)+"\ngfx_scale="+gfxScaleMode+"\n\n[bay]\n";
   bay.forEach(b=>{ t+=b.name+"="+(b.fmt?1:0)+"\n"; });
   t+="\n[mounts]\n";
   Object.keys(mounted).forEach(L=>{ t+=L+"="+mounted[L]+"\n"; });
@@ -1152,6 +1227,8 @@ function applyIni(txt){ if(!txt) return; let sec="", nm={};
       else if(k==="mhz"){ mhz=parseInt(v)||10; $("spd-val").value=mhz; }
       else if(k==="update_disasm"){ disUpdate=v==="1"; $("set-disupd").checked=disUpdate; Core.setTrace(disUpdate); }
       else if(k==="disk_log"){ diskLog=v==="1"; $("set-disklog").checked=diskLog; }
+      else if(k==="gfx_scale"){ if(v==="fractional"||v==="device"||v==="integer"){ gfxScaleMode=v; $("set-gfxscale").value=v; } }
+      else if(k==="gfx_fractional"){ gfxScaleMode=(v==="1")?"fractional":"integer"; $("set-gfxscale").value=gfxScaleMode; }   // legacy key
     } else if(sec==="bay"){ const p=v.split(","); fmtMap[k]= p.length>1 ? p[1]==="1" : p[0]==="1"; }
     else if(sec==="mounts"){ const L=k.toUpperCase(); if(["C","D","E","F"].includes(L)) nm[L]=v; }
   });
