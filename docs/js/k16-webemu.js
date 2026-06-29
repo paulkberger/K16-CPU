@@ -95,10 +95,13 @@ function layoutScreen(){
     tfs = Math.max(6, Math.min(14, Math.round(tfs*100)/100));   // fractional ok; integer lineH avoids drift
     const lineH = Math.round(tfs*LH);
     const onRef = $("tab-ref").getAttribute("aria-selected")==="true";
+    const onIsa = $("tab-isa").getAttribute("aria-selected")==="true";
     if(onRef){
       const top = sw.getBoundingClientRect().top;               // docs want a full-viewport reader
       sw.style.height = Math.max(320, Math.min(window.innerHeight-12,
                           Math.round(window.innerHeight - Math.max(0,top) - 12)))+"px";
+    } else if(onIsa){
+      sw.style.height = "";                                     // opcode cards flow into the page (no inner scroll)
     } else {
       sw.style.height = (lineH*40 + 28)+"px";                   // cap ~40 rows; inspector follows below
     }
