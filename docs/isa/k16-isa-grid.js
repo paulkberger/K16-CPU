@@ -155,7 +155,7 @@
           cell.className='cell';
           cell.style.setProperty('--fc','var('+FAM[cf].c+')');
           cell.tabIndex=0;cell.setAttribute('role','button');
-          cell.innerHTML='<div class="mn">'+d[0]+'</div><div class="cy">'+d[2]+' cyc</div>';
+          cell.innerHTML='<span class="ml" aria-hidden="true">mode '+m+'</span><div class="mn">'+d[0]+'</div><div class="cy">'+d[2]+' cyc</div>';
           cell.dataset.op=op;cell.dataset.mode=m;cell.dataset.fam=cf;
           cell.dataset.search=(name+' '+d[0]+' '+d[1]+' '+((e[3]||[]).join(' '))).toLowerCase();
           const open=()=>openDetail(op,m,cell);

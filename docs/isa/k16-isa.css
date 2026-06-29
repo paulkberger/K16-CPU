@@ -86,6 +86,7 @@
   padding:5px 9px;cursor:pointer;min-width:118px;vertical-align:top;transition:background .1s}
 .isa .cell .mn{font-size:12.5px;color:var(--fc,var(--ink));letter-spacing:.01em;font-weight:500}
 .isa .cell .cy{font-size:10px;color:var(--faint);margin-top:2px}
+.isa .cell .ml{display:none}
 .isa .cell::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--fc,transparent)}
 .isa .cell:hover{background:var(--bg)}
 .isa .cell:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
@@ -171,10 +172,51 @@
   border-radius:7px;padding:6px 10px}
 .isa .d-pill b{font-family:var(--mono);color:var(--ink);margin-right:6px}
 
-@media (max-width:680px){
-  .isa .cell{min-width:84px;padding:6px 6px}
-  .isa .cell .mn{font-size:11px}
-  .isa thead th.opcol,.isa tbody td.op{width:66px;padding-left:8px}
+@media (max-width:820px){
+  /* Let the panel flow into the page instead of scrolling inside a fixed box.
+     This removes the nested-scroll clip boundary (the momentum-scroll black line). */
+  .isa{height:auto;overflow:visible}
+
+  /* Linearize the opcode matrix into one card per opcode. Reuses the table DOM
+     and every click handler untouched -- just restyled via display:block. */
+  .isa .isa-gridwrap{border:none;border-radius:0;overflow:visible;background:none}
+  .isa .isa-gridwrap table{table-layout:auto;width:100%}
+  .isa .isa-gridwrap thead{display:none}
+  .isa .isa-gridwrap tbody,
+  .isa .isa-gridwrap tr,
+  .isa .isa-gridwrap td{display:block;width:auto}
+
+  /* each opcode row -> a card */
+  .isa .isa-gridwrap tr{
+    border:0.5px solid var(--hair2);border-radius:10px;overflow:hidden;
+    background:var(--surface);margin:0 0 10px;
+  }
+  .isa tr.dim{display:none}                 /* filtered-out opcodes drop out entirely */
+
+  /* opcode cell -> card header, family colour on the left edge */
+  .isa tbody td.op{
+    width:auto;background:var(--bg);padding:9px 12px;
+    border-bottom:0.5px solid var(--hair2);
+    border-left:4px solid var(--fc,var(--hair));
+  }
+  .isa tbody td.op .hx{color:var(--fc,var(--accent-d))}
+  .isa tbody td.op .fam{display:inline;margin-left:8px}
+
+  /* each mode -> a full-width tappable row: [MODE 00]  MNEMONIC ...  n cyc */
+  .isa .cell{
+    display:flex;align-items:baseline;gap:10px;min-width:0;width:auto;
+    border-left:none;border-bottom:0.5px solid var(--hair);
+    padding:9px 12px 9px 14px;
+  }
+  .isa .isa-gridwrap tr .cell:last-child{border-bottom:none}
+  .isa .cell::before{display:none}          /* header border carries the family colour */
+  .isa .cell.empty{display:none}            /* hide unused modes; keeps cards tight */
+  .isa .cell .ml{
+    display:inline-block;flex:0 0 auto;min-width:64px;
+    font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);
+  }
+  .isa .cell .mn{font-size:13px;flex:1 1 auto;min-width:0}
+  .isa .cell .cy{margin-top:0;flex:0 0 auto;white-space:nowrap}
 }
 @media (prefers-reduced-motion:reduce){
   .isa .isa-drawer,.isa .isa-scrim,.isa .isa-chip,.isa .cell{transition:none}
