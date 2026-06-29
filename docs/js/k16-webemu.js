@@ -461,9 +461,11 @@ function selectTab(which){ gfxActive=(which==="gfx");
   $("tab-term").setAttribute("aria-selected",String(which==="term"));
   $("tab-gfx").setAttribute("aria-selected",String(which==="gfx"));
   $("tab-ref").setAttribute("aria-selected",String(which==="ref"));
+  $("tab-isa").setAttribute("aria-selected",String(which==="isa"));
   $("term").style.display    = which==="term" ? "block":"none";
   $("gfxwrap").style.display = which==="gfx"  ? "flex":"none";
   $("refwrap").style.display = which==="ref"  ? "flex":"none";
+  $("isawrap").style.display = which==="isa"  ? "block":"none";
   if(window.innerWidth<=820) layoutScreen();          // tab-aware screen height on mobile
   if(which==="ref" && !refLoaded) loadDoc(HOME_DOC);
   if(which==="gfx"){ sizeGfx(); const g=$("gfx"); if(g) setTimeout(()=>g.focus(),0); }
@@ -544,6 +546,7 @@ function feedKeyToCore(e){
 
 $("tab-gfx").onclick=()=>selectTab("gfx");
 $("tab-ref").onclick=()=>selectTab("ref");
+$("tab-isa").onclick=()=>selectTab("isa");
 
 // ---- Keyboard: route keys to the core while the GRAPHICS canvas is focused ----
 // Mirrors the terminal feed minus all clipboard/selection logic - a graphics app
