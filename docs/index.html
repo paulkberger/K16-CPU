@@ -11,6 +11,7 @@
 <link rel="manifest" href="icons/site.webmanifest">
 <meta name="theme-color" content="#16a34a">
 <link rel="stylesheet" href="css/k16-webemu.css">
+<link rel="stylesheet" href="isa/k16-isa.css">
 </head>
 <body>
 <div class="machine" role="application" aria-label="K16 emulator">
@@ -151,6 +152,8 @@
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4zM4 15l4-4 4 4 3-3 5 5"/><circle cx="9" cy="9" r="1.5"/></svg>Graphics</span>
     <span class="tab" id="tab-ref" role="tab" aria-selected="false">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2zM4 19a2 2 0 012-2h13"/></svg>Reference</span>
+    <span class="tab" id="tab-isa" role="tab" aria-selected="false">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4zM4 9h16M9 9v10"/></svg>Opcodes</span>
   </div>
 
   <div class="main" id="main">
@@ -189,6 +192,7 @@
         <div class="ref-toc" id="ref-toc" hidden></div>
         <button class="ref-top" id="ref-top" data-tip="Back to top" aria-label="Back to top" hidden>&#x2191;</button>
       </div>
+      <div class="isawrap isa" id="isawrap" data-isa style="display:none"></div>
     </div>
 
     <div class="insp">
@@ -270,5 +274,8 @@
 <script src="js/k16-host.js"></script>
 <script src="js/k16-vt100.js"></script>
 <script src="js/k16-webemu.js"></script>
+<script src="isa/k16-isa-data.js"></script>
+<script src="isa/k16-isa-detail.js"></script>
+<script src="isa/k16-isa-grid.js"></script>
 </body>
 </html>
