@@ -1,0 +1,181 @@
+/* k16-isa.css - opcode decode grid, scoped entirely under .isa so it cannot
+   collide with WebEMU's bare table / .tab / .card / input rules.
+
+   Base tokens (--bg, --surface, --hair, --hair2, --ink, --muted, --faint,
+   --accent, --accent-d, --warn, --mono, --sans) are INHERITED from the host's
+   :root (k16-webemu.css, or the standalone shell). This file defines only the
+   grid-specific --f-* family colours, with a dark-mode override that tracks
+   WebEMU's own prefers-color-scheme switch. */
+
+.isa{
+  --f-sys:#5a6472;   --f-incdec:#0e8e9e; --f-lookup:#8146b0; --f-stream:#138a82;
+  --f-addr:#2f6fb0;  --f-cond:#9a6a1a;   --f-move:#4a5fb0;   --f-stack:#4f7a9a;
+  --f-alu:#b8631a;   --f-cmp:#a86a12;    --f-branch:#b03a72; --f-flow:#c0392b;
+  --f-load:#0f8a5e;  --f-store:#6f7a1f;  --f-trap:#6f4fa0;
+
+  display:block; width:100%; height:100%; overflow:auto;
+  background:var(--surface); color:var(--ink); font-family:var(--sans);
+  font-size:14px; padding:0; position:relative;
+  scrollbar-gutter:stable;
+}
+@media (prefers-color-scheme:dark){
+  .isa{
+    --f-sys:#9aa3b1;   --f-incdec:#4ec6d6; --f-lookup:#bd86e0; --f-stream:#46c3b8;
+    --f-addr:#6aa9e0;  --f-cond:#d6a85a;   --f-move:#8a9be8;   --f-stack:#86b0d4;
+    --f-alu:#e8954a;   --f-cmp:#d4a45c;    --f-branch:#e07ba6; --f-flow:#e8736a;
+    --f-load:#46c389;  --f-store:#b8c46a;  --f-trap:#b89be8;
+  }
+}
+
+/* ---- carry-sense callout (shown in drawer for SUB/SBC/CMP/Bcc) ---- */
+.isa .d-carry{margin-top:14px;border:0.5px solid var(--warn);border-radius:8px;
+  background:rgba(186,117,23,0.08);padding:9px 12px;font-family:var(--mono);
+  font-size:11.5px;line-height:1.45;color:var(--ink)}
+.isa .d-carry b{color:var(--warn)}
+
+/* ---- controls ---- */
+/* ---- top bar : mirrors WebEMU .refbar (height, padding, separator line) ---- */
+.isa .isa-bar{display:flex;align-items:center;gap:10px;height:46px;box-sizing:border-box;padding:0 16px;
+  border-bottom:0.5px solid var(--hair);position:sticky;top:0;z-index:2;background:var(--surface)}
+.isa .isa-logo{font-family:var(--mono);font-weight:600;letter-spacing:1px;font-size:16px}
+.isa .isa-logo b{color:var(--head,var(--accent))}
+.isa .isa-logo .lbl{font-weight:400;color:var(--muted);letter-spacing:0}
+
+/* ---- search in the bar : mirrors WebEMU .reffind, extended to the right edge ---- */
+.isa .isa-find{flex:1;display:flex;align-items:center;min-width:0}
+.isa .isa-find-box{position:relative;display:flex;flex:1;align-items:center;min-width:0}
+.isa .isa-q{flex:1;width:100%;height:28px;box-sizing:border-box;font-family:var(--sans);font-size:12px;
+  color:var(--ink);background:var(--bg);border:0.5px solid var(--hair2);border-radius:7px;
+  padding:0 52px 0 10px;outline:none}
+.isa .isa-q:focus{border-color:var(--ctl,var(--accent))}
+.isa .isa-q::placeholder{color:var(--faint)}
+.isa .isa-hits{position:absolute;right:30px;top:50%;transform:translateY(-50%);
+  font-family:var(--mono);font-size:11px;color:var(--faint);pointer-events:none}
+.isa .isa-q-x{position:absolute;right:5px;top:50%;transform:translateY(-50%);border:0;background:transparent;
+  color:var(--faint);cursor:pointer;font-size:11px;line-height:1;padding:3px 5px;border-radius:5px}
+.isa .isa-q-x:hover{color:var(--ink);background:var(--hair)}
+.isa .isa-q-x[hidden]{display:none}
+.isa .isa-body{padding:14px clamp(12px,3vw,28px) 40px}
+
+/* ---- controls ---- */
+.isa .isa-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 10px}
+.isa .isa-legend{display:flex;flex-wrap:wrap;gap:4px;flex-basis:100%}
+.isa .isa-chip{font-family:var(--mono);font-size:10px;letter-spacing:.01em;color:var(--muted);
+  border:0.5px solid var(--hair2);border-radius:999px;padding:2px 7px 2px 6px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;user-select:none;background:var(--surface);white-space:nowrap;
+  transition:color .12s,border-color .12s,opacity .12s,background .12s}
+.isa .isa-chip .sw{width:8px;height:8px;border-radius:2px;flex:none}
+.isa .isa-chip:hover{background:var(--bg)}
+.isa .isa-chip[aria-pressed="true"]{color:var(--ink);border-color:var(--accent)}
+.isa .isa-chip.dim{opacity:.34}
+
+/* ---- the grid ---- */
+.isa .isa-gridwrap{border:0.5px solid var(--hair2);border-radius:10px;overflow:hidden;background:var(--surface)}
+.isa table{width:100%;border-collapse:collapse;font-family:var(--mono)}
+.isa .isa-gridwrap table{table-layout:fixed}
+.isa thead th{background:var(--bg);color:var(--muted);font-weight:600;font-size:11px;
+  letter-spacing:.06em;text-transform:uppercase;padding:4px 6px;border-bottom:0.5px solid var(--hair)}
+.isa thead th.opcol{text-align:left;padding-left:14px;width:128px}
+.isa tbody td.op{background:var(--bg);color:var(--ink);font-size:12px;padding:5px 6px 5px 14px;
+  border-bottom:0.5px solid var(--hair);white-space:nowrap}
+.isa tbody td.op .hx{color:var(--accent-d)}
+.isa tbody td.op .nm{color:var(--fc,var(--ink))}
+.isa tbody td.op .fam{display:block;font-size:9.5px;color:var(--faint);letter-spacing:.04em;
+  text-transform:uppercase;margin-top:1px}
+.isa .cell{position:relative;border-left:0.5px solid var(--hair);border-bottom:0.5px solid var(--hair);
+  padding:5px 9px;cursor:pointer;min-width:118px;vertical-align:top;transition:background .1s}
+.isa .cell .mn{font-size:12.5px;color:var(--fc,var(--ink));letter-spacing:.01em;font-weight:500}
+.isa .cell .cy{font-size:10px;color:var(--faint);margin-top:2px}
+.isa .cell::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--fc,transparent)}
+.isa .cell:hover{background:var(--bg)}
+.isa .cell:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.isa .cell.empty{cursor:default}
+.isa .cell.empty .mn{color:var(--faint);font-size:11px;font-weight:400}
+.isa .cell.empty::before{display:none}
+.isa .cell.empty:hover{background:none}
+.isa .cell.hit{background:rgba(29,158,117,0.10)}
+.isa .cell.fade{opacity:.28}
+.isa .cell.sel{background:var(--bg);box-shadow:inset 0 0 0 1px var(--fc)}
+.isa .cell.sel .mn{filter:brightness(1.06)}
+.isa tr.dim td.op{opacity:.3}
+
+/* ---- footer legend ---- */
+.isa .isa-foot{margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--faint);line-height:1.6}
+.isa .isa-foot .flg{color:var(--muted)}
+.isa .isa-foot b{color:var(--muted)}
+.isa .isa-foot .on{color:var(--accent-d)}
+
+/* ---- detail drawer ---- */
+.isa .isa-scrim{position:fixed;inset:0;background:rgba(20,20,16,.10);opacity:0;pointer-events:none;
+  transition:opacity .18s;z-index:40}
+.isa .isa-scrim.open{opacity:1;pointer-events:auto}
+.isa .isa-drawer{position:fixed;top:0;right:0;height:100%;width:min(420px,92vw);background:var(--surface);
+  border-left:0.5px solid var(--hair2);transform:translateX(100%);transition:transform .2s ease;
+  z-index:41;padding:22px 22px 40px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.isa .isa-drawer.open{transform:none}
+.isa .isa-x{position:absolute;top:14px;right:16px;background:transparent;border:0.5px solid var(--hair2);
+  color:var(--muted);border-radius:7px;font-family:var(--mono);font-size:12px;padding:4px 9px;cursor:pointer}
+.isa .isa-x:hover{color:var(--ink);background:var(--bg);border-color:var(--accent)}
+.isa .d-fam{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--fc,var(--muted))}
+.isa .d-op{font-family:var(--mono);font-size:25px;margin:4px 0 2px;color:var(--ink);white-space:nowrap}
+.isa .d-op .hx{color:var(--fc,var(--accent-d))}
+.isa .d-mode{font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:16px}
+.isa .d-syn{font-family:var(--mono);font-size:14px;background:var(--bg);border:0.5px solid var(--hair);
+  border-radius:8px;padding:11px 13px;color:var(--ink);white-space:pre-wrap;line-height:1.5}
+.isa .d-row{display:flex;gap:10px;margin:14px 0 0}
+.isa .d-box{flex:1;background:var(--bg);border:0.5px solid var(--hair);border-radius:8px;padding:9px 11px}
+.isa .d-box .lab{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:4px}
+.isa .d-box .val{font-family:var(--mono);font-size:15px;color:var(--ink)}
+.isa .fchips{display:flex;gap:4px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px}
+.isa .fchip{min-width:28px;text-align:center;box-sizing:border-box;padding:1px 6px;border-radius:5px;background:var(--bg);color:var(--faint);border:0.5px solid var(--hair)}
+.isa .fchip.on{background:rgba(29,158,117,0.14);color:var(--accent-d);border-color:rgba(29,158,117,0.4)}
+.isa .d-note{margin-top:16px;font-size:13px;line-height:1.55;color:var(--muted)}
+.isa .d-variants{margin-top:16px}
+.isa .d-variants .vh{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:7px}
+.isa .d-variants ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+.isa .d-variants li{font-family:var(--mono);font-size:11.5px;color:var(--ink);display:flex;
+  justify-content:space-between;gap:12px;border-bottom:0.5px dashed var(--hair);padding-bottom:5px}
+
+/* ---- rich detail sections ---- */
+.isa .d-sec{margin-top:18px}
+.isa .vh{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:7px}
+.isa .d-oper{font-family:var(--mono);font-size:11.5px;background:var(--bg);border:0.5px solid var(--hair);
+  border-radius:8px;padding:9px 12px;color:var(--ink);line-height:1.4}
+.isa .d-tbl{width:100%;border-collapse:collapse;font-size:11.5px;line-height:1.3}
+.isa .d-tbl td,.isa .d-tbl th{padding:3px 8px;border-bottom:0.5px solid var(--hair);text-align:left;vertical-align:top}
+.isa .d-tbl.enc .bits{color:var(--accent-d);letter-spacing:.06em}
+.isa .d-tbl.enc td{border-bottom:none;white-space:nowrap}
+.isa .d-tbl.enc .bits{text-align:right}
+.isa .d-tbl.enc tr.enc-note td{white-space:normal;color:var(--muted);font-size:11px;
+  padding:0 8px 5px;border-bottom:0.5px solid var(--hair)}
+.isa .d-tbl.pages td:first-child,.isa .d-tbl.pages td:nth-child(2){white-space:nowrap;width:1px}
+.isa .d-tbl.pages td{white-space:nowrap}
+.isa .d-tbl tr:last-child td{border-bottom:none}
+.isa .d-tbl th{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--faint);font-weight:600}
+.isa .d-tbl .mono{font-family:var(--mono);color:var(--ink)}
+.isa .d-tbl .dim{color:var(--faint);font-family:var(--mono);font-size:11px}
+.isa .d-tbl .num{font-family:var(--mono);color:var(--muted);text-align:right;white-space:nowrap}
+.isa .d-tbl .accent{color:var(--accent-d)}
+.isa .d-tbl.br td:first-child{font-family:var(--mono);color:var(--ink);white-space:nowrap}
+.isa .d-fine{font-size:11px;color:var(--faint);margin-top:6px;font-family:var(--mono)}
+.isa .d-bullets{margin:0;padding-left:16px;display:flex;flex-direction:column;gap:7px}
+.isa .d-bullets li{font-size:12.5px;line-height:1.5;color:var(--muted)}
+.isa .d-bullets li::marker{color:var(--accent)}
+.isa .d-see{display:flex;flex-direction:column;gap:6px}
+.isa .d-pill{font-size:12px;color:var(--muted);background:var(--bg);border:0.5px solid var(--hair);
+  border-radius:7px;padding:6px 10px}
+.isa .d-pill b{font-family:var(--mono);color:var(--ink);margin-right:6px}
+
+@media (max-width:680px){
+  .isa .cell{min-width:84px;padding:6px 6px}
+  .isa .cell .mn{font-size:11px}
+  .isa thead th.opcol,.isa tbody td.op{width:66px;padding-left:8px}
+}
+@media (prefers-reduced-motion:reduce){
+  .isa .isa-drawer,.isa .isa-scrim,.isa .isa-chip,.isa .cell{transition:none}
+}
