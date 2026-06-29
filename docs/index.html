@@ -12,6 +12,22 @@
 <meta name="theme-color" content="#16a34a">
 <link rel="stylesheet" href="css/k16-webemu.css">
 <link rel="stylesheet" href="isa/k16-isa.css">
+<style>
+  /* Mobile tab strip: 4 tabs (Terminal/Graphics/Reference/Opcodes) overran the
+     viewport. Tighten sizing and let the strip scroll horizontally instead of
+     pushing past the right edge (which dragged the page into horizontal overflow). */
+  @media (max-width:820px){
+    /* The opcode drawer is position:fixed and parks off the right edge while
+       closed (translateX(100%)). Chrome counts that toward document scroll width,
+       so opening it removes the overflow and the page snaps left. Clamp it. */
+    html,body{overflow-x:hidden}
+    .tabs{gap:2px;padding:8px 8px 0;overflow-x:auto;flex-wrap:nowrap;
+          scrollbar-width:none;-webkit-overflow-scrolling:touch}
+    .tabs::-webkit-scrollbar{display:none}
+    .tab{flex:0 0 auto;font-size:12px;padding:6px 9px;white-space:nowrap}
+    .tab .ic{width:18px;height:18px}
+  }
+</style>
 </head>
 <body>
 <div class="machine" role="application" aria-label="K16 emulator">
