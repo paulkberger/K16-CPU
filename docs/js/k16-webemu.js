@@ -625,9 +625,15 @@ $("tab-isa").onclick=()=>selectTab("isa");
 
   // Focus the proxy (raising the keyboard) and mirror the on-screen focus ring
   // onto whichever surface is active, so the cursor still goes solid.
+  // Seed the proxy with one throwaway char (caret after it) so Backspace always
+  // has something to delete and fires a deleteContentBackward event - on an empty
+  // field neither iOS nor Gboard sends a usable backspace event. Every edit is
+  // preventDefaulted below, so this filler never actually changes.
+  const SEED="\u00A0";
+  function seedProxy(){ proxy.value=SEED; try{ proxy.setSelectionRange(SEED.length,SEED.length); }catch(_){} }
   function focusProxy(){
-    proxy.value="";
     proxy.focus();
+    seedProxy();
   }
   function ringOn(){
     const onGfx=$("tab-gfx").getAttribute("aria-selected")==="true";
@@ -665,9 +671,9 @@ $("tab-isa").onclick=()=>selectTab("isa");
     feedKeyToCore(e);                                          // arrows/Tab/Esc/Ctrl-*
   });
 
-  // beforeinput: the printable + edit path. Cancel it (nothing should land in
-  // the textarea) so the value stays empty; the input fallback below only fires
-  // when beforeinput wasn't cancelable (older iOS predictive paths).
+  // beforeinput: the printable + edit path. Cancel it (nothing should land in the
+  // textarea) so the value stays at the filler seed; the input handler re-seeds
+  // on the rare non-cancelable edit.
   proxy.addEventListener("beforeinput",e=>{
     const t=e.inputType;
     if(t==="insertLineBreak"||t==="insertParagraph"){ Core.queueKey(13); if(e.cancelable)e.preventDefault(); return; }
@@ -678,14 +684,9 @@ $("tab-isa").onclick=()=>selectTab("isa");
       if(e.cancelable)e.preventDefault();
     }
   });
-  // Fallback for non-cancelable beforeinput: read what landed, queue it, clear.
-  proxy.addEventListener("input",()=>{
-    const s=proxy.value; if(!s) return;
-    for(const ch of s){ const c=ch.charCodeAt(0);
-      if(c===10||c===13) Core.queueKey(13);
-      else if(c>=32&&c<=126) Core.queueKey(c); }
-    proxy.value="";
-  });
+  // beforeinput does the emitting (it queues regardless of cancelable); input
+  // only fires when an edit wasn't preventable, so just restore the filler+caret.
+  proxy.addEventListener("input",()=>{ seedProxy(); });
 
   // Next-shell switcher (k/OS $0E, cycles + wraps). mousedown+preventDefault
   // keeps the proxy focused so the keyboard doesn't drop on tap (mobile); on
