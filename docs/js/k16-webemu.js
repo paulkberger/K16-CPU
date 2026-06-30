@@ -115,7 +115,11 @@ function layoutScreen(){
   const inspReserve = sideBySide ? 396 : 0;
   const availW = window.innerWidth - 32 - 28 - inspReserve;
   let scale = (availW >= NW*2 && window.innerHeight >= NH*2 + 240) ? 2 : 1;
-  const w = NW*scale, minH = NH*scale;               // width floored at native 1280
+  // Width floored at native 1280 on real desktops, but never wider than the
+  // viewport — on tablets (821..1279px, still the non-mobile path) forcing 1280
+  // overflowed the page and scrolled the left edge off. Clamp to availW; the gfx
+  // canvas scales to fit and the 80-col terminal needs far less than this.
+  const w = Math.min(NW*scale, availW), minH = NH*scale;
   let h = minH;
   if(sideBySide){ h = Math.max(minH, window.innerHeight - 176); }  // grow to window height
   // .screenwrap is box-sizing:border-box with a 0.5px border, so style.width=w
@@ -383,6 +387,7 @@ function frame(ts){
 function refreshAll(){ renderRegs(); renderDisasm(); renderMem(); renderTerm(true); renderStatus(); }
 function setRunning(on){ running=on; $("b-run").disabled=on; $("b-pause").disabled=!on;
   $("b-step").disabled=on; $("b-anim").disabled=on;   // step/animate are stopped-only tools
+  $("b-switch").disabled=!on;                          // shell switch only meaningful while running
   renderStatus(); }
 
 // Single-step. Keyboard is polled and the keyboard-wait is a block/yield, so the
@@ -606,6 +611,87 @@ $("tab-isa").onclick=()=>selectTab("isa");
       "scale \u00d7"+r3(cssK)+" css / \u00d7"+r3(devK)+" dev \u00b7 "+gfxScaleMode+"\n"+
       "dpr "+r3(dpr)+" \u2192 dev "+Math.round(cw*dpr)+"\u00d7"+Math.round(ch*dpr)+FOOT);
   });
+})();
+
+// ---- Mobile keyboard + task switching ----------------------------------
+// iOS only raises the soft keyboard for a real editable element, and its soft
+// keys deliver printables through beforeinput (keydown reports Unidentified /
+// keyCode 229 during predictive entry) - so on mobile we route input through a
+// hidden proxy <textarea>, not the term/gfx keydown path. Desktop (>820) never
+// touches this: the proxy is never focused and the existing handlers stand.
+(function(){
+  const proxy=$("kbproxy"); if(!proxy) return;
+  const MOB=()=>window.innerWidth<=820;
+
+  // Focus the proxy (raising the keyboard) and mirror the on-screen focus ring
+  // onto whichever surface is active, so the cursor still goes solid.
+  function focusProxy(){
+    proxy.value="";
+    proxy.focus();
+  }
+  function ringOn(){
+    const onGfx=$("tab-gfx").getAttribute("aria-selected")==="true";
+    if(onGfx){ const t=$("tab-gfx"); if(t)t.classList.add("kbfocus"); }
+    else{ $("term").classList.add("tfocus"); const t=$("tab-term"); if(t)t.classList.add("kbfocus"); }
+    const k=$("s-gfxkb"); if(k)k.classList.add("active");
+  }
+  function ringOff(){
+    $("term").classList.remove("tfocus");
+    const tt=$("tab-term"); if(tt)tt.classList.remove("kbfocus");
+    const tg=$("tab-gfx");  if(tg)tg.classList.remove("kbfocus");
+    const k=$("s-gfxkb"); if(k)k.classList.remove("active");
+  }
+  proxy.addEventListener("focus",ringOn);
+  proxy.addEventListener("blur",ringOff);
+
+  // Tapping the term or gfx surface routes focus to the proxy on mobile. The
+  // surface's own mouseup/mousedown focus fires first (no keyboard, harmless);
+  // click runs after and wins, all within the tap gesture iOS requires.
+  ["term","gfx"].forEach(id=>{
+    const el=$(id); if(!el) return;
+    el.addEventListener("click",()=>{ if(MOB()) focusProxy(); });
+  });
+  // The status-bar keyboard icon: re-arm input within a real touch gesture.
+  const kbw=$("s-gfxkbwrap");
+  if(kbw) kbw.addEventListener("touchend",e=>{ if(MOB()){ e.preventDefault(); focusProxy(); } },{passive:false});
+
+  // keydown: control keys + Ctrl-combos only. Bare printables AND Enter/Backspace
+  // are left to beforeinput, so soft and external keyboards both emit once.
+  proxy.addEventListener("keydown",e=>{
+    const k=e.key;
+    if(k==="Enter"||k==="Backspace") return;                 // -> beforeinput
+    if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&k.length===1) return; // printable -> beforeinput
+    feedKeyToCore(e);                                          // arrows/Tab/Esc/Ctrl-*
+  });
+
+  // beforeinput: the printable + edit path. Cancel it (nothing should land in
+  // the textarea) so the value stays empty; the input fallback below only fires
+  // when beforeinput wasn't cancelable (older iOS predictive paths).
+  proxy.addEventListener("beforeinput",e=>{
+    const t=e.inputType;
+    if(t==="insertLineBreak"||t==="insertParagraph"){ Core.queueKey(13); if(e.cancelable)e.preventDefault(); return; }
+    if(t==="deleteContentBackward"){ Core.queueKey(8); if(e.cancelable)e.preventDefault(); return; }
+    if(t==="insertText"||t==="insertCompositionText"||t==="insertReplacementText"){
+      const s=e.data||"";
+      for(const ch of s){ const c=ch.charCodeAt(0); if(c>=32&&c<=126) Core.queueKey(c); }
+      if(e.cancelable)e.preventDefault();
+    }
+  });
+  // Fallback for non-cancelable beforeinput: read what landed, queue it, clear.
+  proxy.addEventListener("input",()=>{
+    const s=proxy.value; if(!s) return;
+    for(const ch of s){ const c=ch.charCodeAt(0);
+      if(c===10||c===13) Core.queueKey(13);
+      else if(c>=32&&c<=126) Core.queueKey(c); }
+    proxy.value="";
+  });
+
+  // Next-shell switcher (k/OS $0E, cycles + wraps). mousedown+preventDefault
+  // keeps the proxy focused so the keyboard doesn't drop on tap (mobile); on
+  // desktop it just suppresses focus-steal, harmless. The button is gated by
+  // setRunning, so it only fires while the CPU is running.
+  const nx=$("b-switch");
+  if(nx) nx.addEventListener("mousedown",e=>{ e.preventDefault(); Core.queueKey(0x0E); });
 })();
 
 /* ---- Reference tab: Docs_Home hub + in-panel .md navigation ---- */
@@ -1208,6 +1294,16 @@ $("dname-ok").onclick=()=>{ const v=$("dname-input").value.trim(); const mb=pars
 $("dname-cancel").onclick=()=>closeName();
 document.addEventListener("click",(e)=>{ const p=$("drives-pop");
   if(!p.hidden && !p.contains(e.target) && !e.target.closest("#b-drives") && !e.target.closest("#dstrip")) closeDrives(); });
+
+// Popover close buttons (X) — route each to its existing close path.
+document.querySelectorAll(".pop-x").forEach(b=>b.addEventListener("click",e=>{
+  e.stopPropagation();
+  switch(b.dataset.close){
+    case "settings-pop": $("settings-pop").hidden=true; $("b-gear").classList.remove("active"); break;
+    case "files-pop":  closeFiles();  break;
+    case "drives-pop": closeDrives(); break;
+  }
+}));
 
 /* ---- k16.ini in the OPFS bay (best-effort; no-ops on file://) ---- */
 function serializeIni(){
