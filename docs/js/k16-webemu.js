@@ -575,7 +575,7 @@ $("tab-isa").onclick=()=>selectTab("isa");
   kb.addEventListener("mousedown",e=>{
     e.preventDefault();                                  // don't let the click blur first
     const onGfx=$("tab-gfx").getAttribute("aria-selected")==="true";
-    const el=$(onGfx?"gfx":"term"); if(el) el.focus();
+    const el=$(onGfx?"gfx":"term"); if(el && window.innerWidth>820) el.focus();
   });
   // Debug aid: refresh the focus hint with the canvas's live on-screen size,
   // but only as the pointer arrives (the tip is a hover-only ::after — no point
