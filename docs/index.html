@@ -26,7 +26,67 @@
     .tabs::-webkit-scrollbar{display:none}
     .tab{flex:0 0 auto;font-size:12px;padding:6px 9px;white-space:nowrap}
     .tab .ic{width:18px;height:18px}
+    /* Stop Safari zooming the page when any field gains focus (<16px triggers it). */
+    input,select,textarea{font-size:16px}
+    /* Align the bar and screen to the tab strip's 8px inset (tabs were already
+       8). Everything lines up on the left, and the terminal + button grid pick
+       up the extra width. */
+    .bar{padding-left:8px;padding-right:8px}
+    .main{padding-left:8px;padding-right:8px}
+    /* Last five buttons (Switch/Load/Files/Disk/Settings) show icon + word on
+       mobile; icon-only on desktop. The first five keep their plain labels. */
+    .btngrid .btxt{display:inline}
+    /* Toolbar: 2 rows of 5 uniform cells. repeat(5,1fr) makes every button the
+       same width regardless of label. Compact sizing so icon + "Settings" fits. */
+    .btngrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;width:100%}
+    .btngrid .btn{width:100%;min-width:0;padding:0 3px;gap:3px;font-size:11px;
+      letter-spacing:-0.01em;justify-content:center;white-space:nowrap;overflow:hidden}
+    .btngrid .btn .ic{width:13px;height:13px;flex:none}
+    /* Status bar. Line 1: three even groups (mode | speed | kbd 80x39) split by
+       the existing | seps. A zero-height full-width break is forced after the
+       kbd group, so line 2 starts at the drive strip: drives, status, GitHub
+       (GitHub pushed right). If line 2 can't fit, GitHub wraps to its own line. */
+    .status{gap:6px 8px;padding:7px 8px}
+    .status #s-mode,.status #s-speed,.status .gfxgrp{flex:1 1 0;min-width:0;width:auto}
+    .status .gfxgrp{justify-content:flex-start}
+    .status .gfxgrp + .sep{flex:0 0 100%;height:0;margin:0;padding:0;overflow:hidden}
+    .status .gh{margin-left:auto}
+    /* Popovers: the top:50px anchor was sized for the old single-row toolbar and
+       now overlaps the 2-row bar. Recenter them as fixed cards, viewport-bounded,
+       scroll if tall. The X (or a tap outside) closes them. */
+    .popover{position:fixed;top:50%;left:50%;right:auto;transform:translate(-50%,-50%);
+      width:min(360px,calc(100vw - 24px));max-height:calc(100vh - 40px);overflow:auto}
+    .popover.files,.popover.drives{width:min(360px,calc(100vw - 24px))}
   }
+  /* Desktop (821+): the wrapper lays the buttons out as a wrapping flex row, the
+     single row the toolbar had before. Non-overlapping with the mobile grid so
+     neither rule depends on source order to win. */
+  @media (min-width:821px){
+    .btngrid{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    /* Last five are icon-only on desktop. */
+    .btngrid .btxt{display:none}
+  }
+  /* Off-screen but focusable proxy: iOS only raises the soft keyboard for a real
+     editable element, so taps on the term/gfx surface focus this instead. Kept
+     1x1 and clipped (not display:none, which can't be focused); 16px font so
+     focusing it never zooms the page. */
+  #kbproxy{position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;
+    border:0;padding:0;margin:0;resize:none;font-size:16px;
+    color:transparent;background:transparent;caret-color:transparent;overflow:hidden}
+  /* Popover close button: top-right corner of every popover, desktop + mobile. */
+  .popover .pop-x{position:absolute;top:8px;right:8px;width:26px;height:26px;padding:0;
+    display:inline-flex;align-items:center;justify-content:center;
+    background:transparent;border:0.5px solid var(--hair2);border-radius:7px;
+    color:var(--muted);font-family:var(--mono);font-size:12px;line-height:1;cursor:pointer}
+  .popover .pop-x:hover{color:var(--ink);background:var(--bg);border-color:var(--accent)}
+  /* Switch button hint is multi-line (shortcut list) - honour the newlines and
+     left-align, like the status-bar keyboard hint does. */
+  #b-switch[data-tip]::after{white-space:pre;text-align:left;line-height:1.5;
+    width:max-content;max-width:min(92vw,420px)}
+  /* Stacked inspector (tablet + mobile): let the no-wrap hex dumps scroll inside
+     their card instead of widening the grid track and overflowing the page. */
+  .main.stack .insp .card{min-width:0}
+  .main.stack .memdump,.main.stack .mlist{overflow-x:auto}
 </style>
 </head>
 <body>
@@ -36,6 +96,7 @@
     <span class="logo">K<b>16</b><span class="lc">cpu</span></span>
     <span class="sub">&middot; web emulator &middot; front panel &middot;</span>
     <div class="barbreak"></div>
+    <div class="btngrid">
     <button class="btn go" id="b-run">
       <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5l12 7-12 7z"/></svg>Run</button>
     <button class="btn" id="b-pause" disabled>
@@ -46,18 +107,22 @@
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 10-2.3 5.6M20 4v5h-5"/></svg>Reset</button>
     <button class="btn" id="b-boot" data-tip="Cold boot - reload system images and restart">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v9"/><path d="M7.5 6.5a7 7 0 109 0"/></svg>Boot</button>
+    <button class="btn" id="b-switch" data-tip="Switch k/OS shell (cycles, wraps)&#10;next:  Ctrl-N &middot; Ctrl-Right &middot; Ctrl-Space&#10;prev:  Ctrl-P &middot; Ctrl-Left &middot; Ctrl-Shift-N&#10;jump: Ctrl-1..9 &middot; Ctrl 0" aria-label="Next k/OS shell" disabled>
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9h13l-3-3M20 15H7l3 3"/></svg><span class="btxt">Switch</span></button>
     <button class="btn" id="b-load" data-tip="Load Intel HEX (e.g. a new k/OS build)">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10M8 9l4 4 4-4M5 21h14"/></svg>Load</button>
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v10M8 9l4 4 4-4M5 21h14"/></svg><span class="btxt">Load</span></button>
     <input type="file" id="hex-file" accept=".hex,.ihex,.ihx,.h16" hidden>
     <button class="btn" id="b-files" data-tip="Files" aria-label="Files">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg></button>
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg><span class="btxt">Files</span></button>
     <button class="btn" id="b-drives" data-tip="Drives" aria-label="Drives">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></button>
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg><span class="btxt">Disk</span></button>
     <button class="btn" id="b-gear" data-tip="Settings" aria-label="Settings">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></button>
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg><span class="btxt">Settings</span></button>
+    </div>
   </div>
 
   <div class="popover settings" id="settings-pop" hidden>
+    <button class="pop-x" data-close="settings-pop" aria-label="Close">&#x2715;</button>
     <h4>Settings</h4>
     <div class="pnote" id="settings-pnote" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>
@@ -99,6 +164,7 @@
   </div>
 
   <div class="popover drives" id="drives-pop" hidden>
+    <button class="pop-x" data-close="drives-pop" aria-label="Close">&#x2715;</button>
     <h4>Drives</h4>
     <div class="pnote" id="drives-pnote" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>
@@ -139,6 +205,7 @@
   </div>
 
   <div class="popover files" id="files-pop" hidden>
+    <button class="pop-x" data-close="files-pop" aria-label="Close">&#x2715;</button>
     <h4>Host files</h4>
     <div class="pnote" id="files-pnote" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>
@@ -175,6 +242,8 @@
   <div class="main" id="main">
     <div class="screenwrap" id="screenwrap">
       <div class="term" id="term" aria-live="off"></div>
+      <textarea id="kbproxy" aria-hidden="true" tabindex="-1"
+        autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false"></textarea>
       <div class="tmenu" id="tmenu" hidden>
         <button data-act="copy"><span>Copy</span><span class="km">Ctrl-C</span></button>
         <button data-act="paste"><span>Paste</span><span class="km">Ctrl-V</span></button>
