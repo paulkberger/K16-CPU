@@ -476,8 +476,8 @@ function selectTab(which){ gfxActive=(which==="gfx");
   $("isawrap").style.display = which==="isa"  ? "block":"none";
   if(window.innerWidth<=820) layoutScreen();          // tab-aware screen height on mobile
   if(which==="ref" && !refLoaded) loadDoc(HOME_DOC);
-  if(which==="gfx"){ sizeGfx(); const g=$("gfx"); if(g) setTimeout(()=>g.focus(),0); }
-  if(which==="term"){ const t=$("term"); if(t){ renderTerm(true); t.scrollTop=t.scrollHeight; setTimeout(()=>t.focus(),0); } }
+  if(which==="gfx"){ sizeGfx(); const g=$("gfx"); if(g && window.innerWidth>820) setTimeout(()=>g.focus(),0); }
+  if(which==="term"){ const t=$("term"); if(t){ renderTerm(true); t.scrollTop=t.scrollHeight; if(window.innerWidth>820) setTimeout(()=>t.focus(),0); } }
   renderStatus(); }
 $("tab-term").onclick=()=>selectTab("term");
 // ---- Shared key feed: map a DOM keydown to k/OS bytes and queue them. ----
@@ -497,7 +497,7 @@ function feedKeyToCore(e){
   term.addEventListener("blur", ()=>{ term.classList.remove("tfocus"); const t=$("tab-term"); if(t)t.classList.remove("kbfocus"); const k=$("s-gfxkb"); if(k)k.classList.remove("active"); });
   // grab focus only on a plain click (no selection in progress), so drag-select
   // isn't collapsed.
-  term.addEventListener("mouseup",()=>{ if((window.getSelection()+"")==="") setTimeout(()=>term.focus(),0); });
+  term.addEventListener("mouseup",()=>{ if(window.innerWidth>820 && (window.getSelection()+"")==="") setTimeout(()=>term.focus(),0); });
 
   // Clipboard model "B": bare Ctrl/Cmd keys stay smart so k/OS keeps its control
   // bytes. Ctrl-C copies ONLY when text is selected, else it falls through as
@@ -565,7 +565,7 @@ $("tab-isa").onclick=()=>selectTab("isa");
   gfx.tabIndex=0;
   gfx.addEventListener("focus",()=>{ if(tab)tab.classList.add("kbfocus"); const k=$("s-gfxkb"); if(k)k.classList.add("active"); });
   gfx.addEventListener("blur", ()=>{ if(tab)tab.classList.remove("kbfocus"); const k=$("s-gfxkb"); if(k)k.classList.remove("active"); });
-  gfx.addEventListener("mousedown",()=>setTimeout(()=>gfx.focus(),0));
+  gfx.addEventListener("mousedown",()=>{ if(window.innerWidth>820) setTimeout(()=>gfx.focus(),0); });
   gfx.addEventListener("keydown",e=>feedKeyToCore(e));
 })();
 
@@ -644,9 +644,10 @@ $("tab-isa").onclick=()=>selectTab("isa");
   proxy.addEventListener("focus",ringOn);
   proxy.addEventListener("blur",ringOff);
 
-  // Tapping the term or gfx surface routes focus to the proxy on mobile. The
-  // surface's own mouseup/mousedown focus fires first (no keyboard, harmless);
-  // click runs after and wins, all within the tap gesture iOS requires.
+  // Tapping the term or gfx surface routes focus to the proxy on mobile, within
+  // the tap gesture iOS needs to raise the keyboard. The surfaces' own self-focus
+  // (term mouseup / gfx mousedown) is gated to desktop so it can't steal focus
+  // back from the proxy on a deferred timer and drop the keyboard.
   ["term","gfx"].forEach(id=>{
     const el=$(id); if(!el) return;
     el.addEventListener("click",()=>{ if(MOB()) focusProxy(); });
