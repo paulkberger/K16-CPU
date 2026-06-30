@@ -51,6 +51,12 @@
     .status .gfxgrp{justify-content:flex-start}
     .status .gfxgrp + .sep{flex:0 0 100%;height:0;margin:0;padding:0;overflow:hidden}
     .status .gh{margin-left:auto}
+    /* Opcodes header keeps its 16px inset while the Reference header is 12px on
+       mobile, so the K16 logo jumps 4px when switching tabs. Match them. */
+    .isa .isa-bar{height:auto;padding:8px 12px}
+    /* Align the Reference document body to the 12px header inset (desktop keeps
+       its wider 26px reading gutters). */
+    .refdoc{padding-left:12px;padding-right:12px}
     /* Popovers: the top:50px anchor was sized for the old single-row toolbar and
        now overlaps the 2-row bar. Recenter them as fixed cards, viewport-bounded,
        scroll if tall. The X (or a tap outside) closes them. */
@@ -66,12 +72,12 @@
     /* Last five are icon-only on desktop. */
     .btngrid .btxt{display:none}
   }
-  /* Off-screen but focusable proxy: iOS only raises the soft keyboard for a real
-     editable element, so taps on the term/gfx surface focus this instead. Kept
-     1x1 and clipped (not display:none, which can't be focused); 16px font so
-     focusing it never zooms the page. */
-  #kbproxy{position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;
-    border:0;padding:0;margin:0;resize:none;font-size:16px;
+  /* Focusable proxy: iOS only raises the soft keyboard for a real editable
+     element. Kept on-screen but invisible (1x1, transparent text/caret, behind
+     everything) - off-screen inputs (left:-9999px) are unreliable for raising
+     the keyboard on iOS. 16px font so focusing it never zooms the page. */
+  #kbproxy{position:fixed;left:0;top:0;width:1px;height:1px;z-index:-1;
+    border:0;padding:0;margin:0;resize:none;font-size:16px;outline:none;
     color:transparent;background:transparent;caret-color:transparent;overflow:hidden}
   /* Popover close button: top-right corner of every popover, desktop + mobile. */
   .popover .pop-x{position:absolute;top:8px;right:8px;width:26px;height:26px;padding:0;
