@@ -73,10 +73,11 @@
     .btngrid .btxt{display:none}
   }
   /* Focusable proxy: iOS only raises the soft keyboard for a real editable
-     element. Kept on-screen but invisible (1x1, transparent text/caret, behind
-     everything) - off-screen inputs (left:-9999px) are unreliable for raising
-     the keyboard on iOS. 16px font so focusing it never zooms the page. */
-  #kbproxy{position:fixed;left:0;top:0;width:1px;height:1px;z-index:-1;
+     element, and only keeps it up while that element is on-screen and not
+     obscured - so this stays on-screen (1x1, transparent text/caret) rather than
+     behind anything. pointer-events:none means it never intercepts a tap while
+     still being programmatically focusable. 16px font so focus never zooms. */
+  #kbproxy{position:fixed;left:0;top:0;width:1px;height:1px;pointer-events:none;
     border:0;padding:0;margin:0;resize:none;font-size:16px;outline:none;
     color:transparent;background:transparent;caret-color:transparent;overflow:hidden}
   /* Popover close button: top-right corner of every popover, desktop + mobile. */
