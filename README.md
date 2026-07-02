@@ -8,6 +8,9 @@ The K16 is a homebrew CPU designed around ROM-based lookup tables for both ALU o
 
 The full design runs today in two environments: a gate-level **Digital** logic simulator (the hardware reference build) and a **Pascal/Lazarus emulator** with an integrated IDE and VT100 terminal. On top of these runs **k/OS**, a preemptive multitasking OS with its re-entrant shell **kosh**, alongside native **Forth** and **BASIC** interpreters that also load as k/OS shells.
 
+**Web Based Emulator**
+https://paulkberger.github.io/K16-CPU/ 
+
 **Key Specifications:**
 - 16-bit data bus
 - 24-bit address bus (16MB flat memory space)
