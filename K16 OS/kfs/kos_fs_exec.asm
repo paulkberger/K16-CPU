@@ -66,9 +66,11 @@
 ; --- Spec recap (kOS_FS_Reference §9.6) ------------------------------------
 ;
 ; In:    XY0  pointer to nul-terminated path ("A:HELLO.COM")
+;        XY1  ASCIIZ arg tail in caller page when D0.bit2 (EXEC_HAS_ARGS) set (Part 15)
 ;        D0   flags
 ;               bit 0 = block (wait for child to exit)   [reserved P16; ignored]
-;               bit 1 = inherit_stdio                    [reserved P18]
+;               bit 1 = EXEC_FOREGROUND  auto-foreground child when it registers as a shell
+;               bit 2 = EXEC_HAS_ARGS    XY1 = ASCIIZ arg tail (Part 15)
 ; Out:   D0   child's TID on success
 ;        C=0  success
 ;        C=1  failure with D0 = ERR_BADPATH / ERR_NOTFOUND / ERR_NOTEXEC /
@@ -79,10 +81,11 @@
 ;
 ; --- Implementation flow ---------------------------------------------------
 ;
-; 1. _ParsePath  → drive in D3, FAT name in FD_NAMEBUF.
+; 1. _ResolveParent → drive, parent cluster; leaf 11-byte name -> FD_NAMEBUF
+;    (Part 44: resolved relative to the CWD context in D1/D2).
 ; 2. Check FD_NAMEBUF[8..10] = "COM" else ERR_NOTEXEC.
 ; 3. _SlotForDrive → XY2.
-; 4. _DirLookup    → cookie of file or ERR_NOTFOUND.
+; 4. DIR_WALK_CLU = parent; _DirLookup → cookie of file or ERR_NOTFOUND.
 ; 5. _LoadDirentFromCookie → FD_DIR_FIRST_CL, FD_DIR_SIZE_LO/HI.
 ; 6. Validate: size > 0 and size ≤ SPAWN_MAX_LEN; first cluster ≥ 2.
 ; 7. _AllocPage → new_page (D0). On fail → ERR_NOMEM.
@@ -105,8 +108,10 @@
 ; ============================================================================
 ; sys_exec — TRAP #31 — load .COM and spawn it as a task
 ;
-;   In:    XY0 = path "X:NAME.COM" (nul-terminated, ≤ 14 chars)
+;   In:    XY0 = path "X:NAME.COM", CWD-relative, or a subpath
 ;          D0  = flags (bit 0 = block; reserved/ignored in P16)
+;          D1  = CWD cluster (0 = root)   — Part 44, for relative paths
+;          D2  = CWD drive index          — Part 44, start drive when no "X:"
 ;   Out:   D0 = new task TID, C=0 on success
 ;          D0 = ERR_*, C=1 on failure
 ; ============================================================================
@@ -114,7 +119,7 @@ sys_exec:
                 DINT
 
                 ; --- Per V2 ABI (Part 36 expansion):
-                ; D1, D2, D3, XY1, XY2 all callee-preserved across syscalls.
+                ; Register contract: see kos_defs.inc, SYSCALL REGISTER CONTRACT.
                 ; Body uses D3 (drive) and XY2 (volume slot) directly;
                 ; helpers _ExecCopyChain et al. clobber D2 internally.
                 ; Part 36 r2: PUSH D1 added — _DirLookup and other helpers
@@ -128,34 +133,69 @@ sys_exec:
                 ; Stash flags (currently unused in P16, but recorded for P17+).
                 STOREZ  D0, [#FE_FLAGS]
 
-                ; --- Parse path → drive in D3, FAT name in FD_NAMEBUF ------
-                LOADI   Y1, #$00
-                LOADI   X1, #FD_NAMEBUF
-                CALLR   _ParsePath
+                ; Part 16: stash the inherited CWD (D1=cluster, D2=drive) before
+                ; _ResolveParent clobbers them; written into the child TCB after
+                ; _BuildTask so the child resolves bare paths from this CWD.
+                STOREZ  D1, [#FE_CWD_CLU]
+                STOREZ  D2, [#FE_CWD_DRIVE]
+
+                ; Part 15: capture argv-tail offset before helpers clobber XY1.
+                ; Caller page = Y3 (stable for the whole syscall). X1 = tail
+                ; offset in the caller page when EXEC_HAS_ARGS set, else none.
+                LOADI   D0, #0
+                STOREZ  D0, [#FE_ARGV_OFF]     ; default: no args
+                LOADZ   D0, [#FE_FLAGS]
+                AND     D0, #EXEC_HAS_ARGS
+                BEQ     .se_no_args_in
+                MOVE    D0, X1
+                STOREZ  D0, [#FE_ARGV_OFF]
+.se_no_args_in:
+
+                ; --- Part 44: resolve parent relative to CWD --------------
+                ; D2 = CWD drive, D1 = CWD clu. _ResolveParent -> drive (D0),
+                ; parent cluster (D1), leaf 11-byte name in RV_FATNAME.
+                MOVE    D0, D2
+                CALLR   _ResolveParent
+                BCS     .se_err
+                STOREZB D0, [#FD_DRIVE_TMP]     ; drive
+                MOVE    D3, D0
+                STOREZ  D1, [#FD_PARENT_CL]     ; parent cluster
+                CALLR   _CopyLeafToNamebuf      ; RV_FATNAME -> FD_NAMEBUF
+
+                ; --- Resolve drive → XY2 (needed before the lookup) -------
+                MOVE    D0, D3
+                CALLR   _SlotForDrive
                 BCS     .se_err
 
-                ; Save drive.
-                STOREZB D3, [#FD_DRIVE_TMP]
+                ; --- Look up file (long-aware) in the resolved parent -----
+                ; Part 45: _DirLookupLong matches by long name (RV_COMP) or 8.3
+                ; (RV_FATNAME); RV_* are still set from _ResolveParent above. A
+                ; long-named .COM has no usable FD_NAMEBUF, so the lookup AND the
+                ; extension check must run off the matched entry, not FD_NAMEBUF.
+                LOADZ   D0, [#FD_PARENT_CL]
+                STOREZ  D0, [#DIR_WALK_CLU]
+                CALLR   _DirLookupLong
+                BCS     .se_lookup_failed
+
+                STOREZ  D0, [#FD_COOKIE_TMP]
+
+                ; --- Adopt the matched SHORT name (Part 45) ---------------
+                ; FD_NAMEBUF from _CopyLeafToNamebuf is only valid for an 8.3
+                ; leaf; for a long name it is garbage. Copy the matched short
+                ; entry's 11-byte name out of FS_BUF_SECTOR so the extension
+                ; check and task-name staging see a real 8.3 "NAME    COM".
+                CALLR   _ExecCopyShortName
 
                 ; --- Verify extension is "COM" ----------------------------
                 CALLR   _ExecCheckExt
                 BCS     .se_err
 
-                ; --- Resolve drive → XY2 ----------------------------------
-                MOVE    D0, D3
-                CALLR   _SlotForDrive
-                BCS     .se_err
-
-                ; --- Look up file -----------------------------------------
-                LOADI   Y0, #$00
-                LOADI   X0, #FD_NAMEBUF
-                CALLR   _DirLookup
-                BCS     .se_lookup_failed
-
-                STOREZ  D0, [#FD_COOKIE_TMP]
-
                 ; --- Load dirent details (first cluster + size) -----------
-                CALLR   _LoadDirentFromCookie
+                ; _LoadDirentFromCookie takes the cookie in D0, but the calls
+                ; above (_ExecCopyShortName, _ExecCheckExt) clobber D0 — reload
+                ; it from FD_COOKIE_TMP first.
+                LOADZ   D0, [#FD_COOKIE_TMP]
+                CALLR   _LoadDirentFromCookie     ; uses DIR_WALK_CLU = parent
                 BCS     .se_err
 
                 ; --- Validate size: 0 < size ≤ SPAWN_MAX_LEN --------------
@@ -179,7 +219,22 @@ sys_exec:
                 ; --- Allocate a fresh user page ---------------------------
                 ; CALL24 _AllocPage doesn't document its preserves — must
                 ; assume D3 and XY2 are clobbered. Re-derive both after.
-                CALL24  _AllocPage
+                ; --- Parse the .COM header (Part 60) ---------------------
+                ; Must happen BEFORE the allocation, because the page count
+                ; is what we are about to allocate - and allocation precedes
+                ; the copy, so the header cannot be read back from the loaded
+                ; page.  _ExecReadHeader reads the image's first sector into
+                ; FS_BUF_SECTOR and leaves the parsed values in FE_PAGES /
+                ; FE_HEAPPG.  On failure D0 already carries ERR_NOTEXEC or
+                ; ERR_IO with C=1, so .se_err needs no special case.
+                CALLR   _ExecReadHeader
+                BCS     .se_err
+
+                ; --- Allocate the destination page RUN --------------------
+                ; CALL24 _AllocPageRun doesn't document its preserves - must
+                ; assume D3 and XY2 are clobbered. Re-derive both after.
+                LOADZ   D0, [#FE_PAGES]
+                CALL24  _AllocPageRun
                 BCS     .se_nomem
                 ; D0 = new page byte. Stash BEFORE any further calls.
                 STOREZB D0, [#FE_NEW_PAGE]
@@ -208,7 +263,14 @@ sys_exec:
                 STOREZ  D0, [#BT_ENTRY_PG]
                 STOREZ  D0, [#BT_PRIMARY]
 
-                LOADI   D0, #1
+                ; Part 60: the page count the header asked for and the
+                ; allocator granted.  Staged HERE rather than at parse time:
+                ; _BuildTask consumes BT_PCOUNT, so a value left behind by an
+                ; error path between the parse and the build would be
+                ; inherited by the NEXT spawn.  FE_PAGES is the carry-across
+                ; precisely so BT_PCOUNT is only ever written on the path
+                ; that goes on to build.
+                LOADZ   D0, [#FE_PAGES]
                 STOREZ  D0, [#BT_PCOUNT]
 
                 ; Parent = current task TID. CURRENT_TCB holds TCB ptr;
@@ -222,14 +284,35 @@ sys_exec:
 
                 ; --- Stage BT_NAME from base name -------------------------
                 CALLR   _ExecStageName
+                ; --- Stage argv block at child:$0100 (Part 15) ------------
+                CALLR   _ExecStageArgs
 
                 ; --- Build the task ---------------------------------------
                 ; XY2 isn't needed after this point so no need to save it.
                 CALL24  _BuildTask
                 BCS     .se_noslots
-                ; D0 = new TCB ptr. Read its TCB_ID for return.
+                ; D0 = new TCB ptr. XY1 := child TCB.
                 LOADI   Y1, #$00
                 MOVE    X1, D0
+                ; Part 16: inherit CWD into the child TCB. Offsets $26/$28 exceed imm5,
+                ; so index via D3 (mode-01 [XY+D]). D0/D3 are reloaded below.
+                LOADI   D3, #TCB_CWD_DRIVE
+                LOADZ   D0, [#FE_CWD_DRIVE]
+                STORED  D0, [XY1+D3]
+                LOADI   D3, #TCB_CWD_CLU
+                LOADZ   D0, [#FE_CWD_CLU]
+                STORED  D0, [XY1+D3]
+                ; Part 51: tag child for auto-foreground when it registers as a
+                ; shell, if launched with EXEC_FOREGROUND (consumed by
+                ; sys_register_shell). FE_FLAGS holds the stashed exec flags.
+                LOADZ   D0, [#FE_FLAGS]
+                AND     D0, #EXEC_FOREGROUND
+                BEQ.S   .se_no_autofg
+                LOADD   D0, [XY1+#TCB_FLAGS]
+                OR      D0, #TF_AUTOFG
+                STORED  D0, [XY1+#TCB_FLAGS]
+.se_no_autofg:
+                ; Read child TCB_ID for return LAST (D0 = return value).
                 LOADD   D0, [XY1+#TCB_ID]
 
                 CLC
@@ -266,6 +349,13 @@ sys_exec:
                 SEC
 
 .se_done:
+                ; Part 44: restore DIR_WALK_CLU root default (single exit funnel;
+                ; preserve the return value in D0 across the store).
+                PUSH    D0, XY3
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                POP     D0, XY3
+
                 ; Gate EINT on KERNEL_STATE (gotcha 4.6).
                 ; Part 36: stash D0 (return) across the gate; D1 is now
                 ; callee-preserved per V2 ABI.
@@ -291,6 +381,105 @@ sys_exec:
 ; ============================================================================
 ; ----------------------- INTERNAL HELPERS ---------------------------------
 ; ============================================================================
+
+; ============================================================================
+; _ExecReadHeader - read and validate the .COM header            [Part 60]
+;
+;   In:    XY2 = volume slot ptr
+;          D3  = drive index (for _FATGetEntry / backend cache identity)
+;          FD_DIR_FIRST_CL = file's first cluster (>= 2, already validated)
+;          FD_DIR_SIZE_LO  = file size in bytes (non-zero, already validated)
+;   Out:   C=0, FE_PAGES / FE_HEAPPG set from the header
+;          C=1 with D0 = ERR_BADHEADER (bad or absent header), or ERR_IO /
+;          ERR_INVALID from the sector read. The code is propagated to
+;          .se_err unchanged, so `run` reports which of the two it was.
+;   Clobbers: D0, D1, D2, X0, X1, Y0, Y1, flags
+;   Preserves: D3, XY2, XY3
+;
+;   The loader needs the page count BEFORE it allocates, and allocation
+;   precedes the copy - so the header must come from the FILE, not from the
+;   loaded page.  We read the first sector of the chain into FS_BUF_SECTOR
+;   and parse it there; _ExecCopyChain then re-reads that same sector as
+;   part of its normal walk.  One redundant 512-byte read per exec, which
+;   buys leaving a working copy routine completely untouched.
+;
+;   FS_BUF_SECTOR is even-aligned, so _ComHeaderCheck's word read at +$04
+;   is safe.
+;
+;   DIR-CACHE COHERENCE (Part 22 protocol, Gotcha 4.47 family): any
+;   non-_DirNextRaw write to FS_BUF_SECTOR MUST invalidate the dir cache,
+;   or _DirNextRaw will skip its next sector read and serve file data
+;   parsed as dirents.  _ExecCopyChain does this at its own entry; we are
+;   the first writer now, so we must do it too rather than rely on a
+;   routine that runs after us.
+;
+;   Called only after FD_DIR_FIRST_CL and FD_DIR_SIZE_LO have been read out
+;   of the dirent into page-$00, so clobbering FS_BUF_SECTOR here costs
+;   nothing.
+; ============================================================================
+_ExecReadHeader:
+                CALLR   _DirCacheInvalidate     ; we are about to write
+                                                ; FS_BUF_SECTOR
+
+                ; --- Read the image's first sector ------------------------
+                LOADZ   D0, [#FD_DIR_FIRST_CL]
+                CALLR   _ClusterToSector        ; preserves D3, XY2
+                BCS     .erh_fail               ; D0 = ERR_INVALID
+
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                CALLR   _VolBlockRead           ; preserves D3, XY2
+                BCS     .erh_fail               ; D0 = ERR_IO
+
+                ; --- Validate the header ---------------------------------
+                ; _VolBlockRead clobbers X0/X1, so rebuild the pointer.
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                LOADZ   D0, [#FD_DIR_SIZE_LO]   ; D0 = image length
+                CALL24  _ComHeaderCheck         ; preserves D2, D3, XY1, XY2
+                BCS     .erh_fail               ; D0 = ERR_NOTEXEC
+
+                ; D0 = pages, D1 = heapPages
+                STOREZ  D0, [#FE_PAGES]
+                STOREZ  D1, [#FE_HEAPPG]
+                RETCC
+
+.erh_fail:
+                ; D0 already carries the error with C=1.
+                RETCS
+
+
+; ============================================================================
+; _ExecCopyShortName — copy the matched short entry's 11-byte name into
+; FD_NAMEBUF (Part 45, LFN-aware exec).
+;
+;   After _DirLookupLong, FS_BUF_SECTOR holds the sector containing the matched
+;   SHORT entry and FD_COOKIE_TMP's low nibble is its index. Copy the 11 name
+;   bytes out so _ExecCheckExt / _ExecStageName operate on a valid 8.3 name even
+;   when the file was opened by its long name.
+;
+;   In:    FD_COOKIE_TMP set; FS_BUF_SECTOR holds the entry's sector.
+;   Out:   FD_NAMEBUF[0..10] = the short entry's 11-byte FAT name.
+;   Clobbers: D0, D1, X0, X1, Y0, Y1, flags.   Preserves: D2, D3, XY2, XY3.
+; ============================================================================
+_ExecCopyShortName:
+                LOADZ   D0, [#FD_COOKIE_TMP]
+                AND     D0, #$0F                ; ent_idx within the sector
+                SHL4    D0
+                SHL     D0                      ; * 32
+                ADD     D0, #FS_BUF_SECTOR
+                LOADI   Y0, #$00
+                MOVE    X0, D0                  ; XY0 = short entry
+                LOADI   Y1, #$00
+                LOADI   X1, #FD_NAMEBUF
+                LOADI   D1, #11
+.ecsn_copy:
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
+                SUB     D1, #1
+                BNE     .ecsn_copy
+                RET
+
 
 ; ============================================================================
 ; _ExecCheckExt — verify FD_NAMEBUF[8..10] = "COM"
@@ -469,10 +658,8 @@ _ExecCopyOneSector:
 .cs_byte_loop:
                 CMP     D2, #0                  ; LOAD/MOVE preserve flags
                 BEQ     .cs_byte_done
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                ADD     X0, #1
-                ADD     X1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D2, #1
                 BRA     .cs_byte_loop
 
@@ -532,6 +719,54 @@ _ExecStageName:
                 RET
 
 ; ============================================================================
+; _ExecStageArgs - stamp the argv tail into child:$0100 (Part 15)
+;
+;   Copies the caller's nul-terminated arg tail (already leading/trailing
+;   trimmed by kosh) from Y3:FE_ARGV_OFF into FE_NEW_PAGE:$0100 as ASCIIZ,
+;   capped at ARGV_MAX chars, and always writes a terminating NUL. If
+;   FE_ARGV_OFF = 0 (no args) it writes a lone $00 at $0100. The stamp is
+;   unconditional: _AllocPage does not clear the page, so $0100 must be
+;   written for the child to trust "peek($0100)=0 => no args".
+;
+;   In:    FE_NEW_PAGE = child page byte
+;          FE_ARGV_OFF = caller-page offset of arg tail (0 = none)
+;          Y3          = caller page (source page for the tail)
+;   Out:   child:$0100.. = ASCIIZ arg tail (or a lone $00)
+;   Clobbers: D0, D1, D2, X0, X1, Y0, Y1, flags
+;   Preserves: D3, XY2, XY3
+; ============================================================================
+_ExecStageArgs:
+                ; Dest = FE_NEW_PAGE:ARGV_BASE ($0100).
+                LOADZB  D0, [#FE_NEW_PAGE]
+                AND     D0, #$FF
+                MOVE    Y1, D0
+                LOADI   X1, #ARGV_BASE
+
+                ; No args -> write a lone NUL at $0100 and return.
+                LOADZ   D0, [#FE_ARGV_OFF]
+                CMP     D0, #0
+                BEQ     .sa_term
+
+                ; Source = Y3:FE_ARGV_OFF.
+                MOVE    Y0, Y3
+                MOVE    X0, D0
+                LOADI   D2, #ARGV_MAX           ; copy budget (chars)
+.sa_loop:
+                CMP     D2, #0                  ; LOADB is flag-transparent
+                BEQ     .sa_term                ; budget exhausted -> terminate
+                LOADB   D0, [XY0]+
+                AND     D0, #$FF
+                CMP     D0, #0
+                BEQ     .sa_term                ; source NUL -> done
+                STOREB  D0, [XY1]+
+                SUB     D2, #1
+                BRA     .sa_loop
+.sa_term:
+                LOADI   D0, #0
+                STOREB  D0, [XY1]               ; guaranteed NUL terminator
+                RET
+
+; ============================================================================
 ; ----------------------- KERNEL-SCRATCH SLOTS -----------------------------
 ; ============================================================================
 ; Page-$00 scratch slots used by Piece 6 (sys_exec) have been RELOCATED
@@ -552,3 +787,4 @@ _ExecStageName:
 ; ============================================================================
 ; End of kos_fs_exec.asm
 ; ============================================================================
+

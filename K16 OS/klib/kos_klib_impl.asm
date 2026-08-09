@@ -273,11 +273,22 @@ _KDiv10:
 ; ============================================================================
 ;   Input:    XY0 = pointer to nul-terminated string
 ;   Output:   D0  = byte count (excluding nul)
+;             XY0 = left pointing AT the nul terminator (start + count)
 ;   Flags:    C = 0
-;   Clobbers: D0, XY0
+;   Clobbers: D0
 ;
 ;   Walks XY0 forward incrementing a counter until it hits a $00 byte.
 ;   Returns 0 for empty string. The nul itself is not counted.
+;
+;   *** CURSOR CONTRACT - DO NOT 'OPTIMISE' THE LOOP ***
+;   The loop exits BEFORE advancing on the nul, so XY0 deterministically
+;   lands ON the terminator, not one past it. Callers depend on this: they
+;   append in place (e.g. _KoshPrintPrompt adds "$ ", ls/pwd append LF) or
+;   walk on from the end. Same rest-on-nul class as the bare scanners left
+;   untouched in the STREAM sweep (.format_bn_find_nul, the run find-end scan).
+;   Folding LOADB to STREAM post-increment ([XY0]+) advances past the nul and
+;   silently corrupts every such caller - this caused an ERR_NOTFOUND
+;   regression once already. Keep LOADB [XY0] bare.
 ;
 ;   Adapted from Forth v2.24 print_string (line 2892), with the STOREB
 ;   replaced by counter increment.
@@ -329,10 +340,8 @@ _KMemCpy:
 
                 MOVE    D1, D0              ; D1 = working count
 .loop:
-                LOADB   D0, [XY1]
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-                INC     XY1, #1
+                LOADB   D0, [XY1]+
+                STOREB  D0, [XY0]+
                 DEC     D1, #1
                 BNE     .loop
 .done:
@@ -366,8 +375,7 @@ _KMemSet:
 
                 MOVE    D2, D0              ; D2 = working count
 .loop:
-                STOREB  D1, [XY0]
-                INC     XY0, #1
+                STOREB  D1, [XY0]+
                 DEC     D2, #1
                 BNE     .loop
 .done:
@@ -471,8 +479,7 @@ _KItoh_Nibble:
 .digit:
                 ADD     D1, #$30                ; '0'
 .emit:
-                STOREB  D1, [XY0]
-                INC     XY0, #1
+                STOREB  D1, [XY0]+
                 RET
 
 ; ============================================================================
@@ -526,15 +533,13 @@ _KUtoa_Recur:
                 POP     D1, XY3                 ; restore our digit
 
                 ADD     D1, #$30
-                STOREB  D1, [XY0]
-                INC     XY0, #1
+                STOREB  D1, [XY0]+
                 ADD     D2, #1
                 RET
 
 .single:
                 ADD     D0, #$30
-                STOREB  D0, [XY0]
-                INC     XY0, #1
+                STOREB  D0, [XY0]+
                 LOADI   D2, #1
                 RET
 
@@ -570,8 +575,7 @@ _KItoa:
 
                 ; Negative: write '-' and advance XY0
                 LOADI   D1, #$2D                ; '-'
-                STOREB  D1, [XY0]
-                INC     XY0, #1
+                STOREB  D1, [XY0]+
                 LOADI   D2, #1                  ; one sign byte
 
                 ; Negate D0
@@ -767,11 +771,9 @@ _KStrCpy:
                 LOADI   D0, #0                  ; D0 = byte count
 
 .loop:
-                LOADB   D1, [XY1]
-                STOREB  D1, [XY0]
+                LOADB   D1, [XY1]+
+                STOREB  D1, [XY0]+
                 ADD     D0, #1
-                INC     XY0, #1
-                INC     XY1, #1
                 CMP     D1, #0
                 BNE     .loop
 
@@ -808,8 +810,8 @@ _KStrCmp:
                 PUSH    XY1, XY3
 
 .loop:
-                LOADB   D1, [XY0]
-                LOADB   D2, [XY1]
+                LOADB   D1, [XY0]+
+                LOADB   D2, [XY1]+
 
                 CMP     D1, D2
                 BNE.S   .differ
@@ -818,8 +820,6 @@ _KStrCmp:
                 CMP     D1, #0
                 BEQ.S   .equal
 
-                INC     XY0, #1
-                INC     XY1, #1
                 BRA     .loop
 
 .differ:
@@ -914,13 +914,11 @@ _KMemCmp:
                 MOVE    D3, D0                  ; D3 = remaining count
 
 .loop:
-                LOADB   D1, [XY0]
-                LOADB   D2, [XY1]
+                LOADB   D1, [XY0]+
+                LOADB   D2, [XY1]+
                 CMP     D1, D2
                 BNE.S   .differ
 
-                INC     XY0, #1
-                INC     XY1, #1
                 DEC     D3, #1
                 BNE     .loop
 
@@ -986,10 +984,8 @@ _KStrCat:
 .copy_src:
                 ; XY0 now points at dst's nul terminator. Overwrite it
                 ; (and advance) with bytes from src, including src's nul.
-                LOADB   D1, [XY1]
-                STOREB  D1, [XY0]
-                INC     XY0, #1
-                INC     XY1, #1
+                LOADB   D1, [XY1]+
+                STOREB  D1, [XY0]+
                 CMP     D1, #0
                 BEQ.S   .done                   ; we just copied the nul
                 ADD     D2, #1                  ; count this byte (not the nul)
@@ -1427,8 +1423,7 @@ _KUtoa32_Recur:
 
                 ; Base case: D0 holds the single digit (0..9).
                 ADD     D0, #$30
-                STOREB  D0, [XY0]
-                INC     XY0, #1
+                STOREB  D0, [XY0]+
                 LOADI   D2, #1
                 RET
 
@@ -1444,8 +1439,7 @@ _KUtoa32_Recur:
                 POP     D3, XY3                     ; D3 = our digit (rescued from stack)
 
                 ADD     D3, #$30
-                STOREB  D3, [XY0]
-                INC     XY0, #1
+                STOREB  D3, [XY0]+
                 ADD     D2, #1                      ; bump total digit count
                 RET
 

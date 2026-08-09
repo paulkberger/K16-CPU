@@ -1,0 +1,105 @@
+https://mirrors.apple2.org.za/apple2.archive.umich.edu/apple2/gs/gsos/font/fonts/00-index
+
+
+the font Avant Garde
+   Contents: 10,12,14,18,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/avante.guarde.bsq
+
+the font Bookman
+   Contents: 10,12,14,18,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/bookman.bsq
+
+The font Courier
+   Contents: 9,10,12,14,18,20,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/courier.bsq
+
+Two fonts optimized for the GS screen
+   Contents: 12 and 6 pt versions of Chicago and Geneva, notes
+     Reqmts: none
+   Keywords: fonts, screen
+   Filename: /pub/apple2/gs/gsos/font/fonts/gsfonts.bsq
+
+the Helvetica font
+   Contents: Helvetica 9,10,12,14,18,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/helvetica.bsq
+
+Hebrew font (?)
+   Contents: Rehovot 10,12,20,24 pt, Hebrew
+     Reqmts: none
+   Keywords: font, hebrew
+   Filename: /pub/apple2/gs/gsos/font/fonts/hebrew.rehovot.bsq
+
+The mousetext font (?)
+   Contents: mousetext.10
+     Reqmts: none
+   Keywords: font, mousetext
+   Filename: /pub/apple2/gs/gsos/font/fonts/mousetext.bsc
+
+The New Century School Book font
+   Contents: New Century School Book 10,12,14,18,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/new.century.bsq
+
+the Helvetica-Narrow font
+   Contents: Helvetica-Narrow 10,12,14,18,24
+     Reqmts: none
+   Keywords: font
+   Filename: /pub/apple2/gs/gsos/font/fonts/helvetica.narrow.bsq
+
+A font called Apple.II, that mimics the 5x7 the 80-col text
+   Contents: 9,18, 38 point sizes
+     Reqmts: none
+   Keywords: font, Apple.II, text
+   Filename: /pub/apple2/gs/gsos/font/fonts/apple2font.bsq
+
+A mono font similar to Shaston
+   Contents: programmer.8
+     Reqmts: none
+   Keywords: font, mono
+   Filename: /pub/apple2/gs/gsos/font/fonts/programmer.8.bsc
+
+No description avaliable
+   Contents: No description avaliable
+     Reqmts: No description avaliable
+   Keywords: No description avaliable
+   Filename: /pub/apple2/gs/gsos/font/fonts/symbol.bsq
+
+No description avaliable
+   Contents: No description avaliable
+     Reqmts: No description avaliable
+   Keywords: No description avaliable
+   Filename: /pub/apple2/gs/gsos/font/fonts/times.bsq
+
+No description avaliable
+   Contents: No description avaliable
+     Reqmts: No description avaliable
+   Keywords: No description avaliable
+   Filename: /pub/apple2/gs/gsos/font/fonts/zaph.chancery.bsq
+
+No description avaliable
+   Contents: No description avaliable
+     Reqmts: No description avaliable
+   Keywords: No description avaliable
+   Filename: /pub/apple2/gs/gsos/font/fonts/zaph.dingbats.bsq
+
+the Palatino font
+   Contents: Palatino 10,12,14,18,24
+     Reqmts: none
+   Keywords: font, mousetext
+   Filename: /pub/apple2/gs/gsos/font/fonts/palatino.bsq
+
+Barcode font
+   Contents: FON font file
+     Reqmts: GS or //e and GS-font compatiable program
+   Keywords: Font, bar code
+   Filename: /pub/apple2/gs/gsos/font/fonts/code39barc.bsq
+

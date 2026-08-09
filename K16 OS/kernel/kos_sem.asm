@@ -107,22 +107,11 @@
 ; ============================================================================
 
 ; ============================================================================
-; SEM_POOL — 16 semaphores × 8 bytes each
-;
-; A semaphore handle is the absolute address (low word; page=$00) of
-; its 8-byte slot. Range: $0400..$0478 (last slot at $0478..$047F).
+; SEM_POOL - 16 semaphores x 8 bytes each.
+; The SEMPOOL region + slot field offsets (SEM_POOL_BASE/END, SEM_COUNT_MAX,
+; SEM_SLOT_SIZE, SEM_COUNT/HEAD/TAIL/FLAGS, SEM_FLAG_INUSE) now live in
+; kos_defs.inc. A handle is the absolute low-word address of an 8-byte slot.
 ; ============================================================================
-SEM_POOL_BASE   .EQU    $0400               ; first byte
-SEM_POOL_END    .EQU    $0480               ; one past last byte ($0400+128)
-SEM_COUNT_MAX   .EQU    16                  ; number of sem slots
-SEM_SLOT_SIZE   .EQU    8                   ; bytes per slot
-
-SEM_COUNT       .EQU    $00                 ; word — current count (signed)
-SEM_HEAD        .EQU    $02                 ; word — first waiter TCB ptr
-SEM_TAIL        .EQU    $04                 ; word — last waiter TCB ptr
-SEM_FLAGS       .EQU    $06                 ; word — flags
-
-SEM_FLAG_INUSE  .EQU    $0001
 
 ; --- _SemTakeTry return convention ------------------------------------------
 ; D0 result codes:
@@ -150,8 +139,7 @@ _InitSemPool:
                 LOADI   D1, #SEM_POOL_END - SEM_POOL_BASE
                 LOADI   D0, #0
 .zero_loop:
-                STOREB  D0, [XY0]
-                INC     XY0, #1
+                STOREB  D0, [XY0]+
                 SUB     D1, #1
                 BNE     .zero_loop
                 RET
@@ -683,6 +671,7 @@ _SemTakeBlocking:
 ; ============================================================================
 sys_semcreate:
                 DINT
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 ; V2 ABI saves done by _SemCreate internally, but we
                 ; still need to wrap DINT/EINT for atomicity.
                 ; (D2 is preserved by _SemCreate; D3, XY2 untouched.)
@@ -707,6 +696,7 @@ sys_semcreate:
                 EINT
 .sc_skip_eint:
                 POP     SR, XY3
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 RET
 
 ; ============================================================================
@@ -717,6 +707,7 @@ sys_semcreate:
 ; ============================================================================
 sys_semdestroy:
                 DINT
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
 
                 ; Part 36: _SemDestroy clobbers D1 (per its header) —
                 ; preserve caller's D1 across the boundary.
@@ -736,6 +727,7 @@ sys_semdestroy:
                 EINT
 .sd_skip_eint:
                 POP     SR, XY3
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 RET
 
 ; ============================================================================
@@ -746,6 +738,7 @@ sys_semdestroy:
 ; ============================================================================
 sys_semgive:
                 DINT
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
 
                 ; Part 36: _SemGive clobbers D1 (per its header) —
                 ; preserve caller's D1 across the boundary.
@@ -765,6 +758,7 @@ sys_semgive:
                 EINT
 .sg_skip_eint:
                 POP     SR, XY3
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 RET
 
 ; ============================================================================

@@ -108,6 +108,7 @@
 sys_kmalloc:
                 PUSH    D123, XY3
                 PUSH    XY1, XY3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
 
                 DINT
 
@@ -131,6 +132,7 @@ sys_kmalloc:
                 POP     SR, XY3                 ; restore C from _kmalloc
 
                 ; Restore caller's saved registers (POP doesn't touch flags).
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 POP     XY1, XY3
                 POP     D123, XY3
                 RET
@@ -144,6 +146,7 @@ sys_kfree:
                 PUSH    D1, XY3
                 PUSH    D2, XY3
                 PUSH    XY1, XY3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
 
                 DINT
 
@@ -164,6 +167,7 @@ sys_kfree:
 .skip_eint_f:
                 POP     SR, XY3                 ; restore C from _kfree
 
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 POP     XY1, XY3
                 POP     D2, XY3
                 POP     D1, XY3

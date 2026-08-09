@@ -1,13 +1,36 @@
 ; ============================================================================
 ; kosh.asm - kosh interactive shell (k/OS Phase 16.7+)
 ; ============================================================================
-; Date:    1 June 2026
-; Status:  Part 41 - kosh made re-entrant: per-shell working state moved out
-;          of kernel page $00 into the task page. Multiple kosh tasks can now
-;          run concurrently without corrupting each other's scratch.
+; Date:    8 August 2026
+; Status:  Part 61 - RAM disk populated from the host, not from kosh.
+; Revision: r45 - 8 August 2026 - Part 61: drive-qualified bare execution.
+;             .nds_switch now sets CD_BARE=1 before routing a colon token to
+;             .cd_resolve, so a token that resolves to a file (or to nothing)
+;             returns to .nds_nocolon and runs instead of reporting
+;             "cd: not a directory". Makes `ram:boot.ksh`, `b:hello.com` and
+;             `ram:hello` work; `cd ram:boot.ksh` still errors, as it should.
+;             kosh_ver_str bumped v1.01 -> v1.02. Requires kosh_defs.inc
+;             (CD_BARE) and kosh_cmds_fs.asm r27.
+; Revision: r44 - 8 August 2026 - Part 61: boot seeder removed. kosh no
+;             longer writes B:HELLO.COM and B:NOTES.TXT into the freshly
+;             formatted RAM disk. Deleted the .pop_h_* / .pop_n_* block from
+;             the entry path and the boot_hello_path / boot_notes_path /
+;             hello_com_image / notes_txt_image data block. Population now
+;             comes from A:STARTUP.KSH via the Part 57 boot cascade, using
+;             `load ramdisk/<name>` against the host's system/ramdisk folder
+;             (kosh_cmds_fs.asm r26 + kosh_defs.inc). That path is EMU-only:
+;             on Digital the host bridge is absent, so B: now comes up empty
+;             rather than carrying the two demo files.
+; Revision: r43 - 28 June 2026 - Part 50: `fg` command added — cmd_table tag 36
+;             + dispatch ladder entry -> .do_fg (body in kosh_cmds_sys.asm).
+;             Brings a task to the foreground by TID via TRAP_SETFOREGROUND.
+; Revision: r42 - 28 June 2026 - Part 49: msg_version bumped "kosh v1.0" ->
+;             "kosh v1.01" (the entry banner's own version line). The splash
+;             logo's "v1.01 Phase 49+" comes separately from the kernel
+;             identity slots (kos_boot.asm r54 / kosh_splash.asm r9).
 ; Revision: r41 - 1 June 2026 - Part 41: multi-shell re-entrancy fix.
 ;             The ~34 per-shell working slots (LS_*, DISK_*, CP_*, LOAD_*,
-;             VOL_*_TMP, GLOB_*, including the stray LS_SIZE_TMP) were
+;             VOL_*_TMP, GLOB_*, including the stray LS_SIZE) were
 ;             historically in kernel page $00 at $40xx-$46xx, accessed via
 ;             LOADZ/STOREZ. That was a singleton hangover from when kosh was
 ;             embedded in the kernel: every kosh task shared one copy, so a
@@ -60,7 +83,7 @@
 ;
 ;             Slots moved (+$2000): DUMP_PAGE/OFFS/LEN/ROW, ROW_BUF,
 ;             LS_DIRENT_BUF, CAT_BUF, LIST_BUF, LIST_BUF_END, CP_BUF,
-;             KOSH_CWD, KOSH_NORM_A, KOSH_NORM_B, RUN_BG_TMP,
+;             KOSH_CWD, KOSH_NORM_A, KOSH_NORM_B, RUN_BG,
 ;             SIZE_FMT_BUF.
 ;
 ;             Slots unchanged (page-$00, multi-shell race risk to fix
@@ -145,13 +168,13 @@
 ;             listed/matched it).
 ;
 ; Revision: r37 - 18 May 2026 - Part 34: page-$00 scratch additions:
-;               VOL_FREE_TMP   ($45FA) - free clusters per row
-;               VOL_TOTAL_TMP  ($45FC) - total clusters per row
+;               VOL_FREE   ($45FA) - free clusters per row
+;               VOL_TOTAL  ($45FC) - total clusters per row
 ;               SIZE_FMT_BUF   ($45FE..$460D) - 16-byte work area used by
 ;                                   _KoshEmitSize (kosh_helpers.asm r3) to
 ;                                   build human-readable size strings
 ;                                   before right-aligning into ROW_BUF.
-;               VOL_CLSZ_TMP   ($460E) - cluster size in bytes
+;               VOL_CLSZ   ($460E) - cluster size in bytes
 ;               LOAD_WRITTEN_LO/HI ($4610/$4612) - 32-bit cumulative for the
 ;                                   load command's partial-write report
 ;                                   (Part 34 sys_write returns D1=partial
@@ -289,9 +312,9 @@
 ;               synthesised moves; same-drive mv is a single TRAP_RENAME).
 ;
 ;           r24 - 11 May 2026 - Part 25: cmd_table tag 26 (cp).
-;             • New scratch slots CP_BUF ($43B8, 512 B), CP_SRC_FD_TMP,
-;               CP_DST_FD_TMP, CP_SRC_PATH_TMP, CP_DST_PATH_TMP. Sit
-;               above DISK_WALK_TMP and below LINE_BUF_OFF ($5000).
+;             • New scratch slots CP_BUF ($43B8, 512 B), CP_SRC_FD,
+;               CP_DST_FD, CP_SRC_PATH, CP_DST_PATH. Sit
+;               above DISK_WALK and below LINE_BUF ($5000).
 ;             • Dispatch ladder gains CMP #26 / BEQ .do_cp.
 ;             • cmd_table sentinel pushed down by one entry.
 ;
@@ -306,7 +329,7 @@
 ;               the catalogue. Persistent bay assignments live in INI
 ;               [Disks] as plain `C=name.kos`.
 ;             • Scratch layout updated: LIST_BUF (256 B kosh-page) at
-;               $42B0; DISK_DRIVE_TMP / DISK_SECTORS_TMP / DISK_WALK_TMP
+;               $42B0; DISK_DRIVE / DISK_SECTORS / DISK_WALK
 ;               at $43B2..$43B6 in page $00. Old DISK_SLOT_TMP /
 ;               DISK_COUNT_TMP / DISK_FLAGS_TMP gone (no slots in the
 ;               new model).
@@ -326,7 +349,7 @@
 ;             that ls had a long-standing bug clobbering D2/D3 across
 ;             _KoshEmitDec / _KoshEmitNamePadded. Fixed in
 ;             kosh_cmds_fs.asm by stashing drive/index in zero-page
-;             slots LS_DRIVE_TMP / LS_INDEX_TMP. Symptom was: ls
+;             slots LS_DRIVE / LS_INDEX. Symptom was: ls
 ;             always stopped after the first file (returned ERR_BADDRIVE
 ;             from sys_dirent on iter 2 due to bogus drive byte). Bug
 ;             was hidden because (a) until r17 there was only ever one
@@ -449,6 +472,31 @@
 ; ============================================================================
                 .ORG    $0200
 
+                JMP16   kosh_entry              ; $0200 - universal entry
+; --- .COM header (Part 60) -------------------------------------------------
+; $0200 is a JMP16 so the image stays directly executable with no loader at
+; all; the header follows at $0204 and is parsed separately, so a bad header
+; can never endanger control flow.  The loader REFUSES a bad magic - there is
+; no headerless fallback.  See kos_defs.inc for the full field description.
+;
+; Every field is a full WORD, and the block is emitted with .WORD only.  RM
+; 4.6 lists what .BYTE accepts - numeric literals, string literals, escape
+; sequences - and symbols are not among them, so `.BYTE COM_VERSION` is an
+; undefined-symbol error (RM 11: only immediates, .EQU and .WORD evaluate
+; expressions).  An all-.WORD block also cannot leave an odd byte count, so
+; it can never desynchronise the alignment of what follows.
+;
+; To change the page allocation, edit COM_PAGES / COM_HEAPPG - nothing else in
+; this file needs to know.
+COM_PAGES       .EQU    1       ; TOTAL contiguous pages, including heap
+COM_HEAPPG      .EQU    0       ; how many of those are heap (0 = task page)
+
+                .WORD   COM_MAGIC       ; $0204 - dumps as 52 42 "RB"
+                .WORD   COM_VERSION     ; $0206 - header version
+                .WORD   COM_PAGES       ; $0208 - total pages
+                .WORD   COM_HEAPPG      ; $020A - heap pages (partition of pages)
+; --- end of header; kosh_entry follows at $020C
+
 
 ; ============================================================================
 ; kosh_entry - the kosh user task body.
@@ -464,9 +512,9 @@
 ;
 ;   Layout inside the task page:
 ;     $0200..       code + tables + strings (this body, including
-;                   the .INCLUDEd command-group files)
-;     $4000..$465F  scratch (DUMP_*, ROW_BUF, LS_*, CAT_BUF, etc.)
-;     $5000..$504F  LINE_BUF (sys_gets target, 80 bytes)
+;                   the .INCLUDEd command-group files); ~32 KB runway
+;     $8000..       KCORE (persistent) / KBUFS (buffers) / KSTATE
+;                   (per-command scratch) - see kosh_defs.inc
 ;     $FFF0         task stack top (provided by _BuildTask)
 ;
 ;   String addressing: every string is referenced as
@@ -495,21 +543,20 @@ kosh_entry:
                 BRA     .reg_fail           ; halt - should never happen
 .reg_ok:
 
-                ; -- Zero per-shell state region (Part 41) ------------------
-                ; The kosh working slots (LS_*/DISK_*/CP_*/LOAD_*/VOL_*/GLOB_*)
-                ; moved from kernel page $00 ($4xxx) into THIS task's page at
-                ; $7000..$76FF, accessed via LOADP/STOREP Y3. Each kosh now has
-                ; private copies, so a second shell cannot corrupt the first.
-                ; A fresh task page inherits whatever was previously resident,
-                ; so clear the whole region (896 words) before first use.
+                ; -- Zero per-command scratch (KSTATE) ----------------------
+                ; The kosh working slots (LS_*/DISK_*/CP_*/LOAD_*/VOL_*/GLOB_*
+                ; etc.) live in THIS task's page in the KSTATE region, accessed
+                ; via LOADP/STOREP Y3. Each kosh has a private copy, so a second
+                ; shell cannot corrupt the first. A fresh task page inherits
+                ; whatever was previously resident, so clear KSTATE before first
+                ; use. KSTATE_START/KSTATE_WORDS track the region automatically.
                 ; (Clobbers D0/D1/X0/Y0 - all reloaded by CWD init below.)
-                LOADI   X0, #$7000
+                LOADI   X0, #KSTATE_START
                 MOVE    Y0, Y3
                 LOADI   D0, #0
-                LOADI   D1, #896             ; $700 bytes / 2 = $7000..$76FF
+                LOADI   D1, #KSTATE_WORDS  ; = KSTATE_SIZE/2 (region-driven)
 .zero_pss_loop:
-                STORED  D0, [XY0]
-                ADD     X0, #2
+                STORED  D0, [XY0]+
                 SUB     D1, #1
                 BNE     .zero_pss_loop
 
@@ -521,6 +568,10 @@ kosh_entry:
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_CWD
                 STOREB  D0, [XY0]
+                ; CWD directory cluster = 0 (root) at boot.
+                LOADI   D0, #0
+                LOADI   X0, #KOSH_CWD_CLU
+                STORED  D0, [XY0]
 
                 ; -- OS sign-on splash --------------------------------------
                 ; Clears screen and paints the k/OS sign-on (logo + live
@@ -536,103 +587,50 @@ kosh_entry:
                 TRAP    #TRAP_PUTS
 
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_version
+                LOADI   X0, #kosh_ver_str       ; shared version token
                 TRAP    #TRAP_PUTS
 
-                ; -- Populate B: with HELLO.COM and NOTES.TXT (r18) ----------
-                ; Runs from kosh task context, so sys_* TRAPs work normally
-                ; (FD_TABLE is in kosh's primary page, zeroed by _BuildTask;
-                ; CURRENT_TCB points to kosh's TCB; KERNEL_STATE = RUN).
-                ;
-                ; Idempotent: tries sys_open(..., READ) first; if it succeeds
-                ; the file already exists and we close + skip. If it returns
-                ; ERR_NOTFOUND we sys_open(..., CREATE|WRITE|TRUNC) and write.
-                ;
-                ; Path strings + image blobs live inside the kosh.com image
-                ; (kosh.asm assembles with .ORG $0200), so they're addressed
-                ; via Y0=Y3 (kosh task page) + X0=#label (in-page offset).
-                ;
-                ; D2 holds fd across the open/write/close trio (TRAP epilogue
-                ; runs in our task context - D2 is preserved across TRAPs in
-                ; the standard syscall ABI).
-
-                ; --- HELLO.COM ----------------------------------------------
                 MOVE    Y0, Y3
-                LOADI   X0, #boot_hello_path
-                LOADI   D0, #FOPEN_READ
-                TRAP    #TRAP_OPEN
-                BCS     .pop_h_create           ; not found -> create
-                ; Already exists. Close and skip.
-                MOVE    D2, D0
-                TRAP    #TRAP_CLOSE
-                BRA     .pop_h_done
+                LOADI   X0, #msg_ver_tail       ; " - type 'help'" + blank line
+                TRAP    #TRAP_PUTS
 
-.pop_h_create:
-                MOVE    Y0, Y3
-                LOADI   X0, #boot_hello_path
-                LOADI   D0, #OPEN_FLAGS_NEW
-                TRAP    #TRAP_OPEN
-                BCS     .pop_h_done             ; create failed -> silently skip
-                MOVE    D2, D0                  ; D2 = fd
-
-                MOVE    Y0, Y3
-                LOADI   X0, #hello_com_image
-                LOADI   D1, #hello_com_image_end-hello_com_image
-                MOVE    D0, D2
-                TRAP    #TRAP_WRITE
-                ; ignore write result - close anyway
-
-                MOVE    D0, D2
-                TRAP    #TRAP_CLOSE
-.pop_h_done:
-
-                ; --- NOTES.TXT ----------------------------------------------
-                MOVE    Y0, Y3
-                LOADI   X0, #boot_notes_path
-                LOADI   D0, #FOPEN_READ
-                TRAP    #TRAP_OPEN
-                BCS     .pop_n_create
-                MOVE    D2, D0
-                TRAP    #TRAP_CLOSE
-                BRA     .pop_n_done
-
-.pop_n_create:
-                MOVE    Y0, Y3
-                LOADI   X0, #boot_notes_path
-                LOADI   D0, #OPEN_FLAGS_NEW
-                TRAP    #TRAP_OPEN
-                BCS     .pop_n_done
-                MOVE    D2, D0
-
-                MOVE    Y0, Y3
-                LOADI   X0, #notes_txt_image
-                LOADI   D1, #notes_txt_image_end-notes_txt_image
-                MOVE    D0, D2
-                TRAP    #TRAP_WRITE
-
-                MOVE    D0, D2
-                TRAP    #TRAP_CLOSE
-.pop_n_done:
+; ----------------------------------------------------------------------------
+; Boot cascade: run STARTUP.KSH on A:/B:/C: in order (Part 57+)
+;   Arm the cascade (next drive = A) and open the first available STARTUP.KSH.
+;   _KoshCascadeAdvance skips unmounted drives / missing files silently and
+;   pushes the first it finds; the REPL below runs it, and re-arms for the next
+;   drive each time the script stack empties. With no STARTUP.KSH anywhere,
+;   SCRIPT_BOOT_DRV returns to 0 and we fall to the interactive prompt as before.
+; ----------------------------------------------------------------------------
+                LOADI   D0, #1
+                STOREP  D0, Y3, [#SCRIPT_BOOT_DRV]   ; arm: next drive = A
+                CALL16  _KoshCascadeAdvance          ; open first available
 
 ; ----------------------------------------------------------------------------
 ; Read-eval-print loop
 ; ----------------------------------------------------------------------------
 .repl_loop:
-                ; -- Prompt (Part 25 r4: builds "<CWD>:$ " + stale check) ---
-                CALL16  _KoshPrintPrompt
-
-                ; -- Read line into LINE_BUF --------------------------------
+                ; -- Line source: script (if active) or interactive ---------
+                ; If a script is running, pull its next executable line into
+                ; LINE_BUF (already echoed) and fall straight to dispatch;
+                ; otherwise prompt + sys_gets. Either way D0 = line length on
+                ; fall-through to .skip_ws. (kosh scripts, Part 57+.)
+                CALL16  _KoshScriptNextLine
+                BCC     .repl_have_line             ; C=0 -> script line ready
+                ; -- Interactive: prompt, then read line into LINE_BUF ------
                 ;   sys_gets:  XY0 = buffer ptr, D0 = max len
                 ;   returns:   D0 = actual length, C=0
+                CALL16  _KoshPrintPrompt
                 MOVE    Y0, Y3
-                LOADI   X0, #LINE_BUF_OFF
+                LOADI   X0, #LINE_BUF
                 LOADI   D0, #LINE_BUF_MAX
                 TRAP    #TRAP_GETS
+.repl_have_line:
 
                 ; -- Skip leading whitespace --------------------------------
                 ;   XY1 walks the buffer; D1 = remaining chars.
                 MOVE    Y1, Y3
-                LOADI   X1, #LINE_BUF_OFF
+                LOADI   X1, #LINE_BUF
                 MOVE    D1, D0
 .skip_ws:
                 CMP     D1, #0
@@ -741,6 +739,10 @@ kosh_entry:
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_CWD
                 STOREB  D3, [XY0]
+                ; Switching drive lands at that drive's root: reset cluster.
+                LOADI   D0, #0
+                LOADI   X0, #KOSH_CWD_CLU
+                STORED  D0, [XY0]
                 BRA     .repl_loop
 
 .drive_switch_bad:
@@ -751,6 +753,33 @@ kosh_entry:
                 BRA     .repl_loop
 
 .not_drive_switch:
+                ; -- Bare "<name>:" / "path:" token (named drives v2) --------
+                ; A first token containing ':' is a PATH, not a command word.
+                ; Usually it is a CWD target (ram:, fonts:, fonts:bold, B:) so
+                ; it goes to the cd resolver - but it may equally be a
+                ; drive-qualified executable (ram:boot.ksh, b:hello.com,
+                ; ram:hello). Part 61: CD_BARE=1 tells .cd_resolve that a
+                ; non-directory target here is not an error; it branches back
+                ; to .nds_nocolon and the token takes the ordinary
+                ; cmd_table-miss -> .unknown -> _KoshExecFile path, which also
+                ; gets the ".com" retry for free. Before this, `ram:boot.ksh`
+                ; died with "cd: not a directory" and the only way to launch a
+                ; drive-qualified name was `run`.
+                LEA     XY0, XY2
+.nds_scan:
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
+                BEQ     .nds_nocolon            ; nul, no ':' -> a real command
+                CMP     D0, #':'
+                BEQ     .nds_switch
+                INC     XY0, #1
+                BRA     .nds_scan
+.nds_switch:
+                LOADI   D0, #1                   ; Part 61: bare-token entry
+                STOREP  D0, Y3, [#CD_BARE]
+                LEA     XY0, XY2                 ; XY0 = whole token (path)
+                BRA     .cd_resolve
+.nds_nocolon:
 
                 ; -- Dispatch via cmd_table ---------------------------------
                 ;   cmd_table entries are 4 bytes each:
@@ -857,12 +886,102 @@ kosh_entry:
                 BEQ     .do_load
                 CMP     D0, #31
                 BEQ     .do_kill
+                CMP     D0, #32
+                BEQ     .do_mkdir
+                CMP     D0, #33
+                BEQ     .do_cd
+                CMP     D0, #34
+                BEQ     .do_pwd
+                CMP     D0, #35
+                BEQ     .do_rmdir
+                CMP     D0, #36
+                BEQ     .do_fg
+                CMP     D0, #37
+                BEQ     .do_assign
                 ; Unknown tag - fall through.
 
 .unknown:
+                ; Not a built-in. Try it as an implicit executable. The
+                ; command word (XY2) is the name; scan the remaining args
+                ; for a trailing '&' so "name &" backgrounds, exactly like
+                ; "run name.com &". _KoshExecFile appends ".com" on not-found.
+                ;
+                ; --- scan args region for a trailing '&' -> D3 (bg flag) ---
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN              ; XY0 left on the name nul
+                INC     XY0, #1                  ; -> first arg byte
+                LEA     XY1, XY0                 ; XY1 walks; XY0 = args start
+.unk_amp_end:
+                LOADB   D0, [XY1]
+                CMP     D0, #0
+                BEQ.S   .unk_amp_back
+                INC     XY1, #1
+                BRA     .unk_amp_end
+.unk_amp_back:
+                ; XY1 -> nul. Step back over trailing spaces; if the last
+                ; non-space byte is '&', it is a background launch.
+                LOADI   D3, #0                   ; bg = 0
+.unk_amp_sp:
+                CMP     X1, X0
+                BNE.S   .unk_amp_step
+                CMP     Y1, Y0
+                BEQ.S   .unk_have_bg             ; empty args -> fg
+.unk_amp_step:
+                DEC     XY1, #1
+                LOADB   D0, [XY1]
+                CMP     D0, #CH_SPACE
+                BEQ     .unk_amp_sp
+                CMP     D0, #'&'
+                BNE.S   .unk_have_bg
+                LOADI   D3, #1                   ; trailing '&' -> background
+
+                ; Part 26: REMOVE the '&'. It is a shell operator, not an
+                ; argument -- but this path only ever READ it, so it stayed in
+                ; the command string and was handed to the child as part of
+                ; its argv tail. `zork zork1.z3 &' reached the program as
+                ; "zork1.z3 &", which it then failed to open, printing the
+                ; error into a back-buffer nobody was looking at and exiting
+                ; immediately. .do_run has always nulled it ("It's an '&'.
+                ; Null it, set bg flag, trim preceding spaces"), so
+                ; `run zork.com zork1.z3 &' worked and the bare form did not.
+                ;
+                ; XY1 points AT the '&' here. Nulling alone is enough:
+                ; _KoshExecFile's .xf_sp_bk loop trims trailing spaces off the
+                ; arg tail, so no preceding-space walk is needed. When the '&'
+                ; was the only argument the tail collapses to empty and the
+                ; boundary-restore below correctly leaves the word isolated.
+                LOADI   D0, #0
+                STOREB  D0, [XY1]                ; drop the '&'
+.unk_have_bg:
+                ; Part 15: if args follow the command word, restore the word/args
+                ; boundary the dispatcher nul'd (first space) so the word + args are
+                ; one contiguous "prog args" string - the same shape .do_run hands
+                ; _KoshExecFile. XY0 = first arg byte (= word-nul + 1). If it is a nul
+                ; there are no args (dispatcher's sentinel guarantees a clean nul) -
+                ; leave the word isolated.
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
+                CMP     D0, #0
+                BEQ     .unk_no_args             ; no args -> leave word isolated
+                DEC     XY0, #1                  ; -> the nul between word and args
+                LOADI   D0, #CH_SPACE
+                STOREB  D0, [XY0]                ; restore the boundary space
+.unk_no_args:
+                LEA     XY0, XY2                 ; name = the command word (+ args)
+                CALL16  _KoshExecFile
+                BCC     .repl_loop               ; C=0 -> ran & reported
+                ; C=1 -> failed, D0 = ERR_*.
+                CMP     D0, #ERR_NOTFOUND        ; Z-flag test (not carry)
+                BNE.S   .unknown_execerr
+                ; Truly absent -> preserve the classic message.
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_unknown
                 TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+.unknown_execerr:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_run_execerr
+                CALL16  _KoshPrintErr
                 BRA     .repl_loop
 
 
@@ -897,6 +1016,7 @@ kosh_entry:
                 .INCLUDE "../kosh/kosh_cmds_fs.asm"
                 .INCLUDE "../kosh/kosh_cmds_disk.asm"
                 .INCLUDE "../kosh/kosh_splash.asm"   ; Part 30 - OS sign-on (moved from kernel)
+                .INCLUDE "../kosh/kosh_script.asm"   ; Part 57+ - .KSH script runner
 
 ; ============================================================================
 ; Kosh-internal helper subroutines (CALL24-callable).
@@ -979,6 +1099,18 @@ cmd_table:
                 .WORD   30                      ; tag: load        (kosh_cmds_fs.asm)
                 .WORD cmd_kill_str
                 .WORD   31                      ; tag: kill        (kosh_cmds_sys.asm)
+                .WORD cmd_mkdir_str
+                .WORD   32                      ; tag: mkdir       (kosh_cmds_fs.asm)
+                .WORD cmd_cd_str
+                .WORD   33                      ; tag: cd          (kosh_cmds_fs.asm)
+                .WORD cmd_pwd_str
+                .WORD   34                      ; tag: pwd         (kosh_cmds_fs.asm)
+                .WORD cmd_rmdir_str
+                .WORD   35                      ; tag: rmdir       (kosh_cmds_fs.asm)
+                .WORD cmd_fg_str
+                .WORD   36                      ; tag: fg          (kosh_cmds_sys.asm)
+                .WORD cmd_assign_str
+                .WORD   37                      ; tag: assign      (kosh_cmds_fs.asm)
                 .WORD   0                       ; sentinel
                 .WORD   0
 
@@ -990,7 +1122,11 @@ cmd_table:
 ;   strings live in their group's include file.
 ; ============================================================================
 msg_banner:    .TEXT   "k/OS shell\n",0
-msg_version:   .TEXT   "kosh v1.0 - type 'help'\n\n",0
+; kosh version - SINGLE SOURCE OF TRUTH. Emitted by the entry banner (above)
+; and by the `info` command (kosh_cmds_sys.asm references kosh_ver_str). Bump
+; this one line to change the version everywhere.
+kosh_ver_str:  .TEXT   "kosh v1.02",0
+msg_ver_tail:  .TEXT   " - type 'help'\n\n",0
 ; (Part 30 r37: msg_prompt removed - was "$ " from before the dynamic
 ;  "B:$ " CWD prompt landed. No call sites.)
 msg_unknown:   .TEXT   "?\n",0
@@ -1037,6 +1173,9 @@ err_name_table:
                 .WORD   $FFDF, err_name_baddrive
                 .WORD   $FFDE, err_name_nomore
                 .WORD   $FFDD, err_name_notexec
+                .WORD   $FFDC, err_name_notdir
+                .WORD   $FFDB, err_name_notempty
+                .WORD   $FFD8, err_name_badheader        ; Part 60
                 .WORD   $0000,  0                                   ; sentinel
 
 err_name_badcall:   .TEXT "ERR_BADCALL",0
@@ -1061,82 +1200,12 @@ err_name_io:        .TEXT "ERR_IO",0
 err_name_baddrive:  .TEXT "ERR_BADDRIVE",0
 err_name_nomore:    .TEXT "ERR_NOMORE",0
 err_name_notexec:   .TEXT "ERR_NOTEXEC",0
+err_name_notdir:    .TEXT "ERR_NOTDIR",0
+err_name_notempty:  .TEXT "ERR_NOTEMPTY",0
+err_name_badheader: .TEXT "ERR_BADHEADER",0
 err_name_unk:       .TEXT "ERR_UNKNOWN",0
                     .ALIGN 2
 
-
-; ============================================================================
-; Embedded disk content for fresh-boot population (r17, Phase 19)
-; ============================================================================
-; HELLO.COM + NOTES.TXT are written to the freshly-formatted RAM disk so
-; the user has something to `cat` and `run` immediately on first boot.
-; Phase 19 shim until kosh `cp` (and host save/load of the RAM disk image)
-; provide proper population.
-
-; Path strings for sys_open. Note 11-char "8.3" form: drive + "FILENAME.EXT".
-boot_hello_path:  .TEXT   "B:HELLO.COM",0
-boot_notes_path:  .TEXT   "B:NOTES.TXT",0
-
-; --- HELLO.COM image -------------------------------------------------------
-; 36-byte assembled output of Test/Test_hello.asm (built 7 May 2026).
-; Position-independent: uses LEA + page-zero TRAPs only.
-; Listing reference:
-;   $0200  1C 00 00 0A   LEA   XY0, hello_msg
-;   $0204  F0 18         TRAP  #TRAP_PUTLN  (#12)
-;   $0206  C0 00         LOADI D0, #0
-;   $0208  F0 20         TRAP  #TRAP_EXIT   (#16)
-;   $020A  8E 00 FF FC   BRA.L .hang  (-4, infinite loop guard)
-;   $020E..$0223         "Hello from sys_exec!" + nul + word-pad
-;
-; To rebuild: assemble Test/Test_hello.asm with `.INCLUDE "../kos_defs.inc"`,
-; copy bytes from the assembler listing's "Address  Code" columns. Total
-; 36 bytes (18 words). Ends at $0223 inclusive.
-;
-; r2 (8 May 2026): switched code blob from .BYTE pairs to .WORD per
-; userMemories byte-order rule. The previous .BYTE form transcribed the
-; listing word column directly (e.g. `$1C, $00` for word $1C00) - but
-; K16 is little-endian, so the actual stored bytes for word $1C00 are
-; low byte $00 first then high byte $1C. The wrong order caused HELLO
-; to fetch $001C as the first instruction (not LEA), executing garbage
-; and eventually hanging. .WORD does the byte-order conversion at
-; assemble time so the listing word value can be transcribed verbatim.
-hello_com_image:
-                .WORD   $1C00, $000A                ; LEA XY0, hello_msg
-                .WORD   $F01A                       ; TRAP #13 (PUTLN, was #12 pre-Part 20)
-                .WORD   $C000                       ; LOADI D0, #0
-                .WORD   $F036                       ; TRAP #27 (EXIT, was #16 pre-Part 20)
-                .WORD   $8E00, $FFFC                ; BRA.L .hang (-4)
-                .BYTE   "Hello from sys_exec!", 0, 0   ; msg + nul + word pad
-hello_com_image_end:
-                .ALIGN
-
-; --- NOTES.TXT image -------------------------------------------------------
-; Plain text greeting + cheat-sheet for `cat`. Length determined by the
-; (end - start) computation in the writer; no trailing nul needed (this
-; is a text file, not a zstring).
-;
-; Use .BYTE (not .TEXT) so the assembler doesn't round-pad each line -
-; that would inject $00 bytes mid-content. .BYTE advances PC by exact
-; byte count.
-;
-; ALIGNMENT NOTE:  the .ALIGN goes AFTER the _end label, not before. We
-; want (end - start) to equal the exact text length sys_write should
-; emit; an .ALIGN before _end would inflate that count by 1 if total
-; text bytes are odd, causing one stray pad byte to be written into the
-; file. The "label at odd address - may cause misalignment if used as
-; code target" warning the assembler emits for _end is benign here:
-; we only use _end in arithmetic (end-start), never branch to it.
-notes_txt_image:
-                .BYTE   "Welcome to k/OS!\n"
-                .BYTE   "\n"
-                .BYTE   "Try these commands:\n"
-                .BYTE   "  vol         - list mounted volumes\n"
-                .BYTE   "  ls          - list files on B:\n"
-                .BYTE   "  cat B:NOTES.TXT  - re-read this file\n"
-                .BYTE   "  run B:HELLO.COM  - execute the demo\n"
-                .BYTE   "  help        - all kosh commands\n"
-                .ALIGN
-notes_txt_image_end:
 
 ; ============================================================================
 ; End of kosh.asm

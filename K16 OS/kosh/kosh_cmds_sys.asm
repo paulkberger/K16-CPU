@@ -1,8 +1,31 @@
 ; ============================================================================
 ; kosh_cmds_sys.asm — kosh system-introspection commands
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 40 - dynamic version/phase in info banner.
+; Date:    Saturday, 1 August 2026
+; Status:  Part 60 - ps PAGE column becomes the full page RUN.
+;
+; Revision: r15 — Saturday, 1 August 2026 — Part 60: ps `PAGE` column widened
+;             to `PAGES` (5 -> 8) and now shows the whole run a task owns,
+;             not just its base page:
+;                 single page   "$08"
+;                 3-page run    "$08-0A"
+;             Multi-page tasks arrived with the .COM header's `pages` field,
+;             so TCB_PAGE_COUNT stopped being decorative: _PageInUse
+;             range-tests [TCB_SAVED_Y .. +TCB_PAGE_COUNT), and a base page
+;             alone no longer describes what a task holds. Reading a live ps
+;             and doing the arithmetic by hand is exactly how an allocator
+;             that is behaving correctly gets mistaken for one that is not.
+;             The idle TCB has PAGE_COUNT = 0 and prints "$00" via the
+;             single-page path - correct, it owns nothing.
+;             BLOCKS/BYTES untouched: those are kernel HEAP stats from
+;             sys_heapstats_by_tid and have nothing to do with pages.
+; Revision: r14 — 28 June 2026 — Part 50: `fg <tid>` command — .do_fg handler
+;             (mirrors .do_kill) calls TRAP_SETFOREGROUND; cmd_fg_str +
+;             msg_fg_usage/badarg/err_pfx. Needs kosh.asm r43 (tag 36).
+; Revision: r13 — 28 June 2026 — Part 50: ps `FG` column joined by a new `GFX`
+;             column — "Mn" for the task holding the video handle
+;             (VIDEO_OWNER_TID), n = its TCB_GFX_MODE, "-" otherwise. FG logic
+;             unchanged; GFX emit added after it. Header + legend updated.
 ;
 ; Revision: r12 — 29 May 2026 — Part 40: comments only — the version/phase
 ;             separator (shared splash_logo2b) tightened from two spaces
@@ -188,7 +211,7 @@
 ;   Walks the TCB pool (kernel page $00, $0800..$2780, step 128). Skips
 ;   TS_UNUSED slots. For each active slot prints:
 ;
-;       TID PTID NAME     ST FG PAGE TICKS
+;       TID PTID NAME     ST FG GFX PAGES   BLOCKS BYTES  TICKS
 ;
 ;   Columns:
 ;     TID   width 3, left-aligned, decimal task id
@@ -196,7 +219,16 @@
 ;     NAME  width 8, left-aligned, NUL-padded with spaces
 ;     ST    width 2, single letter from state_chars
 ;     FG    width 2, single letter: '*' fg shell, 's' bg shell, '-' other
-;     PAGE  width 5, "$nn" (primary page byte from TCB_SAVED_Y low byte)
+;     GFX   width 3, video owner + mode: 'Mn' holds screen (mode n), '-' none
+;     PAGES width 8, the page RUN this task owns:
+;               "-"       owns nothing (TCB_PAGE_COUNT = 0: a TS_DEAD
+;                         corpse, which released its run at death, or idle)
+;               "$nn"     single page  (TCB_PAGE_COUNT = 1)
+;               "$nn-mm"  a run        (mm = base + count - 1)
+;           Base is TCB_SAVED_Y's low byte, extent is TCB_PAGE_COUNT -
+;           the same two fields _PageInUse range-tests, so this column
+;           shows precisely what the allocator considers taken.
+;     BLOCKS/BYTES  kernel HEAP stats (sys_heapstats_by_tid) - NOT pages.
 ;     TICKS variable, left-aligned, 32-bit preempt counter, last column
 ;
 ;   State letters: R=ready, B=blocked, D=dead, U=unused (skipped),
@@ -374,36 +406,140 @@
                 LOADI   D0, #CH_SPACE
                 TRAP    #TRAP_PUTCHAR
 
-                ; --- PAGE column (5 wide, left-aligned "$nn"+2 spaces) --
-                ; Primary page byte = low byte of TCB_SAVED_Y.
-                ; Render "$nn" into ROW_BUF via _KoshEmitByteHex (same
-                ; idiom as .do_task), emit via TRAP_PUTS, then 2 spaces.
+                ; --- GFX column (4 wide) — graphics/video owner + mode ---
+                ;   "Mn" if this task holds the video handle (n = mode 1..3)
+                ;   "-"  otherwise.  VIDEO_OWNER_TID is the single screen
+                ;   handle; mode is read straight from the owner's
+                ;   TCB_GFX_MODE ($24 — outside imm5, mode-01 [XY+D]).
+                LOADI   Y0, #$00
+                MOVE    X0, D2
+                LOADD   D0, [XY0+#TCB_ID]       ; D0 = our TID
+                LOADZ   D1, [#VIDEO_OWNER_TID]  ; D1 = owner TID (0 = none)
+                CMP     D1, #0
+                BEQ     .ps_gfx_dash
+                CMP     D0, D1
+                BNE     .ps_gfx_dash
+
+                ; We hold the screen — emit 'M' + mode digit + 2 pad spaces.
+                LOADI   D0, #'M'
+                TRAP    #TRAP_PUTCHAR
+                LOADI   Y0, #$00
+                MOVE    X0, D2
+                LOADI   D1, #TCB_GFX_MODE
+                LOADD   D0, [XY0+D1]            ; D0 = mode (1..3)
+                LOW     D0
+                ADD     D0, #'0'                ; -> ASCII digit
+                TRAP    #TRAP_PUTCHAR
+                LOADI   D0, #CH_SPACE
+                TRAP    #TRAP_PUTCHAR
+                LOADI   D0, #CH_SPACE
+                TRAP    #TRAP_PUTCHAR
+                BRA     .ps_gfx_done
+
+.ps_gfx_dash:
+                ; Not the owner — '-' + 3 pad spaces (4-wide field).
+                LOADI   D0, #'-'
+                TRAP    #TRAP_PUTCHAR
+                LOADI   D0, #CH_SPACE
+                TRAP    #TRAP_PUTCHAR
+                LOADI   D0, #CH_SPACE
+                TRAP    #TRAP_PUTCHAR
+                LOADI   D0, #CH_SPACE
+                TRAP    #TRAP_PUTCHAR
+.ps_gfx_done:
+
+                ; --- PAGES column (8 wide, left-aligned) ----------------
+                ; Part 60: shows the whole run, not just the base.
+                ;     "-"       owns nothing  (1 char,  pad 7)
+                ;     "$nn"     single page   (3 chars, pad 5)
+                ;     "$nn-mm"  a run         (6 chars, pad 2)
+                ; Base = TCB_SAVED_Y low byte, extent = TCB_PAGE_COUNT -
+                ; the same two fields _PageInUse range-tests.
+                ;
+                ; Rendered into ROW_BUF via _KoshEmitByte/_KoshEmitByteHex
+                ; (same idiom as .do_task), which walk XY1 as a cursor and
+                ; clobber only D0 (D1 is pushed internally). D2 is the ps
+                ; loop's TCB cursor and must survive, so D3 carries the page
+                ; byte and then the pad count.
                 LOADI   Y0, #$00
                 MOVE    X0, D2
                 LOADD   D0, [XY0+#TCB_SAVED_Y]
                 LOW     D0
+                MOVE    D3, D0                  ; D3 = base page (D2 is the cursor!)
 
-                ; Build "$nn\0" in ROW_BUF.
+                LOADD   D0, [XY0+#TCB_PAGE_COUNT]
+                LOW     D0
+
+                ; Part 60: a TS_DEAD task has already released its run -
+                ; sys_exit/sys_kill zero TCB_PAGE_COUNT at death, keeping only
+                ; the exit status until reap. TCB_SAVED_Y survives, so
+                ; printing a base here would claim pages the corpse no longer
+                ; holds. Count 0 renders "-" and says so. (The idle TCB also
+                ; has count 0 and also owns nothing, so it gets the same
+                ; honest answer.)
+                CMP     D0, #0
+                BEQ     .ps_pg_none
+
+                PUSH    D0, XY3                 ; save count across the emits
+
+                ; Build "$nn" in ROW_BUF.
                 MOVE    Y1, Y3
                 LOADI   X1, #ROW_BUF
-                MOVE    D3, D0                  ; D3 = page byte (D2 is TCB cursor!)
                 LOADI   D0, #'$'
                 CALL16  _KoshEmitByte
                 MOVE    D0, D3
                 CALL16  _KoshEmitByteHex
+
+                POP     D0, XY3                 ; D0 = page count
+                CMP     D0, #2
+                BLO     .ps_pg_single           ; C=0 => count < 2, i.e. == 1
+                                                ; (count 0 was already routed
+                                                ;  to .ps_pg_none above)
+
+                ; Multi-page run: append "-mm", mm = base + count - 1.
+                PUSH    D0, XY3                 ; count survives the '-' emit
+                LOADI   D0, #'-'
+                CALL16  _KoshEmitByte
+                POP     D0, XY3
+                ADD     D0, D3                  ; base + count
+                SUB     D0, #1                  ; last page OF the run
+                CALL16  _KoshEmitByteHex        ; (preserves D3)
                 LOADI   D0, #0
                 CALL16  _KoshEmitByte
+                LOADI   D3, #2                  ; "$nn-mm" is 6 -> pad 2
+                BRA     .ps_pg_emit
 
-                ; Emit it.
+.ps_pg_single:
+                LOADI   D0, #0
+                CALL16  _KoshEmitByte
+                LOADI   D3, #5                  ; "$nn" is 3 -> pad 5
+                BRA     .ps_pg_emit
+
+.ps_pg_none:
+                ; No pages owned (TS_DEAD corpse, or idle). ROW_BUF has had
+                ; nothing written to it yet on this path, so build "-" from
+                ; scratch rather than truncating a half-built string.
+                MOVE    Y1, Y3
+                LOADI   X1, #ROW_BUF
+                LOADI   D0, #'-'
+                CALL16  _KoshEmitByte
+                LOADI   D0, #0
+                CALL16  _KoshEmitByte
+                LOADI   D3, #7                  ; "-" is 1 -> pad 7
+
+.ps_pg_emit:
                 MOVE    Y0, Y3
                 LOADI   X0, #ROW_BUF
                 TRAP    #TRAP_PUTS
 
-                ; 2 separator spaces after PAGE.
+.ps_pg_pad:
+                CMP     D3, #0
+                BEQ.S   .ps_pg_pad_done
                 LOADI   D0, #CH_SPACE
                 TRAP    #TRAP_PUTCHAR
-                LOADI   D0, #CH_SPACE
-                TRAP    #TRAP_PUTCHAR
+                SUB     D3, #1
+                BRA     .ps_pg_pad
+.ps_pg_pad_done:
 
                 ; --- BLOCKS column (7 wide, left-aligned) ----------------
                 ; --- BYTES  column (7 wide, left-aligned) ----------------
@@ -509,6 +645,7 @@
                 BRA     .ps_loop
 
 .ps_done:
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 
@@ -586,6 +723,76 @@
 
 
 ; ----------------------------------------------------------------------------
+; .do_fg — bring a task to the foreground by TID (Part 50).
+;
+;   Syntax: fg <tid>
+;
+;   Parses the decimal TID after "fg ", calls TRAP_SETFOREGROUND, and on
+;   failure prints "fg: <msg> [ERR_NAME $HHHH]\n". Success is silent — the
+;   foreground switch is self-evident (terminal/graphics tab follows).
+;
+;   sys_setforeground accepts any TF_FOCUSABLE target (a registered shell
+;   OR a graphics task, Part 49), so `fg` works on cube5/mandel as well as
+;   on background shells. kosh has TF_PRIV, so ERR_PERM here would be a boot
+;   bug.
+;
+;   Quick errors:
+;     no arg           -> "fg: usage: fg <tid>"
+;     non-numeric arg  -> "fg: bad TID (need decimal number)"
+;     unknown TID      -> ERR_NOTFOUND
+;     not focusable    -> ERR_INVALID   (task holds no shell/graphics handle)
+; ----------------------------------------------------------------------------
+.do_fg:
+                ; -- Locate args zstring (after "fg\0" in LINE_BUF) -----------
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN
+                INC     XY0, #1                 ; step past nul
+
+                ; Skip leading whitespace.
+.fg_skip_ws:
+                LOADB   D0, [XY0]
+                CMP     D0, #CH_SPACE
+                BNE.S   .fg_check_arg
+                INC     XY0, #1
+                BRA     .fg_skip_ws
+
+.fg_check_arg:
+                CMP     D0, #0
+                BEQ     .fg_usage
+
+                ; -- Parse the TID via KLIB_ATOI ------------------------------
+                CALL24  KLIB_ATOI
+                BCS     .fg_bad_arg
+                ; D0 = TID. sys_setforeground validates focusability.
+
+                ; -- Call sys_setforeground -----------------------------------
+                TRAP    #TRAP_SETFOREGROUND
+                BCS     .fg_err
+
+                ; Success — silent return to prompt.
+                BRA     .repl_loop
+
+.fg_usage:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_fg_usage
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.fg_bad_arg:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_fg_badarg
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.fg_err:
+                ; D0 = ERR_* code from sys_setforeground.
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_fg_err_pfx
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
 ; .do_info — current system state dashboard.
 ;
 ;   Part 30 r2 (14 May 2026): rewritten to share string symbols with
@@ -618,13 +825,34 @@
                 LOADI   X0, #splash_logo2b      ; " " (shared 1-space sep)
                 TRAP    #TRAP_PUTS
                 CALL16  _OSSplashPhase          ; "Phase 39+"
+                MOVE    Y0, Y3
+                LOADI   X0, #info_kos_built     ; "    (Built: "
+                TRAP    #TRAP_PUTS
+                CALL16  _OSKernBuild            ; kernel ISO date+time (slots)
+                MOVE    Y0, Y3
+                LOADI   X0, #info_built_close   ; ")"
+                TRAP    #TRAP_PUTS
                 LOADI   D0, #$0A
                 TRAP    #TRAP_PUTCHAR
 
-                ; --- Shell: kosh's own version (static) --------------------
+                ; --- Shell: kosh's own version (shared kosh_ver_str) -------
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_ver_full
+                LOADI   X0, #msg_shell_lbl
                 TRAP    #TRAP_PUTS
+                MOVE    Y0, Y3
+                LOADI   X0, #kosh_ver_str       ; shared version token (kosh.asm)
+                TRAP    #TRAP_PUTS
+                MOVE    Y0, Y3
+                LOADI   X0, #info_shell_built   ; "         (Built: " (col-aligned)
+                TRAP    #TRAP_PUTS
+                MOVE    Y0, Y3
+                LOADI   X0, #kosh_build_iso     ; kosh OWN ISO date+time (direct)
+                TRAP    #TRAP_PUTS
+                MOVE    Y0, Y3
+                LOADI   X0, #info_built_close   ; ")"
+                TRAP    #TRAP_PUTS
+                LOADI   D0, #$0A
+                TRAP    #TRAP_PUTCHAR
 
                 ; --- Host: -------------------------------------------------
                 MOVE    Y0, Y3
@@ -816,6 +1044,7 @@
                 LOADI   D0, #CH_LF
                 TRAP    #TRAP_PUTCHAR
 
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 
@@ -1042,6 +1271,7 @@
                 LOADI   D0, #CH_LF
                 TRAP    #TRAP_PUTCHAR
 
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 .tcb_bad:
@@ -1057,15 +1287,23 @@
 
 ; --- ver --------------------------------------------------------------------
 ; k/OS version + phase are now emitted dynamically by .do_info from the
-; page-$00 identity slots (Part 40). msg_ver_full carries only kosh's own
-; (static) version. info_kos_lbl is the dynamic line's label; the 1-space
+; page-$00 identity slots (Part 40). kosh's own version prints as
+; msg_shell_lbl + kosh_ver_str (the single-source version token, defined in
+; kosh.asm). info_kos_lbl is the dynamic line's label; the 1-space
 ; separator reuses splash_logo2b from kosh_splash.asm.
 info_kos_lbl:  .TEXT   "k/OS:     v", 0
-msg_ver_full:  .TEXT   "Shell:    kosh v1.0\n",0
+msg_shell_lbl: .TEXT   "Shell:    ",0          ; version follows via kosh_ver_str (kosh.asm)
+
+; Build-stamp fragments for the info k/OS + Shell lines. Leading spaces
+; column-align "(Built:" at col 30 for the current version/phase strings;
+; if those change length the k/OS line alignment drifts (dynamic content).
+info_kos_built:   .TEXT   "    (Built: ", 0
+info_shell_built: .TEXT   "         (Built: ", 0
+info_built_close: .TEXT   ")", 0
 
 ; --- ps ---------------------------------------------------------------------
 ; Header column widths (must match .do_ps emit code):
-;   "  TID PTID NAME     ST FG PAGE BLOCKS BYTES   TICKS\n"
+;   "  TID PTID NAME     ST FG GFX PAGES   BLOCKS BYTES  TICKS\n"
 ;     ^^^  ^^^^ ^^^^^^^^ ^^ ^^ ^^^^^ ^^^^^^^ ^^^^^^^ <var>
 ;     |    |    |        |  |  |     |       |
 ;     |    |    |        |  |  |     |       7 chars (digits + pad spaces)
@@ -1079,13 +1317,16 @@ msg_ver_full:  .TEXT   "Shell:    kosh v1.0\n",0
 ; Header uses "BLOCKS " / "BYTES  " (each 7 chars) so data columns line up
 ; with their headers. TICKS sits to the right of BYTES with no extra
 ; separator since both BYTES data and "BYTES  " header end in pad spaces.
-msg_ps_hdr:    .TEXT   "  TID PTID NAME     ST FG PAGE BLOCKS BYTES  TICKS\n",0
+msg_ps_hdr:    .TEXT   "  TID PTID NAME     ST FG GFX PAGES   BLOCKS BYTES  TICKS\n",0
 msg_ps_indent: .TEXT   "  ",0
 
 ; --- kill -------------------------------------------------------------------
 msg_kill_usage:    .TEXT  "kill: usage: kill <tid>\n",0
 msg_kill_badarg:   .TEXT  "kill: bad TID (need decimal number)\n",0
 msg_kill_err_pfx:  .TEXT  "kill:",0
+msg_fg_usage:      .TEXT  "fg: usage: fg <tid>\n",0
+msg_fg_badarg:     .TEXT  "fg: bad TID (need decimal number)\n",0
+msg_fg_err_pfx:    .TEXT  "fg:",0
 
 ; State letters indexed by TS_xxx (TS_READY=0, TS_BLOCKED=1, TS_DEAD=2,
 ; TS_UNUSED=3 (skipped, but indexable), TS_WAITING=4, TS_SEMWAIT=5).
@@ -1118,3 +1359,4 @@ cmd_ps_str:     .TEXT   "ps",0
 cmd_info_str:   .TEXT   "info",0
 cmd_task_str:   .TEXT   "task",0
 cmd_kill_str:   .TEXT   "kill",0
+cmd_fg_str:     .TEXT   "fg",0

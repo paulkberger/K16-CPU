@@ -68,11 +68,10 @@ _RawPuts:
                 LOADI   Y0, #TERMINAL_PAGE
                 LOADI   X0, #$0000          ; XY0 = terminal
 .loop:
-                LOADB   D0, [XY1]
+                LOADB   D0, [XY1]+
                 CMP     D0, #0
                 BEQ.S     .done
                 STOREB  D0, [XY0]
-                INC     XY1, #1
                 ADD     D1, #1
                 BRA     .loop
 .done:
@@ -147,9 +146,8 @@ _RawPutDec:
 .emit_loop:
                 CMP     D2, #0
                 BEQ.S     .emit_done
-                LOADB   D0, [XY1]
+                LOADB   D0, [XY1]+
                 STOREB  D0, [XY0]
-                INC     XY1, #1
                 SUB     D2, #1
                 BRA     .emit_loop
 .emit_done:

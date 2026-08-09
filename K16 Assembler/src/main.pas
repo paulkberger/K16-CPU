@@ -19,6 +19,10 @@ type
   { TFormMain }
 
   TFormMain = class(TForm)
+    ActionRegionTick: TAction;
+    ActionRegionSave: TAction;
+    ActionListingTick: TAction;
+    ActionSaveListing: TAction;
     ActionGenerateCOM: TAction;
     ActionGenerateHEX: TAction;
     ActionFileSave: TAction;
@@ -64,16 +68,23 @@ type
     SaveDialog: TSaveDialog;
     Separator1: TMenuItem;
     Separator3: TMenuItem;
+    seMapFile: TSynEdit;
     Splitter1: TSplitter;
     StatusBar1: TStatusBar;
     seEditSource: TSynEdit;
     seSourceListing: TSynEdit;
+    TabSheetMap: TTabSheet;
     TabSheetSource: TTabSheet;
     TabSheetListing: TTabSheet;
     TabSheetSettings: TTabSheet;
     ToolBar1: TToolBar;
     ToolButton1: TToolButton;
     ToolButton10: TToolButton;
+    ToolButton11: TToolButton;
+    ToolButton12: TToolButton;
+    ToolButton13: TToolButton;
+    ToolButton14: TToolButton;
+    ToolButton15: TToolButton;
     ToolButton2: TToolButton;
     ToolButton3: TToolButton;
     ToolButton4: TToolButton;
@@ -81,6 +92,7 @@ type
     ToolButton6: TToolButton;
     ToolButton7: TToolButton;
     ToolButton8: TToolButton;
+    ToolButton9: TToolButton;
     procedure ActionFileNewExecute(Sender: TObject);
     procedure ActionGenerateCOMExecute(Sender: TObject);
     procedure ActionGenerateHEXExecute(Sender: TObject);
@@ -103,6 +115,7 @@ type
      procedure UpdateCaption( ACaption : String );
      procedure UpdateStatusBarText;
      procedure OnAssemblerMessage(const Msg: string);
+     procedure UpdateSuccessActions( Enable: boolean);
   public
 
   end;
@@ -138,9 +151,7 @@ begin
      LoadFolder                 := Settings.ReadString('Inject','LoadFolder', '');
      FileNameEditROMdisk.FileName := Settings.ReadString('ROMDrive','File', '');
 
-     ActionGenerateROMs.Enabled := False;
-     ActionGenerateHEX.Enabled  := False;
-     ActionGenerateCOM.Enabled  := False;
+     UpdateSuccessActions( false );
 end;
 
 procedure TFormMain.PageControlChange(Sender: TObject);
@@ -194,9 +205,7 @@ begin
 
   if scModified in Changes then
   begin
-    ActionGenerateROMs.Enabled := False;
-    ActionGenerateHEX.Enabled  := False;
-    ActionGenerateCOM.Enabled  := False;
+    UpdateSuccessActions( false );
   end;
 end;
 
@@ -213,6 +222,7 @@ begin
      MemoOutput.Update;
 
      seSourceListing.Clear;
+     seMapFile.Clear;
 
      //Start Fresh
      FreeAndNil( K16Assembler );
@@ -227,10 +237,7 @@ begin
        begin
          MemoOutput.Lines.Add('' );
          MemoOutput.Lines.Add('Assembly successful!' );
-
-         ActionGenerateROMs.Enabled := True;
-         ActionGenerateHEX.Enabled  := True;
-         ActionGenerateCOM.Enabled  := True;
+         UpdateSuccessActions( true );
 
          if K16Assembler.HasWarnings then
          begin
@@ -238,20 +245,20 @@ begin
            MemoOutput.Lines.Add('Warnings:');
            MemoOutput.Lines.AddStrings( K16Assembler.WarningList );
          end;
-         //Assembler.GenerateIntelHex('program.hex');
-         //Assembler.GenerateBinary('program.bin');
 
+         MemoOutput.Lines.Add('Generating Listing...' );
          seSourceListing.Text := K16Assembler.GenerateListingText;
+
+         MemoOutput.Lines.Add('Generating Region Map...' );
+         seMapFile.Text := K16Assembler.GenerateRegionMapText;
+
+         MemoOutput.Lines.Add('Complete.' );
          PageControl.ActivePage := TabSheetListing;
          UpdateStatusBarText;
-         //Assembler.GenerateListing('program.lst');
 
        end else
        begin
-         ActionGenerateROMs.Enabled := False;
-         ActionGenerateHEX.Enabled  := False;
-         ActionGenerateCOM.Enabled  := False;
-
+         UpdateSuccessActions( false );
          MemoOutput.Lines.Add('' );
          MemoOutput.Lines.Add('Errors:');
          MemoOutput.Lines.AddStrings( K16Assembler.ErrorList );
@@ -301,9 +308,7 @@ begin
   MemoOutput.Lines.Clear;
 
   FreeAndNil( K16Assembler );
-  ActionGenerateROMs.Enabled := False;
-  ActionGenerateHEX.Enabled  := False;
-  ActionGenerateCOM.Enabled  := False;
+  UpdateSuccessActions( false );
 
   FileName := '';
   UpdateCaption('');
@@ -375,9 +380,10 @@ end;
 procedure TFormMain.ActionFileOpenExecute(Sender: TObject);
 begin
   OpenDialog.Filter :=
-    'K16 Assembly files (*.asm;*.K16)|*.asm;*.K16|' +
+    'K16 Assembly files (*.asm;*.inc;*.K16)|*.asm;*.inc;*.K16|' +
     'Kiama K16 files (*.K16)|*.K16|' +
     'Assembly files (*.asm)|*.asm|' +
+    'Include files (*.inc)|*.inc|' +
     'Text files (*.txt)|*.txt|' +
     'All files (*.*)|*.*';
   OpenDialog.FilterIndex := 1;
@@ -387,9 +393,7 @@ begin
     if FileExists(OpenDialog.FileName) then
     begin
       seEditSource.Lines.LoadFromFile(OpenDialog.FileName);
-      ActionGenerateROMs.Enabled := False;
-      ActionGenerateHEX.Enabled  := False;
-      ActionGenerateCOM.Enabled  := False;
+      UpdateSuccessActions( false );
       FileName := OpenDialog.FileName;
       UpdateCaption( FileName );
       PageControl.ActivePage := TabSheetSource;
@@ -403,9 +407,10 @@ end;
 procedure TFormMain.ActionFileSaveExecute(Sender: TObject);
 begin
   SaveDialog.Filter :=
-    'K16 Assembly files (*.asm;*.K16)|*.asm;*.K16|' +
+    'K16 Assembly files (*.asm;*.inc;*.K16)|*.asm;*.inc;*.K16|' +
     'Kiama K16 files (*.K16)|*.K16|' +
     'Assembly files (*.asm)|*.asm|' +
+    'Include files (*.inc)|*.inc|' +
     'Text files (*.txt)|*.txt|' +
     'All files (*.*)|*.*';
   SaveDialog.FilterIndex := 1;
@@ -443,6 +448,14 @@ begin
 
   Settings.UpdateFile;  // writes only if modified
   Settings.Free;
+end;
+
+procedure TFormMain.UpdateSuccessActions( Enable: boolean);
+begin
+  ActionGenerateROMs.Enabled := Enable;
+  ActionGenerateHEX.Enabled  := Enable;
+  ActionGenerateCOM.Enabled  := Enable;
+  ActionSaveListing.Enabled  := Enable;
 end;
 
 end.

@@ -35,6 +35,7 @@ type
 
     { Build address -> label-name map (labels only, not constants) }
     function  BuildAddressLabelMap: TDictionary<UInt32, string>;
+    function  IsBuildSymbol(const AName: string): Boolean;
 
     { Join a TArray<string> with a separator — local copy so unit is self-contained }
     function  JoinStrings(const Arr: TArray<string>; const Sep: string): string;
@@ -148,15 +149,32 @@ end;
 
 { ---- Section 1: Header ---- }
 
-procedure TK16ListingGenerator.WriteHeader(Listing: TStringList);
+function TK16ListingGenerator.IsBuildSymbol(const AName: string): Boolean;
 begin
+  // Reserved predefined build symbols (__DATE__, __YEAR__, ...) are build
+  // metadata, not program symbols — excluded from the human-facing symbol
+  // table and its count (their values are not addresses).
+  Result := AName.StartsWith('__') and AName.EndsWith('__');
+end;
+
+
+procedure TK16ListingGenerator.WriteHeader(Listing: TStringList);
+var
+  Sym: TSymbol;
+  UserSymCount: Integer;
+begin
+  UserSymCount := 0;
+  for Sym in FAsm.Symbols.Values do
+    if not IsBuildSymbol(Sym.Name) then
+      Inc(UserSymCount);
+
   Listing.Add('K16 CPU Assembly Listing');
   Listing.Add('========================');
   Listing.Add('Generated : ' + DateTimeToStr(Now));
   Listing.Add('');
   Listing.Add(Format('Source Lines  : %d', [FAsm.SourceLines.Count]));
   Listing.Add(Format('Instructions  : %d', [FAsm.MachineCode.Count]));
-  Listing.Add(Format('Symbols       : %d', [FAsm.Symbols.Count]));
+  Listing.Add(Format('Symbols       : %d', [UserSymCount]));
   Listing.Add(Format('Start Address : %.*X %.*X',
     [2, FAsm.StartAddress shr 16, 4, FAsm.StartAddress and $FFFF]));
   if FAsm.EntryPoint <> FAsm.StartAddress then
@@ -185,7 +203,8 @@ begin
   Sorted := TList<TSymbol>.Create;
   try
     for Sym in FAsm.Symbols.Values do
-      Sorted.Add(Sym);
+      if not IsBuildSymbol(Sym.Name) then
+        Sorted.Add(Sym);
 
     { Simple insertion sort — symbol counts stay small, O(n²) is fine. }
     for i := 0 to Sorted.Count - 2 do

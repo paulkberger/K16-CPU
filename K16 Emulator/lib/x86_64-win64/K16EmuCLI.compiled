@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<CONFIG>
-  <Compiler Value="C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe" Date="1533565110"/>
-  <Params Value="-MObjFPC -Scghi -O1 -gw3 -gl -l -vewnhibq &quot;-FuC:\Users\paul\iCloudDrive\CPU Play\K16 CPU\K16 Emulator\&quot; &quot;-FUC:\Users\paul\iCloudDrive\CPU Play\K16 CPU\K16 Emulator\lib\x86_64-win64\&quot; &quot;-FEC:\Users\paul\iCloudDrive\CPU Play\K16 CPU\K16 Emulator\&quot; &quot;-oC:\Users\paul\iCloudDrive\CPU Play\K16 CPU\K16 Emulator\K16EmuCLI.exe&quot; K16EmuCLI.lpr"/>
-</CONFIG>

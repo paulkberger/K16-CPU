@@ -1,9 +1,23 @@
 ; ============================================================================
 ; kos_defs.inc — k/OS shared constants (Phase 1, Phase 2, Phase 3)
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 40 — kernel identity (KOS_INFO_*) at $A300..$A30B.
-; Revision: r44 — 29 May 2026 — Part 40: added KOS_PHASE_TAG_PAGE ($A30A)
+; Date:    28 June 2026
+; Status:  Part 49 — graphics-task foreground integration.
+; Revision: r46 — 28 June 2026 — Part 50: TCB_SHELL_NEXT doc clarified — 0 means
+;               lone shell / not in ring; non-zero is the next shell's offset
+;               (no self-loop). Matches the .first_shell + splice/reap rework.
+; Revision: r45 — 28 June 2026 — Part 49: graphics tasks join the foreground
+;               ring. Added TF_GRAPHICS (TCB_FLAGS bit 4, $0010), TF_FOCUSABLE
+;               ($0018 = TF_HAS_BACKBUF | TF_GRAPHICS), and TCB_GFX_MODE (TCB
+;               field $24, mode-01). A task that acquires the screen via
+;               sys_setvidmode(mode!=0) is spliced into the shell ring and
+;               becomes foreground, so Ctrl-N cycling reaches it and the host
+;               (WebEMU) follows VID_MODE to the graphics tab. TCB_RESERVED
+;               start moved $24 -> $26. Requires kos_video.asm r2+,
+;               kos_switcher.asm r8+, kos_console.asm r15+, kos_tcb.asm r23+,
+;               kos_task.asm r19+.
+;
+;           r44 — 29 May 2026 — Part 40: added KOS_PHASE_TAG_PAGE ($A30A)
 ;               so the phase-tag pointer is published as a COMPLETE 24-bit
 ;               address. The kernel's ROM (code + ROM data, incl. the
 ;               phase-tag string) lives at page $FF (kos_boot.asm is
@@ -465,6 +479,7 @@
 ;  offset, since 24-bit immediates aren't directly loadable.)
 TERMINAL_PAGE   .EQU    $DF                 ; Page byte for terminal MMIO ($DF_0000)
 KEYBOARD_PAGE   .EQU    $DE                 ; Page byte for keyboard MMIO ($DE_0000)
+TERM_SIZE_PAGE  .EQU    $DB                 ; Page byte for terminal-geometry MMIO ($DB_0000, Part 15)
 
 ;-----------------------------------------------------------------------------
 ; Lookup table region (Digital has ROM here; EMU does not)
@@ -499,7 +514,12 @@ LOOKUP_PROBE_VAL .EQU   $2468               ; SHL($1234) = $2468
 ; $04D8-$04E3   FE scratch (Part 36 — relocated from $03BC after FE_NEW_PAGE
 ;               was found to overlap VOL_SLOT_F+$1C, smashing F:'s
 ;               VOL_BLOCKREAD_PTR on every sys_exec; see Gotcha 4.47)
-; $04E4-$07FF   Reserved (kernel growth)
+; $04E4-$05CD   FS path/rename/LFN scratch union (defined in kos_fs_defs.inc)
+; $05CE-$07CD   Assign / named-volume table (named drives v2 — kos_fs_defs.inc)
+; $07CE-$07D9   AS_CAND — named-volume prefix scan buffer (12 B)
+; $07DA-$07DF   ASGN_* — sys_assign argument stash (6 B)
+; $07E0-$07E1   FE_ARGV_OFF (Part 15 — sys_exec argv-tail offset stash)
+; $07E2-$07FF   Reserved (kernel growth — 30 B before TCB pool)
 ; $0800-$277F   TCB pool (63 × 128 bytes — idle + 62 user tasks)
 ; $2780-$27BF   KBD_RING_BUF  (Phase A: 64-byte keyboard ring)
 ; $27C0-$9FFD   Kernel work area
@@ -603,13 +623,18 @@ VEC_TRAP_FIRST  .EQU    $0024               ; TRAP #9 — first TRAP-style slot
 VEC_PUTCHAR     .EQU    $0028               ; TRAP #10
 VEC_GETCHAR     .EQU    $002C               ; TRAP #11
 VEC_PUTS        .EQU    $0030               ; TRAP #12
-VEC_PUTLN       .EQU    $0034               ; TRAP #13
+VEC_PUTLP       .EQU    $0034               ; TRAP #13
 VEC_GETS        .EQU    $0038               ; TRAP #14
 VEC_PUTDEC      .EQU    $003C               ; TRAP #15
 VEC_PUTHEX      .EQU    $0040               ; TRAP #16
 VEC_CLEAR       .EQU    $0044               ; TRAP #17
 VEC_SETCURSOR   .EQU    $0048               ; TRAP #18
-;                                             $004C..$0060 reserved (TRAP #19..#24)
+VEC_TERMSIZE    .EQU    $004C               ; TRAP #19 - sys_termsize
+VEC_SETATTR     .EQU    $0050               ; TRAP #20 - sys_setattr
+VEC_CLREOL      .EQU    $0054               ; TRAP #21 - sys_clreol
+VEC_CURSORVIS   .EQU    $0058               ; TRAP #22 - sys_cursorvis (Step 1)
+VEC_WHEREXY     .EQU    $005C               ; TRAP #23 - sys_wherexy
+VEC_CLREOS      .EQU    $0060               ; TRAP #24 - sys_clreos
 
 ; ── Task group ────────────────────────────────────── starts $0064 ──
 VEC_GETPID      .EQU    $0064               ; TRAP #25
@@ -647,28 +672,50 @@ VEC_FORMAT      .EQU    $0104               ; TRAP #65
 VEC_UNLINK      .EQU    $0108               ; TRAP #66
 VEC_RENAME      .EQU    $010C               ; TRAP #67
 VEC_DISKFREE    .EQU    $0110               ; TRAP #68 — sys_diskfree (Part 34)
-;                                             $0114..$0128 reserved (TRAP #69..#74)
+VEC_MKDIR       .EQU    $0114               ; TRAP #69 — sys_mkdir
+VEC_RESOLVE     .EQU    $0118               ; TRAP #70 — sys_resolve
+VEC_PWD         .EQU    $011C               ; TRAP #71 — sys_pwd
+VEC_RMDIR       .EQU    $0120               ; TRAP #72 — sys_rmdir
+;                                             $0124..$0128 reserved (TRAP #73..#74)
 
 ; ── Device group ──────────────────────────────────── starts $012C ──
 VEC_SETVIDMODE  .EQU    $012C               ; TRAP #75 (Part 20 — body lands later)
 VEC_SETFOREGROUND .EQU  $0130               ; TRAP #76 — sys_setforeground (Phase B Step 2)
 VEC_REGISTER_SHELL .EQU $0134               ; TRAP #77 — sys_register_shell (Phase B Step 1)
-;                                             $0138..$0150 reserved (TRAP #78..#84)
+VEC_ASSIGN      .EQU    $0138               ; TRAP #78 — sys_assign (named drives v2)
+VEC_KBHIT       .EQU    $013C               ; TRAP #79 — sys_kbhit (non-blocking key poll)
+;                                             $0140..$0150 reserved (TRAP #80..#84)
 
 ; ── Reserved tail $0154..$01FF (TRAP #85..#127) ───────────────────────────
 
 VEC_TABLE_END   .EQU    $0200               ; one past last slot
 
-;--- Kernel system variables (Phase 1) ---------------------------------------
-SYS_TICKS       .EQU    $0200               ; word — system tick counter
-SYS_TICKS_HI    .EQU    $0202               ; word — system tick counter (high word)
-                                            ; — Part 30 r36 (14 May 2026):
-                                            ; was SYS_FLAGS (unused, written 0
-                                            ; at boot, never read). Repurposed
-                                            ; to extend SYS_TICKS to 32 bits.
-                                            ; Wraps at ~4.5 years @ 30 Hz.
-KBD_HEAD        .EQU    $0204               ; word — keyboard ring head (write index)
-KBD_TAIL        .EQU    $0206               ; word — keyboard ring tail (read index)
+;--- Kernel system vars + scheduler globals + _BuildTask scratch -------------
+; Converted from scattered .EQUs to a single collision-checked region
+; (REGION spec v1.6). Addresses unchanged. Interleaved constants
+; (KBD_RING_*, KOS_TERM_*, KEY_CTRL_*, ...) remain as .EQU in their original
+; sections below. Reference fields by plain name or SYSVARS@FIELD.
+; --- Address space (.SPACE): this file's regions are 'kernel'-owned ---
+.SPACE kernel
+
+SYSVARS         .REGION $0200
+  SYS_TICKS       .RS 1w    ; $0200  word - system tick counter
+  SYS_TICKS_HI    .RS 1w    ; $0202  word - system tick counter (high word)
+                            ;   Part 30 r36 (14 May 2026): was SYS_FLAGS
+                            ;   (unused, written 0 at boot, never read).
+                            ;   Repurposed to extend SYS_TICKS to 32 bits.
+                            ;   Wraps at ~4.5 years @ 30 Hz.
+  KBD_HEAD        .RS 1w    ; $0204  word - keyboard ring head (write index)
+  KBD_TAIL        .RS 1w    ; $0206  word - keyboard ring tail (read index)
+  CURRENT_TCB     .RS 2w    ; $0208  word - running TCB ptr (low word + page)
+  READY_HEAD      .RS 2w    ; $020C  word - ready queue head (low word + page)
+  TASK_COUNT      .RS 1w    ; $0210  word - number of active tasks
+  BT_ENTRY_LO     .RS 1w    ; $0212  word - task entry low word
+  BT_ENTRY_PG     .RS 1w    ; $0214  word - entry page byte (low byte used)
+  BT_PRIMARY      .RS 1w    ; $0216  word - primary_page (low byte used)
+  BT_PCOUNT       .RS 1w    ; $0218  word - page_count (low byte used)
+  BT_PARENT_ID    .RS 1w    ; $021A  word - parent task id (0 = kernel)
+                .ENDREGION  ; SYSVARS_END=$021C  SYSVARS_SIZE=$1C
 
 ;--- Keyboard ring storage (Phase A — 13 May 2026) --------------------------
 ; 64-byte SPSC ring in the kernel work area. Power-of-two size lets
@@ -676,12 +723,21 @@ KBD_TAIL        .EQU    $0206               ; word — keyboard ring tail (read 
 ; (empty iff HEAD==TAIL; full iff (HEAD+1)&MASK==TAIL).
 ; Producer: _KbdTick inline in _TimerIRQ (kos_ctxsw.asm) via _RingPush.
 ; Consumer: sys_getchar → _RingWaitPop (kdrv/kos_kbd.asm).
-KBD_RING_BUF    .EQU    $2780               ; base of 64-byte ring storage
+KBDRING         .REGION $2780
+  KBD_RING_BUF    .RS 32w   ; $2780  64-byte SPSC keyboard ring storage
+                .ENDREGION  ; KBDRING_END=$27C0  KBDRING_SIZE=$40
 KBD_RING_MASK   .EQU    $003F               ; size 64 - 1; wraps HEAD/TAIL
 
 ;--- Phase B Step 1: terminal geometry & back-buffer sizing -----------------
 KOS_TERM_COLS   .EQU    80                  ; characters per row
 KOS_TERM_ROWS   .EQU    80                  ; rows per screen
+KOS_GRID_ROWS   .EQU    100                 ; Step 1 - physical ring rows (total)
+SURFACE_SIZE    .EQU    16000               ; 80 * 100 * 2 word-cells (literal)
+SURFACE_WORDS   .EQU    8000                ; SURFACE_SIZE / 2 (fill word count)
+ROW_STRIDE_B    .EQU    160                 ; 80 * 2 bytes per row
+ATTR_DEFAULT    .EQU    $07                 ; light-grey on black
+CELL_BLANK      .EQU    $0720               ; space + default attr (blank cell word)
+TERM_ROWS_DIGITAL .EQU  24                  ; Digital dumb-TTY fixed rows (no size MMIO; Part 15)
 BACKBUF_SIZE    .EQU    6400                ; bytes per shell back-buffer
                                             ; (80 cols * 80 rows; literal because
                                             ;  .EQU doesn't accept arithmetic).
@@ -723,35 +779,36 @@ KEY_CTRL_DIGIT_FIRST .EQU $81                ; range bounds for hot-key filter
 KEY_CTRL_DIGIT_LAST  .EQU $8A
 
 ;--- Scheduler globals (Phase 2) ---------------------------------------------
-CURRENT_TCB     .EQU    $0208               ; word — running TCB ptr (low word)
-READY_HEAD      .EQU    $020C               ; word — ready queue head (low word)
-TASK_COUNT      .EQU    $0210               ; word — number of active tasks
+; CURRENT_TCB ($0208) / READY_HEAD ($020C) / TASK_COUNT ($0210) now live in the
+; SYSVARS region above. Reference via the plain names or SYSVARS@CURRENT_TCB.
 
 ;--- _BuildTask scratch slots ($00:0212..$021A) -----------------------------
-BT_ENTRY_LO     .EQU    $0212               ; word — task entry low word
-BT_ENTRY_PG     .EQU    $0214               ; word — entry page byte (low byte used)
-BT_PRIMARY      .EQU    $0216               ; word — primary_page (low byte used)
-BT_PCOUNT       .EQU    $0218               ; word — page_count (low byte used)
-BT_PARENT_ID    .EQU    $021A               ; word — parent task id (0 = kernel)
+; BT_ENTRY_LO/_ENTRY_PG/_PRIMARY/_PCOUNT/_PARENT_ID ($0212..$021A) now live in
+; the SYSVARS region above. Reference via the plain names.
 
-;--- Host environment (Part 8) ----------------------------------------------
-KOS_HOST        .EQU    $021C               ; word — host type (low byte used)
+;--- Part 8 host env + sys_putdec scratch ($021C..$0223) --------------------
+; KOS_HOST (host type) and the 5-byte sys_putdec digit buffer are address-
+; contiguous; gathered into one region so the run is collision-checked.
+; HOST_* values and PUTDEC_BUF_END stay as constants.
+HOSTVARS        .REGION $021C
+  KOS_HOST        .RS 1w    ; $021C  word - host type (low byte used)
+  PUTDEC_BUF      .RS 5     ; $021E  sys_putdec digit buffer (5 bytes)
+                .ENDREGION  ; HOSTVARS_END=$0223  HOSTVARS_SIZE=$07
 HOST_UNKNOWN    .EQU    0
 HOST_DIGITAL    .EQU    1                   ; dumb-TTY, lookup ROMs populated
 HOST_EMU        .EQU    2                   ; VT100, lookup tables ALU-computed
-
-;--- sys_putdec scratch buffer (Part 8) -------------------------------------
-PUTDEC_BUF      .EQU    $021E               ; first byte of digit buffer
-PUTDEC_BUF_END  .EQU    $0223               ; one past last byte (5 bytes)
+PUTDEC_BUF_END  .EQU    HOSTVARS_END        ; $0223 - one past PUTDEC_BUF (compat)
 
 ;--- Kernel heap globals (Part 9) -------------------------------------------
 ; Set by _InitMemConfig at boot, used by _kmalloc/_kfree.
-KOS_PAGE_COUNT  .EQU    $0224               ; word — total RAM pages (low byte)
-KOS_KHEAP_BASE  .EQU    $0226               ; word — first heap page (always $01)
-KOS_KHEAP_END   .EQU    $0228               ; word — last heap page available
-HEAP_REGIONS    .EQU    $022A               ; word — count of active heap regions
-HEAP_BYTES_FREE .EQU    $022C               ; word — total free bytes (capped $FFFF)
-HEAP_FIRST_PAGE .EQU    $022E               ; word — page byte of first region (low byte)
+HEAPGLOBALS     .REGION $0224
+  KOS_PAGE_COUNT  .RS 1w    ; $0224  word - total RAM pages (low byte)
+  KOS_KHEAP_BASE  .RS 1w    ; $0226  word - first heap page (always $01)
+  KOS_KHEAP_END   .RS 1w    ; $0228  word - last heap page available
+  HEAP_REGIONS    .RS 1w    ; $022A  word - count of active heap regions
+  HEAP_BYTES_FREE .RS 1w    ; $022C  word - total free bytes (capped $FFFF)
+  HEAP_FIRST_PAGE .RS 1w    ; $022E  word - page byte of first region (low byte)
+                .ENDREGION  ; HEAPGLOBALS_END=$0230  HEAPGLOBALS_SIZE=$0C
 
 ;--- Heap walk scratch slots (Phase 14 Part 3 — relocated 17 May 2026) ------
 ; Used by _HeapStatsByTid and _ReapByTid. Page $00 scratch frees up
@@ -778,14 +835,28 @@ HEAP_FIRST_PAGE .EQU    $022E               ; word — page byte of first region
 ; The HEAP_SCRATCH0..3 entries from r38 (originally planned for snapshot
 ; stashes during the walks) are removed — the final code uses only
 ; HEAP_TID_QUERY and HEAP_RBT_REGION. The other four were dead.
-HEAP_TID_QUERY  .EQU    $03F0               ; word — target TID for walk
-HEAP_RBT_REGION .EQU    $03F2               ; word — region page (_ReapByTid: survives _kfree)
+HEAPSCRATCH     .REGION $03F0
+  HEAP_TID_QUERY  .RS 1w    ; $03F0  word - target TID for walk
+  HEAP_RBT_REGION .RS 1w    ; $03F2  word - region page (survives _kfree)
+                .ENDREGION  ; HEAPSCRATCH_END=$03F4  HEAPSCRATCH_SIZE=$04
 
-;--- Host-aware user-page ceiling (Part 9 — TCB pool expansion) -------------
-; Set by _InitMemConfig based on KOS_HOST. _AllocPage in kos_tcb.asm reads
-; this rather than using a literal compile-time TASK_PAGE_END. Digital
-; gets $1F (30 pages); EMU gets $41 (64 pages).
-KOS_USER_PAGE_END .EQU  $0230               ; word — runtime user-page ceiling (low byte)
+;--- Kernel runtime state ($0230..$023E) ------------------------------------
+; KOS_USER_PAGE_END: set by _InitMemConfig based on KOS_HOST. _AllocPage in
+; kos_tcb.asm reads this rather than a literal TASK_PAGE_END. Digital gets
+; $1F (30 pages); EMU gets $41 (64 pages).
+; The remaining fields were added piecemeal across Parts 9/13/20/22 and
+; Phase B; gathered here so the whole $0230..$023E run is collision-checked.
+; Each field's original section below keeps its notes with a pointer.
+RUNTIMESTATE    .REGION $0230
+  KOS_USER_PAGE_END .RS 1w    ; $0230  word - runtime user-page ceiling (low byte)
+  KERNEL_STATE      .RS 1w    ; $0232  word (low byte used)
+  HOST_DISK_SEM     .RS 1w    ; $0234  word - host-disk sem handle
+  VIDEO_OWNER_TID   .RS 1w    ; $0236  word - TID of video mode owner
+  FOREGROUND_TCB    .RS 1w    ; $0238  word - TID of foreground shell
+  FIRST_SHELL_TID   .RS 1w    ; $023A  word - TID of first registered shell
+  TICK_INCREMENT    .RS 1w    ; $023C  word (low byte used)
+  KBD_WAITER_TCB    .RS 1w    ; $023E  word - parked KBD reader TCB ptr (0=none)
+                .ENDREGION  ; RUNTIMESTATE_END=$0240  RUNTIMESTATE_SIZE=$10
 
 ;--- Kernel runtime state (Phase 13) ----------------------------------------
 ; Scheduler liveness flag. Used by routines that depend on timer IRQs and
@@ -801,7 +872,7 @@ KOS_USER_PAGE_END .EQU  $0230               ; word — runtime user-page ceiling
 ;
 ; Set to KERN_STATE_BOOT during _InitKernel; promoted to KERN_STATE_RUN by
 ; _IdleLoop just before its EINT. Once promoted, never demoted.
-KERNEL_STATE      .EQU  $0232               ; word (low byte used)
+; KERNEL_STATE now in the RUNTIMESTATE region ($0232).
 KERN_STATE_BOOT   .EQU  $00
 KERN_STATE_RUN    .EQU  $01
 
@@ -812,13 +883,13 @@ KERN_STATE_RUN    .EQU  $01
 ;
 ; (r31 — moved here from kos_fs_host.asm to colocate all page-$00 slot
 ; allocations in one registry; see r30 note re collision discovery.)
-HOST_DISK_SEM     .EQU  $0234               ; word — sem handle
+; HOST_DISK_SEM now in the RUNTIMESTATE region ($0234).
 
 ;--- Video driver state (Part 20) -------------------------------------------
 ; Owner of VID_MODE. 0 = unowned (text mode by default). When non-zero,
 ; holds the TID of the task that called sys_setvidmode(mode != 0). Cleared
 ; by sys_setvidmode(0) from owner, or by _VideoForceReset when owner dies.
-VIDEO_OWNER_TID   .EQU  $0236               ; word — TID of mode owner (low byte used)
+; VIDEO_OWNER_TID now in the RUNTIMESTATE region ($0236).
 
 ;--- Phase B Step 1: foreground-shell state ---------------------------------
 ; FOREGROUND_TCB holds the TID of the foreground shell (0 = no shell yet).
@@ -826,36 +897,68 @@ VIDEO_OWNER_TID   .EQU  $0236               ; word — TID of mode owner (low by
 ; (Step 2) and by hot-key dispatch (Step 6). Looked up via _TidToTcb when
 ; the TCB pointer is needed; we don't cache the pointer because lookups
 ; happen only on switch events (rare).
-FOREGROUND_TCB    .EQU  $0238               ; word — TID of foreground shell
+; FOREGROUND_TCB now in the RUNTIMESTATE region ($0238).
 
 ; FIRST_SHELL_TID is the anchor for Ctrl-digit direct-index switching.
 ; Set by sys_register_shell when it creates the first shell (the singleton
 ; self-loop case); never changed afterwards by the registration path. Ctrl-1
 ; walks 0 hops from this anchor, Ctrl-2 walks 1 hop, etc.
-FIRST_SHELL_TID   .EQU  $023A               ; word — TID of first registered shell
+; FIRST_SHELL_TID now in the RUNTIMESTATE region ($023A).
 
 ;--- Host-dependent tick increment (27 May 2026) ---------------------------
 ; Digital's hardware timer fires at 6 Hz to reduce IRQ overhead; EMU's
 ; timer fires at 30 Hz. To keep sys_sleep semantics consistent across
 ; hosts (30 ticks/sec on both), _TimerIRQ adds TICK_INCREMENT to
 ; SYS_TICKS each fire. _DetectHost sets this to 1 on EMU, 5 on Digital.
-TICK_INCREMENT    .EQU  $023C               ; word (low byte used)
+; TICK_INCREMENT now in the RUNTIMESTATE region ($023C).
+
+; KBD_WAITER_TCB — TCB pointer (page-$00 offset) of the single task parked
+; in _WaitInput on the keyboard ring (0 = none). Producer side: _RingPush
+; uses it directly as the TCB base to mark TS_READY, then clears it when a
+; byte lands. Single-waiter is correct: the foreground gate ensures only one
+; active keyboard consumer at a time. (Part 48)
+; KBD_WAITER_TCB now in the RUNTIMESTATE region ($023E).
 
 ;--- _BuildTask name buffer (r20) -------------------------------------------
 ; 32-byte inline buffer in page $00. Caller writes a zstring here before
 ; calling _BuildTask. If first byte is non-zero, _BuildTask copies up to
 ; 31 bytes into the new TCB's TCB_NAME field. Zero first byte = no name
 ; (TCB_NAME stays zero-filled).
-BT_NAME           .EQU  $0240               ; first byte of name buffer (32 B)
+BTNAME          .REGION $0240
+  BT_NAME         .RS 16w   ; $0240  32-byte inline task-name buffer
+                .ENDREGION  ; BTNAME_END=$0260  BTNAME_SIZE=$20
 
-;--- TCB pool ----------------------------------------------------------------
-TCB_POOL_BASE   .EQU    $0800               ; first TCB at $00:0800
-TCB_POOL_COUNT  .EQU    63                  ; 1 idle + 62 user tasks
+;--- Semaphore pool ($0400..$0480: 16 x 8) ----------------------------------
+; Relocated from kos_sem.asm (page-$00 defs belong in the .inc, not the .asm).
+; A semaphore handle is the absolute low-word address of its 8-byte slot.
+SEM_COUNT_MAX   .EQU    16                  ; number of sem slots (value)
+SEM_SLOT_SIZE   .EQU    8                   ; bytes per slot (value)
+
+SEMPOOL         .REGION $0400
+  SEM_POOL_BASE   .RS SEM_COUNT_MAX * SEM_SLOT_SIZE  ; $0400  16 x 8 = 128 B
+                .ENDREGION  ; SEMPOOL_END=$0480  SEMPOOL_SIZE=$80
+SEM_POOL_END    .EQU    SEMPOOL_END         ; $0480 (compat; one past last)
+
+; slot field offsets (0-based within an 8-byte slot)
+SEM_COUNT       .EQU    $00                 ; word - current count (signed)
+SEM_HEAD        .EQU    $02                 ; word - first waiter TCB ptr
+SEM_TAIL        .EQU    $04                 ; word - last waiter TCB ptr
+SEM_FLAGS       .EQU    $06                 ; word - flags
+SEM_FLAG_INUSE  .EQU    $0001
+
+;--- TCB pool ($0800..$277F: 63 x 128 = idle + 62 user) ---------------------
+; Value constants first so the region's .RS expressions resolve.
 TCB_SIZE        .EQU    128                 ; bytes per TCB
-TCB_POOL_END    .EQU    $2780               ; one past last TCB
-USER_TCB_BASE   .EQU    $0880               ; first user TCB ($0800 = idle)
+TCB_POOL_COUNT  .EQU    63                  ; 1 idle + 62 user tasks
 USER_TCB_COUNT  .EQU    62                  ; user tasks (Digital runtime-caps at 30)
-IDLE_TCB        .EQU    $0800               ; idle TCB lives at slot 0
+
+TCBPOOL         .REGION $0800
+  IDLE_TCB        .RS TCB_SIZE                  ; $0800  slot 0 (idle)
+  USER_TCB_BASE   .RS USER_TCB_COUNT * TCB_SIZE ; $0880  first user TCB, 62 slots
+                .ENDREGION  ; TCBPOOL_END=$2780  TCBPOOL_SIZE=$1F80
+
+TCB_POOL_BASE   .EQU    TCBPOOL_START       ; $0800  (compat; == IDLE_TCB)
+TCB_POOL_END    .EQU    TCBPOOL_END         ; $2780  (compat; one past last TCB)
 
 ;--- TCB field offsets (v2.4 — word-granular throughout) --------------------
 TCB_SAVED_X     .EQU    $00                 ; word — saved X3 (stack pointer)
@@ -903,14 +1006,37 @@ TCB_PREEMPT_COUNT_HI .EQU $22               ; word — high word of preempt coun
                                             ;        non-adjacent words. Wraps at
                                             ;        ~4 years of continuous timer
                                             ;        IRQs at 30Hz.
-TCB_RESERVED    .EQU    $24                 ; 40 bytes ($24..$4B) — growth space.
+TCB_GFX_MODE    .EQU    $24                 ; word — graphics task's VID_MODE value,
+                                            ;        saved on acquire so the foreground
+                                            ;        switcher can rewrite VID_MODE when
+                                            ;        the cycle lands back on this task.
+                                            ;        Meaningful only when TF_GRAPHICS
+                                            ;        is set; zeroed on release / reap.
+                                            ;        $24 is outside imm5 (0..31) — use
+                                            ;        mode-01 [XY+D] addressing.
+; Part 16 CWD: sys_open resolves relative paths against a per-task CWD (drive +
+; start cluster) held in the TCB and inherited at exec. A caller passes CWD_SELF
+; as the CWD-drive arg to mean "use my task's CWD"; sys_open then reads TCB_CWD_*.
+CWD_SELF        .EQU    $FF                 ; sentinel CWD-drive value = "use my TCB CWD"
+TCB_CWD_DRIVE   .EQU    $26                 ; word - task CWD drive index (Part 16). Zeroed by
+                                            ;        _BuildTask; set by sys_exec (inherited)
+                                            ;        or left 0 (A: root). >imm5 - use [XY+D].
+TCB_CWD_CLU     .EQU    $28                 ; word - task CWD start cluster (0 = root).
+TCB_CURSOR_VIS  .EQU    $2A                 ; word - 1 = cursor visible (Step 1 surface hdr)
+TCB_CUR_ATTR    .EQU    $2C                 ; word - current attribute, stamped into cells
+TCB_TOP_ROW     .EQU    $2E                 ; word - ring: physical index of visible row 0
+TCB_VIS_ROWS    .EQU    $30                 ; word - cached visible row count (from termsize)
+TCB_RENDER_ATTR .EQU    $32                 ; word - repaint: last SGR attr emitted (renderer scratch)
+TCB_RESERVED    .EQU    $34                 ; 24 bytes ($34..$4B) — growth space.
                                             ;        Phase B Step 1 narrowed this
                                             ;        from 62 to 42 bytes by claiming
                                             ;        $4C..$53 for the four shell
                                             ;        fields below. 13 May 2026: a
                                             ;        further 2 bytes claimed at $22
                                             ;        for TCB_PREEMPT_COUNT_HI.
-                                            ;        Anything new in $24..$4B
+                                            ;        28 June 2026: $24 claimed for
+                                            ;        TCB_GFX_MODE (graphics foreground).
+                                            ;        Anything new in $26..$4B
                                             ;        remains fair game.
 
 ;--- Phase B Step 1: per-shell TCB fields -----------------------------------
@@ -925,8 +1051,8 @@ TCB_BACKBUF_PAGE .EQU   $4E                 ; word — back-buffer page byte (lo
                                             ;        (zero if TF_HAS_BACKBUF unset)
 TCB_SHELL_NEXT   .EQU   $50                 ; word — page-$00 offset of next shell TCB
                                             ;        in the circular shell ring
-                                            ;        (zero if not in ring; self-offset
-                                            ;         if singleton).
+                                            ;        (0 = lone shell / not in ring;
+                                            ;         non-zero = next shell's offset)
 TCB_BACKBUF_CRSR .EQU   $52                 ; word — packed cursor for back-buffer:
                                             ;        high byte = row (0..29)
                                             ;        low  byte = col (0..79)
@@ -942,6 +1068,7 @@ TS_DEAD         .EQU    2                   ; exited, awaiting cleanup
 TS_UNUSED       .EQU    3                   ; slot is free, available
 TS_WAITING      .EQU    4                   ; blocked in sys_wait
 TS_SEMWAIT      .EQU    5                   ; blocked on a counting semaphore (Part 20b)
+TS_BLOCKED_ON_INPUT .EQU 6                  ; blocked in _WaitInput, parked on the KBD ring (Part 48)
 
 ;--- TCB_FLAGS bit values ----------------------------------------------------
 ; Stored in the word at TCB+$12. Bits 2..15 reserved for future use.
@@ -982,6 +1109,58 @@ TF_HAS_BACKBUF       .EQU $0008              ; bit 3 — task is a registered sh
                                              ; Set by sys_register_shell; cleared
                                              ; on task death by _HandleDeadTCB
                                              ; (Phase B Step 10).
+TF_GRAPHICS          .EQU $0010              ; bit 4 — task owns the graphics screen.
+                                             ; Set by sys_setvidmode(mode!=0); the
+                                             ; task is spliced into the foreground
+                                             ; ring and participates in Ctrl-N
+                                             ; cycling exactly like a shell, but has
+                                             ; NO back-buffer. _GetGatedKey gates its
+                                             ; keyboard reads on FOREGROUND_TCB just
+                                             ; as for a shell. Its VID_MODE is saved
+                                             ; in TCB_GFX_MODE and rewritten by
+                                             ; _CommitForeground when the cycle lands
+                                             ; back on it (host follows VID_MODE to
+                                             ; the graphics tab). Cleared by
+                                             ; sys_setvidmode(0) and by _ReapDeadTask.
+
+TF_AUTOFG            .EQU $0020              ; bit 5 — auto-foreground this task
+                                             ; when it registers as a shell. Set
+                                             ; by sys_exec from the EXEC_FOREGROUND
+                                             ; exec-flag; consumed and cleared by
+                                             ; sys_register_shell (Part 51).
+
+TF_DETACH_PENDING    .EQU $0040              ; bit 6 — a registering shell could
+                                             ; not find its launcher, so it left
+                                             ; this note on ITS OWN TCB instead.
+                                             ; sys_wait tests it before blocking
+                                             ; and returns ERR_DETACHED at once.
+                                             ;
+                                             ; Part 26. Before this, the detach
+                                             ; was PUSH-ONLY: sys_register_shell
+                                             ; called _FindWaiterFor and, if the
+                                             ; launcher had not reached sys_wait
+                                             ; yet, silently gave up. The launcher
+                                             ; then blocked forever on a child
+                                             ; that never exits. Which side won
+                                             ; the race depended on image size and
+                                             ; page count -- kedit won it, a
+                                             ; four-page Pascal task lost it, and
+                                             ; nothing about either program said
+                                             ; so. The flag makes the rendezvous
+                                             ; two-sided: whoever arrives second
+                                             ; completes it, and it no longer
+                                             ; matters which that is.
+                                             ; One-shot; cleared by the consumer.
+
+; Convenience masks. Pre-combined as literals because the K16 assembler
+; doesn't accept `|` in expressions; disjoint single bits, so the value is
+; just the bitwise OR.
+TF_FOCUSABLE         .EQU $0018              ; TF_HAS_BACKBUF | TF_GRAPHICS — "may
+                                             ; hold the foreground". Tested wherever
+                                             ; ring membership / foreground eligibility
+                                             ; is decided (the switcher walks, the
+                                             ; getchar gate, the reap unlink, the
+                                             ; sys_exit eager-reap decision).
 
 ; Convenience: combined flag mask written by kosh into its own TCB_FLAGS
 ; immediately after _BuildTask returns. Pre-combined here because the K16
@@ -1032,17 +1211,16 @@ RESET_VECTOR    .EQU    $FF0000             ; 24-bit absolute reset entry
 ;     LOADZ   D0, [#KOS_PHASE_TAG_PTR]  ; D0 = 16-bit offset within $FF
 ;     MOVE    X0, D0
 ;     TRAP    #TRAP_PUTS                ; sys_puts honours the Y0 page byte
-KOS_VERSION       .EQU  $A300             ; word - high byte = major, low byte = minor
-                                          ;        (e.g. $0100 = v1.0)
-KOS_BUILD_YEAR    .EQU  $A302             ; word - build year (e.g. 2026)
-KOS_BUILD_MONTH   .EQU  $A304             ; word - build month 1..12 (low byte used)
-KOS_BUILD_DAY     .EQU  $A306             ; word - build day 1..31 (low byte used)
-KOS_PHASE_TAG_PTR .EQU  $A308             ; word - 16-bit OFFSET of phase-tag
-                                          ;        string within the kernel ROM page
-KOS_PHASE_TAG_PAGE .EQU $A30A             ; word - kernel ROM page byte ($FF) for the
-                                          ;        phase-tag string (low byte used).
-                                          ;        Pair with KOS_PHASE_TAG_PTR for the
-                                          ;        full 24-bit address.
+KOSINFO         .REGION $A300
+  KOS_VERSION        .RS 1w  ; $A300  high byte=major, low byte=minor (e.g. $0100)
+  KOS_BUILD_YEAR     .RS 1w  ; $A302  build year (e.g. 2026)
+  KOS_BUILD_MONTH    .RS 1w  ; $A304  build month 1..12 (low byte used)
+  KOS_BUILD_DAY      .RS 1w  ; $A306  build day 1..31 (low byte used)
+  KOS_PHASE_TAG_PTR  .RS 1w  ; $A308  16-bit OFFSET of phase-tag string in kernel ROM
+  KOS_PHASE_TAG_PAGE .RS 1w  ; $A30A  kernel ROM page byte ($FF); pair with _PTR
+  KOS_BUILD_STR_PTR  .RS 1w  ; $A30C  offset of kernel build-stamp string in ROM
+  KOS_BUILD_STR_PAGE .RS 1w  ; $A30E  ROM page byte ($FF); pair with _PTR
+                .ENDREGION  ; KOSINFO_END=$A310  KOSINFO_SIZE=$10
 ;--- Pages ------------------------------------------------------------------
 IDLE_PAGE       .EQU    $00                 ; idle task lives in kernel page
 KHEAP_PAGE      .EQU    $01                 ; kernel heap region #1 (always)
@@ -1064,6 +1242,102 @@ KHEAP_POOL_END_EMU  .EQU $FF                ; last growth-pool page on EMU
 ;--- sys_spawn constants ----------------------------------------------------
 SPAWN_ENTRY_OFFSET .EQU $0200               ; child's PC starts at primary:$0200
 SPAWN_MAX_LEN      .EQU $FE00               ; max copy length
+
+;--- .COM image header (Part 60) --------------------------------------------
+; Every .COM carries a fixed 12-byte header at the image start, i.e. at
+; <page>:$0200 once loaded.
+;
+;   $0200  JMP16   __start        2 words
+;   $0204  .WORD   $4252          magic - dumps as 52 42 = "RB"
+;   $0206  .WORD   1              header version
+;   $0208  .WORD   pages          TOTAL contiguous pages, INCLUDING heap
+;   $020A  .WORD   heapPages      how many of those are heap (0 = task page)
+;   $020C  __start:
+;
+; EVERY FIELD IS A FULL WORD.  Byte-packing two fields per word would need
+; little-endian packing arithmetic to emit and byte reads to parse, for no
+; saving - the header is 12 bytes either way.  Word fields also match the
+; rest of k/OS: TCB_SAVED_Y, TCB_PAGE_COUNT, BT_PRIMARY and BT_PCOUNT are
+; all "word, low byte used", so pages and heapPages travel from header to
+; TCB without ever changing width.
+;
+; There are no reserved fields.  The header can grow later precisely because
+; the JMP16 comes first and never moves, so reserving space for a future that
+; may not arrive buys nothing.
+;
+; WHY THE JUMP COMES FIRST AND NOT THE HEADER.  If the header led, the loader
+; would have to correctly parse a header field to know where to jump - so an
+; unrecognised version, or any parse error, would mean computing a jump target
+; from data it has just admitted it cannot interpret.  With JMP16 at a fixed
+; offset:
+;   - SPAWN_ENTRY_OFFSET is unchanged and _BuildTask needs no edit;
+;   - header parsing can fail cleanly without ever endangering control flow;
+;   - a .COM stays DIRECTLY EXECUTABLE - jump to $0200 from a debugger, a test
+;     harness or Digital with no loader at all, which matters while the
+;     multi-page path is new and a failure needs bisecting between loader and
+;     program;
+;   - the header can grow later without touching the entry mechanism.
+;
+; JMP16 (not JMP24): JMP24 encodes an absolute 24-bit address embedding the
+; ASSEMBLER's page byte ($00), which would land in kernel space at runtime
+; since the .COM's page byte is chosen by the loader.  JMP16 stays in the
+; current code page - exactly what is wanted.  FORTH30.asm and BASIC25.asm
+; have both always opened this way; the header simply formalises it.
+;
+; THE MAGIC'S JOB IS REJECTION, NOT COMPATIBILITY.  Every .COM carries a
+; header, so the magic exists so that `run readme.txt` produces a clean loader
+; error instead of executing text at $0200.  The loader REFUSES on a bad
+; magic - it does not fall back to assuming one page.  Flag day, no grace
+; period: kernel, kosh and every tool .COM are rebuilt together.
+;
+; heapPages is a PARTITION of pages, not an addition to it.  pages is the
+; allocation quantity, so the same number appears in three places: what
+; _AllocPageRun allocates, what TCB_PAGE_COUNT records for _PageInUse's range
+; test, and what a task reads back from its own header.  Splitting it into two
+; numbers would leave the header disagreeing with the TCB.  The field is
+; validated but otherwise unused until the far heap lands; it is nailed down
+; NOW because changing it later means rebuilding every .COM a second time.
+;
+; Bare metal is exempt: --bare builds at .ORG $FF0000 have no k/OS loader, so
+; header emission is keyed off the k/OS target.
+;
+; COM_OFF_* are relative to the IMAGE BASE - the byte that lands at $0200 -
+; so they address a file buffer as readily as a loaded page.
+COM_HDR_SIZE    .EQU    12                  ; bytes $0200..$020B
+COM_OFF_MAGIC   .EQU    $04                 ; word
+COM_OFF_VER     .EQU    $06                 ; word
+COM_OFF_PAGES   .EQU    $08                 ; word (low byte used)
+COM_OFF_HEAPPG  .EQU    $0A                 ; word (low byte used)
+COM_MAGIC       .EQU    $4252               ; "RB" in an ascending hex dump.
+                                            ; K16 is little-endian, so $4252
+                                            ; lays down $52 'R' first; $5242
+                                            ; would dump as "BR".
+COM_VERSION     .EQU    1
+
+; Absolute in-task-page addresses of the same fields, for a task reading its
+; own header back with no syscall and no kernel support:
+;     LOADP   D0, Y3, [#COM_HDR_PAGES]      ; D0 = my page count
+; (LOADP, not LOADPB - the field is a word. Also 3 cycles instead of a byte
+; read plus a mask.)
+; Authoritative, because the allocation contract is "exactly N or fail" - so
+; the header cannot disagree with what the loader did.  Better than a
+; compile-time constant, which could drift.  The run BASE is Y3 itself:
+; TCB_SAVED_Y is the value the scheduler restores AND the value _PageInUse
+; range-tests, so it is the definitional run base, not merely where the code
+; happens to sit.
+COM_HDR_MAGIC   .EQU    SPAWN_ENTRY_OFFSET + COM_OFF_MAGIC   ; $0204
+COM_HDR_VER     .EQU    SPAWN_ENTRY_OFFSET + COM_OFF_VER     ; $0206
+COM_HDR_PAGES   .EQU    SPAWN_ENTRY_OFFSET + COM_OFF_PAGES   ; $0208
+COM_HDR_HEAPPG  .EQU    SPAWN_ENTRY_OFFSET + COM_OFF_HEAPPG  ; $020A
+
+;--- Command-line argv area (per task page, Part 15) -----------------------
+; The <$0200 kernel-reserved slice of each task page carries an ASCIIZ
+; command tail at $0100. sys_exec ALWAYS stamps it: $0100 = $00 means no
+; args, otherwise the nul-terminated tail (leading/trailing trimmed by kosh,
+; interior preserved). _AllocPage does not clear the page, so the stamp is
+; mandatory - the child trusts "peek($0100)=0 => no args".
+ARGV_BASE          .EQU $0100               ; ASCIIZ command tail start
+ARGV_MAX           .EQU 127                 ; copy cap (guards spill toward $0200)
 
 ;--- Task-local page-zero slots (per task page) ----------------------------
 MY_TCB_PTR      .EQU    $0000               ; word — TCB low word
@@ -1154,19 +1428,65 @@ OWNER_KERNEL    .EQU    0
 ; Syscall numbers (TRAP #n)
 ;
 ; Part 20 — domain-grouped layout (see VEC_ table above for full details).
+;
+;-----------------------------------------------------------------------------
+; SYSCALL REGISTER CONTRACT — authoritative. Do not restate it per handler.
+;-----------------------------------------------------------------------------
+;
+;   CALLEE-PRESERVED across every TRAP:   D1, D2, D3, XY1, XY2, XY3
+;   Caller-saved (free for the handler):  D0, XY0
+;   D0 additionally carries the result;  C=1 means D0 is an error code.
+;
+; XY2 IS ON THAT LIST AND IT MATTERS MORE THAN IT LOOKS. It is the K16
+; Pascal frame pointer: every parameter, spilled local and function RESULT
+; is addressed as [XY2+#N]. A handler that leaves XY2 disturbed does not
+; produce a wrong answer -- it silently corrupts the CALLER'S FRAME, and only
+; for callers that touch a parameter or return a value after the call. That
+; is a bug which reproduces nowhere near the syscall that caused it.
+;
+; The requirement is UNCONDITIONAL. Do not audit a handler's body and skip
+; the save because it appears not to use XY2: the clobber is usually in a
+; helper. sys_open showed exactly one XY2 reference of its own, while the
+; damage came three levels down in _SlotForDrive, which returns the volume
+; slot in X2 with Y2 = $00. One edit to a shared helper silently breaks every
+; caller that was audited clean last month.
+;
+; So: PUSH XY2 with the rest of the save list, POP it in mirrored position,
+; on EVERY exit arm. PUSH/POP are flag-transparent (except POP SR), so the
+; restore may sit after a POP SR gate without disturbing the result carry.
+;
+; THREE EXEMPTIONS, and only these:
+;   1. Handlers that never return (sys_exit) -- nothing to restore.
+;   2. Tail calls (sys_getchar -> _GetGatedKey) where the TARGET documents
+;      Preserves: ... XY2. A PUSH before a BRA would leak the task stack.
+;   3. Leaves that make NO calls, never name XY2, and exit via RETCC/RETCS
+;      (sys_termsize, sys_cursorvis, sys_wherexy, sys_getpid). An outstanding
+;      PUSH under a conditional return leaks on the taken arm, so these carry
+;      a Preserves: line instead of instructions.
+;
+; History: added Part 25 (2 August 2026). Before this, the contract read
+; "D1, D2, D3, XY1 callee-preserved" and was restated in each handler header,
+; so sys_open, sys_write, sys_mkdir and sys_diskfree were written without the
+; save and were live bugs. Nineteen handlers gained the pair in that pass.
 ;-----------------------------------------------------------------------------
 
 ; ── Console group (TRAP #10..#24) ────────────────────────────────────────
 TRAP_PUTCHAR    .EQU    10
 TRAP_GETCHAR    .EQU    11
 TRAP_PUTS       .EQU    12
-TRAP_PUTLN      .EQU    13
+TRAP_PUTLP      .EQU    13
 TRAP_GETS       .EQU    14
 TRAP_PUTDEC     .EQU    15
 TRAP_PUTHEX     .EQU    16
 TRAP_CLEAR      .EQU    17
 TRAP_SETCURSOR  .EQU    18
-;                       19..24 reserved
+TRAP_TERMSIZE   .EQU    19                  ; sys_termsize (leaf) - live terminal geometry
+TRAP_SETATTR    .EQU    20                  ; sys_setattr (leaf) - set current attribute
+TRAP_CLREOL     .EQU    21                  ; sys_clreol - clear cursor..EOL (grid + live)
+TRAP_CURSORVIS  .EQU    22                  ; sys_cursorvis (leaf) - Step 1 cursor visibility
+TRAP_WHEREXY    .EQU    23                  ; sys_wherexy (leaf) - query cursor col/row
+TRAP_CLREOS     .EQU    24                  ; sys_clreos - clear cursor..EOS (grid + live)
+;                       20..24 reserved
 
 ; ── Task group (TRAP #25..#39) ───────────────────────────────────────────
 TRAP_GETPID     .EQU    25
@@ -1176,6 +1496,13 @@ TRAP_SLEEP      .EQU    28
 TRAP_SPAWN      .EQU    29
 TRAP_WAIT       .EQU    30
 TRAP_EXEC       .EQU    31
+
+; sys_exec (TRAP_EXEC) flags word (D0) bits:
+;   bit 0 ($0001) = block             (reserved/ignored)
+;   bit 1 ($0002) = EXEC_FOREGROUND   auto-switch foreground to the child once
+;                   it registers as a shell (kosh sets this for a non-'&' run).
+EXEC_FOREGROUND .EQU    $0002
+EXEC_HAS_ARGS   .EQU    $0004                ; bit 2 - XY1 = ASCIIZ arg tail (Part 15)
 TRAP_KILL       .EQU    32                  ; Part 20 — body lands later
 ;                       33..39 reserved
 
@@ -1204,13 +1531,19 @@ TRAP_FORMAT     .EQU    65
 TRAP_UNLINK     .EQU    66
 TRAP_RENAME     .EQU    67
 TRAP_DISKFREE   .EQU    68                  ; Part 34 — sys_diskfree
-;                       68..74 reserved
+TRAP_MKDIR      .EQU    69                  ; subdir support — sys_mkdir
+TRAP_RESOLVE    .EQU    70                  ; path resolver — sys_resolve
+TRAP_PWD        .EQU    71                  ; path resolver — sys_pwd
+TRAP_RMDIR      .EQU    72                  ; subdir support — sys_rmdir
+;                       73..74 reserved
 
 ; ── Device group (TRAP #75..#84) ─────────────────────────────────────────
 TRAP_SETVIDMODE .EQU    75                  ; Part 20 — body lands later
 TRAP_SETFOREGROUND .EQU 76                  ; Phase B Step 2 — sys_setforeground
 TRAP_REGISTER_SHELL .EQU 77                 ; Phase B Step 1 — sys_register_shell
-;                       78..84 reserved
+TRAP_ASSIGN     .EQU    78                  ; named drives v2 — sys_assign (set/clear)
+TRAP_KBHIT      .EQU    79                  ; sys_kbhit (leaf) — non-blocking key poll
+;                       80..84 reserved
 
 ; ── Reserved tail (TRAP #85..#127) ───────────────────────────────────────
 
@@ -1243,14 +1576,32 @@ ERR_IO          .EQU    $FFE0               ; block-layer read/write failed
 ERR_BADDRIVE    .EQU    $FFDF               ; drive letter not mounted
 ERR_NOMORE      .EQU    $FFDE               ; directory iteration ended
 ERR_NOTEXEC     .EQU    $FFDD               ; sys_exec on non-.COM file
+ERR_NOTDIR      .EQU    $FFDC               ; path component is not a directory
+ERR_NOTEMPTY    .EQU    $FFDB               ; rmdir on a non-empty directory
+ERR_DETACHED    .EQU    $FFDA               ; child detached to foreground — not an
+                                            ; error; sys_register_shell's auto-fg path
+                                            ; delivers this to the launcher's sys_wait
+                                            ; in place of an exit code (Part 51).
+ERR_LOCKED      .EQU    $FFD9               ; assign is locked (ROM:/RAM: system seed)
+ERR_BADHEADER   .EQU    $FFD8               ; .COM header missing or malformed (Part 60).
+                                            ; Distinct from ERR_NOTEXEC on purpose:
+                                            ; NOTEXEC already covered wrong extension,
+                                            ; empty file, oversize and bad chain, so a
+                                            ; header rejection was indistinguishable
+                                            ; from four other failures. A stale
+                                            ; headerless image is the single most likely
+                                            ; failure during the flag-day changeover and
+                                            ; it should say so itself.
 
 ;-----------------------------------------------------------------------------
 ; Character constants
 ;-----------------------------------------------------------------------------
 CH_BS           .EQU    $08                 ; backspace
+CH_TAB          .EQU    $09                 ; horizontal tab
 CH_LF           .EQU    $0A                 ; line feed
 CH_CR           .EQU    $0D                 ; carriage return
 CH_SPACE        .EQU    $20                 ; space
+CH_QUOTE        .EQU    $22                 ; double quote (kosh quoted token)
 CH_NUL          .EQU    $00                 ; null terminator
 CH_ESC          .EQU    $1B                 ; escape (VT100 sequences)
 

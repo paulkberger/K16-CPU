@@ -1,8 +1,25 @@
 ; ============================================================================
 ; kos_ctxsw.asm — k/OS context switch (Phase 3, idle-task model)
 ; ============================================================================
-; Date:    14 May 2026
+; Date:    18 July 2026
 ; Status:  Part 30 hygiene + Phase 13 + Phase A keyboard ring + drain-loop poll
+; Revision: r36 - 18 July 2026 — .restore_idle returns via a
+;             synthesized-frame RTI instead of JMP24 _RestoreIdle's
+;             EINT+BRA. This path is entered from a LIVE timer IRQ; on
+;             Digital's 74LS148 priority hardware only RTI clears the
+;             IRQ's in-service level (LVL is read-only; EINT sets IE
+;             alone), so the old path masked the timer the instant the
+;             system went idle at a blocked prompt — keyboard dead, CPU
+;             parked in _IdleLoop. Latent since r28's _RestoreIdle path;
+;             harmless while keyboard-wait was a spin (task stayed
+;             runnable, standard restore RTI'd), exposed by Part 48's
+;             block+park (idle now reached during a key wait). EMU gates
+;             on IE only, so it never showed. Frame layout + SR value
+;             ($0080 = IE=1, LVL=0, flags clear) match _BuildTask and the
+;             non-leaf syscall return ABI. _RestoreIdle unchanged — boot,
+;             .bc_idle, and spawn/wait idle diversions stay EINT+BRA
+;             (TRAP-context, no live IRQ to unwind).
+;
 ; Revision: r35 - 14 May 2026 — k/OS Part 30 hygiene: removed dead
 ;             _UnhandledIRQ stub. Was a 5-instruction "emit '?' and
 ;             HALT" with zero references in the codebase — all 8
@@ -114,6 +131,8 @@
 ; _INTDispatch — installed at $00:0000
 ; ============================================================================
 _INTDispatch:
+
+; _INTDispatch Version 1
 ;                PUSH    D0, XY3
 ;                PUSH    XY1, XY3            ; save XY1 — about to clobber for JMPT base
 ;
@@ -127,7 +146,34 @@ _INTDispatch:
 ;                LOADI   X1, #<_IRQ_VECS
 ;                JMPT    XY1, D0
 
+; _INTDispatch Version 2
+;                PUSH    D0, XY3
+;                PUSH    XY1, XY3            ; save XY1 — about to clobber for JMPT base
+;
+;                ; Saved SR is at [XY3+#6] (after PUSH D0 + PUSH XY1 = 6 bytes)
+;                LOADD   D0, [XY3+#6]
+;                AND     D0, #$0070
+;                SHR4    D0                  ; bits 6:4 → bits 2:0
+;                SHL     D0                  ; ×2 for word offset (0,2,...,14)
+;                LOADI   Y1, #>_IRQ_VECS
+;                LOADI   X1, #<_IRQ_VECS
+;                JMPT    XY1, D0
 
+; _INTDispatch Version 3 — JMPT D0 (page-$00 form, no base register)
+;   *** TEMPORARILY DISABLED — boot hang under investigation (V3) ***
+;   JMPT D0 reads [$00:D0] directly: no XY base to build, no XY1 to save.
+;   D0 must therefore hold the full low-16 address _IRQ_VECS + level×2.
+;   Only D0 is pushed now, so saved SR is at [XY3+#2].
+;                PUSH    D0, XY3
+;
+;                LOADD   D0, [XY3+#2]        ; saved SR (only PUSH D0 = 2 bytes)
+;                AND     D0, #$0070
+;                SHR4    D0                  ; bits 6:4 → bits 2:0  (= level 0..7)
+;                SHL     D0                  ; ×2 word offset (0,2,...,14)
+;                ADD     D0, #<_IRQ_VECS     ; low-16 addr; JMPT D0 reads [$00:D0]
+;                JMPT    D0
+
+; _INTDispatch Version 2 — RESTORED (known-good, boots)
                 PUSH    D0, XY3
                 PUSH    XY1, XY3            ; save XY1 — about to clobber for JMPT base
 
@@ -139,6 +185,8 @@ _INTDispatch:
                 LOADI   Y1, #>_IRQ_VECS
                 LOADI   X1, #<_IRQ_VECS
                 JMPT    XY1, D0
+
+
 
 ; ============================================================================
 ; _IRQ_VECS — JMPT table in ROM
@@ -159,7 +207,7 @@ _IRQ_VECS:
 ; ============================================================================
 _TimerIRQ:
                 ; Restore XY1 (saved by _INTDispatch before its JMPT clobber)
-                ; and D0 (saved by _INTDispatch's first PUSH).
+                ; and D0 (saved by _INTDispatch's first PUSH).  [V2 pairing]
                 POP     XY1, XY3
                 POP     D0, XY3
 
@@ -304,14 +352,55 @@ _TimerIRQ:
                 ; because the kernel stack is shared with idle's preemption
                 ; frame and was overwritten by _WakeSleepers/_Schedule above.
                 ; Don't touch the saved frame — go to a fresh idle entry.
-                JMP24   _RestoreIdle
+                ; --- Digital timer-recurrence fix (was: JMP24 _RestoreIdle) ---
+                ; This path is entered from a LIVE timer IRQ. Returning via
+                ; _RestoreIdle's EINT+BRA leaves the IRQ's in-service level
+                ; latched on Digital's 74LS148 priority logic (EINT sets IE
+                ; only; LVL is read-only), so the timer never re-fires and
+                ; the keyboard -- polled only in _KbdTick inside this IRQ --
+                ; goes dead. EMU gates on IE alone, so it never showed.
+                ; (Latent since r28's _RestoreIdle path; harmless while the
+                ; keyboard wait was a spin -- the task stayed runnable and
+                ; the standard restore RTI'd. Part 48's block+park is the
+                ; first time idle is reached during a key wait, exposing it.)
+                ;
+                ; Fix: complete the interrupt with a real RTI. Build a fresh
+                ; idle INT frame on the kernel stack and RTI through it.
+                ; Push order PC[15:0], PC[23:16], SR -> SR ends on top;
+                ; RTI pops SR/PC and re-enables ints from SR. Frame layout
+                ; and SR value ($0080 = IE=1, LVL=0, flags clear) match
+                ; _BuildTask and the non-leaf syscall return ABI. Boot,
+                ; .bc_idle, and the spawn/wait idle diversions keep using
+                ; _RestoreIdle (EINT+BRA) -- they are TRAP-context, no live IRQ.
+                LOADI   Y3, #$00
+                LOADI   X3, #KERNEL_STACK_TOP
+                LOADI   D0, #KERN_STATE_RUN     ; BOOT -> RUN (idempotent)
+                STOREZ  D0, [#KERNEL_STATE]
+                LOADI   D0, #<_IdleLoop         ; PC[15:0]
+                PUSH    D0, XY3
+                LOADI   D0, #>_IdleLoop         ; PC[23:16] (page byte)
+                PUSH    D0, XY3
+                LOADI   D0, #$0080              ; SR: IE=1, LVL=0, flags clear
+                PUSH    D0, XY3
+                RTI
 
 ; ============================================================================
 ; _RestoreIdle — fresh idle entry (no saved-frame dependency)
 ;
-; Called via JMP24 (not CALL24) from any restore site whose _Schedule
-; result is IDLE_TCB. Re-establishes a clean kernel-stack/page state and
-; falls into _IdleLoop. Does not return.
+; Called via JMP24 (not CALL24) from a NO-LIVE-IRQ restore site whose
+; _Schedule result is IDLE_TCB — boot (_P2Main), _BlockCommon's .bc_idle,
+; and the sys_spawn/sys_wait idle diversions. Re-establishes a clean
+; kernel-stack/page state and falls into _IdleLoop. Does not return.
+;
+; *** CALLER CONTRACT — do NOT route a live-IRQ path through here. ***
+; This entry finishes with EINT + fall-through to _IdleLoop, NOT RTI. That
+; is correct only when no interrupt is in service. A path reached from
+; inside a hardware IRQ (e.g. _TimerIRQ's .restore_idle) MUST instead
+; return via RTI, so the IRQ's in-service level clears on real priority
+; hardware (74LS148): EINT sets IE but cannot lower LVL (read-only). Using
+; this EINT+BRA form from a live IRQ masks that IRQ forever on Digital
+; (invisible on EMU, which gates on IE alone). See .restore_idle (r36) for
+; the synthesized-frame RTI pattern to use from IRQ context.
 ;
 ; Why this is needed: idle's TCB_SAVED_X points at the kernel stack region
 ; which gets clobbered by _WakeSleepers and _Schedule themselves. Reading

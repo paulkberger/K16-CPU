@@ -1,283 +1,284 @@
 ; ============================================================================
 ; kosh_defs.inc - kosh task-page layout and constants (canonical map)
 ; ============================================================================
-; Date:    1 June 2026
-; Status:  Part 42 (prep) - extracted verbatim from kosh.asm r41. All kosh
-;          task-page EQUs and constants now live here, mirroring how
-;          kos_defs.inc holds the kernel's page-$00 map. No address or value
-;          changed in the extraction; this is a pure relocation of the
-;          declarations out of the middle of kosh.asm.
+; Date:    11 July 2026
+; Status:  Part 57 - full task-page refactor. The scattered Part-42..56 layout
+;          (LINEBUF/TASKBUF/DIRENTBUFS/PERSHELL, riddled with hand-computed
+;          TB_PAD*/PS_PAD* fillers and an 896-word blanket zero-fill that was
+;          almost entirely pad) was rebuilt from scratch into three tight,
+;          single-purpose regions on a high fixed base. All slots repacked;
+;          no address preserved from prior parts (a deliberate re-layout, not
+;          a zero-drift move). Every slot is Y3-relative and reached by symbol
+;          only - there are no hardcoded task-page addresses anywhere in kosh,
+;          so this repack propagates through the whole codebase automatically.
 ;
-; Why this file exists:
-;   Part 40 was a TASK-PAGE collision bug - kosh.com code grew past the
-;   scratch base ($4020) and every `ls` silently clobbered code. The kernel
-;   prevents this class in page $00 via a single canonical ZERO PAGE MAP
-;   (kos_defs.inc) with all declarations in one include. kosh now has real
-;   structured per-task state (esp. the Part 41 $7000-$76FF per-shell
-;   region), so it deserves the same discipline: one canonical map, all
-;   EQUs in one place.
+; Why the high base ($8000):
+;   kosh.com is one upward-growing image from .ORG $0200. Successive parts kept
+;   colliding code into buffers parked just above it (Part 40 @ $4020, Part 56
+;   LINEBUF @ $5000 inside the $529E image). Parking every buffer at $8000+
+;   gives ~32 KB of code runway ($0200..$7FFF) and ends the whack-a-mole. The
+;   assembler's '.SPACE kosh' code-in-region guard hard-errors the instant code
+;   ever grows into one of these regions, so the headroom is self-policing.
+;
+; The three regions:
+;   KCORE   $8000  persistent shell state (survives across commands; explicitly
+;                  initialised at kosh_entry, NOT zeroed).
+;   KBUFS   $8100  staging buffers (each written-before-read within a single
+;                  command; no init required).
+;   KSTATE  $8800  per-command scratch state, grouped by command family;
+;                  zero-filled by kosh_entry on each new task (KSTATE_START /
+;                  KSTATE_WORDS) so a fresh task page never inherits stale
+;                  values. Now ~55 words instead of the old 896.
+;
+;   $8870-$FDFF  free / kosh stack (grows down from ~$FE00; glob's stack table
+;                is SP-relative and stays high, well clear of the regions above)
+;   $FFDC-$FFFF  initial fake INT frame + stack region
 ;
 ; Include order: pulled in by kosh.asm AFTER kos_fs_defs.inc, because
 ;   OPEN_FLAGS_NEW depends on FOPEN_* (defined there).
-;
-; ----------------------------------------------------------------------------
-; CANONICAL TASK-PAGE MAP (kosh.com runs at .ORG $0200 in its own task page;
-;   all slots below are Y3-relative - Y3 = this task's page register)
-; ----------------------------------------------------------------------------
-;   $0000-$01FF   OS-reserved task-local slots (kernel-owned):
-;                   $0000 MY_TCB_PTR, $0004 TASK_ID  (see kos_defs.inc)
-;                 A .com MUST NOT use $0000-$01FF for its own scratch.
-;   $0200-~$4480  kosh.com code + data + embedded HELLO.COM / NOTES.TXT
-;                   (~17 KB; grows upward - this is the value that collided
-;                   with scratch in Part 40)
-;   $5000-$504F   LINE_BUF (80 B; LINE_BUF_OFF / LINE_BUF_MAX)
-;   $6000-$660D   task-local buffers (foreground-stable, written then read
-;                 within one command):
-;                   $6000 DUMP_PAGE/OFFS/LEN/ROW, $6020 ROW_BUF,
-;                   $6080 LS_DIRENT_BUF, $60AC CAT_BUF, $62B0 LIST_BUF,
-;                   $63B8 CP_BUF, $65C0 KOSH_CWD, $65D0 KOSH_NORM_A/B,
-;                   $65F8 RUN_BG_TMP, $65FE SIZE_FMT_BUF
-;   $7000-$76FF   PER-SHELL working state (Part 41; zero-filled by
-;                 kosh_entry on each new task). Each kosh has a private copy,
-;                 so concurrent shells cannot corrupt each other. Slots:
-;                   $70A0 LS_*, $73B2 DISK_*, $75B8 CP_*_TMP,
-;                   $75F0 LOAD_*, $75FA VOL_*_TMP, $760E VOL_CLSZ_TMP,
-;                   $7610 LOAD_WRITTEN_*/ERR, $7620 GLOB_*, $764E LS_PAT_PTR
-;   $6700-$6FFF   free (buffer growth headroom)
-;   $7700-$FDFF   free / kosh stack (grows down from ~$FE00)
-;   $FFDC-$FFFF   initial fake INT frame + stack region
-;
-; TODO (Gotcha #35 mitigation): once the assembler's .IF/.ERROR support and a
-;   `kosh_code_end` symbol are confirmed available, add a build-time overlap
-;   assertion here, e.g.:
-;       .IF (ROW_BUF < kosh_code_end + 256)
-;           .ERROR "kosh task-local scratch overlaps kosh.com code"
-;       .ENDIF
-;   This would have caught the Part 40 collision at assembly time. Left as a
-;   comment until the assembler features are verified (do not enable blind).
 ; ============================================================================
 
+.SPACE kosh
 
-LINE_BUF_OFF    .EQU    $5000               ; line buffer offset within page
-                                            ; (r14: was $1000, but the kosh body
-                                            ; has grown past $1000 - msg_help
-                                            ; overlapped LINE_BUF and the user's
-                                            ; typed "help\0" was overwriting
-                                            ; msg_help bytes at runtime, causing
-                                            ; sys_puts to truncate when it hit
-                                            ; the embedded nul. Moved to $5000
-                                            ; - clear of the body and clear of
-                                            ; the scratch area at $4000..$42A7.)
-LINE_BUF_MAX    .EQU    79                  ; sys_gets max length (excl. nul)
-
-; Precomputed open-flags for the boot-time disk populate (r17). The
-; assembler evaluates expressions left-to-right but does not accept '|'
-; inside a LOADI immediate; we OR the constants here at .EQU time.
-;   FOPEN_CREATE ($4) | FOPEN_WRITE ($2) | FOPEN_TRUNC ($8) = $E
-OPEN_FLAGS_NEW  .EQU    FOPEN_CREATE+FOPEN_WRITE+FOPEN_TRUNC
-
-; --- kosh-owned scratch in user page ----------------------------------------
-;
-; History:
-;   r12 - placed scratch at $1100. r14 added FS-command scratch and the
-;         kosh body grew past $1100, causing scratch to overlap msg_help
-;         and other trailing strings. Symptom was sys_puts truncating
-;         msg_help at offset ~290.
-;
-;   r14 - moved all scratch to $4000. Plenty of room above the body
-;         (then ~$1B00 bytes); plenty of room below the stack at $FFFE.
-;
-;   r40 - Part 40: kosh.com migration (Part 39) plus accumulated growth
-;         pushed the kosh.com code+data end to ~$4480 (17 KB total).
-;         Task-local scratch slots starting at $4020 (ROW_BUF) now
-;         OVERLAP THE CODE. Symptom: any command that returned via
-;         _KoshSplitDrivePat.sdp_no_prefix after a prior `ls` had its
-;         POP-XY0 read garbage because ROW_BUF (written by ls) had
-;         overwritten the .sdp_no_prefix code at $4020. The kosh.com
-;         layout had grown past the scratch base.
-;
-;         Fix: bumped all *task-local* scratch slots by +$2000. New
-;         base is $6000 — comfortably above the current code end
-;         ($~4480) and above LINE_BUF ($5000..$504F). The page-$00
-;         (LOADZ/STOREZ) slots stayed at $4xxx in r40 since they lived
-;         in kernel page $00, not the task page. (r41 note: those slots
-;         have since moved to the task page at $7xxx — see the r41 entry
-;         and the $7xxx layout block below. They are no longer page-$00.)
-;
-; Layout from $6000 (task-local; bytes live in task page):
-;   $6000..$6005   DUMP_PAGE / DUMP_OFFS / DUMP_LEN     (was $4000..$4005)
-;   $6006..$6015   DUMP_ROW (16 B)                       (was $4006..$4015)
-;   $6020..$607F   ROW_BUF (96 B)                        (was $4020..$407F)
-;   $6080..$609F   LS_DIRENT_BUF (32 B)                  (was $4080..$409F)
-;   $60AC..$62AC   CAT_BUF (513 B)                       (was $40AC..$42AC)
-;   $62B0..$63AF   LIST_BUF (256 B)                      (was $42B0..$43AF)
-;   $63B8..$65B7   CP_BUF (512 B)                        (was $43B8..$45B7)
-;   $65C0..$65C1   KOSH_CWD (byte+pad)                   (was $45C0..$45C1)
-;   $65D0..$65EF   KOSH_NORM_A/B (2x16 B)                (was $45D0..$45EF)
-;   $65F8          RUN_BG_TMP (1 word)                   (was $45F8)
-;   $65FE..$660D   SIZE_FMT_BUF (16 B)                   (was $45FE..$460D)
-;
-; Per-shell working state at $7xxx (Part 41; task page, addressed via
-;                  LOADP/STOREP Y3 — each kosh task has its own private copy.
-;                  Zero-filled by kosh_entry on every new task. Old addresses
-;                  shown for diff against r40; mapping is OLD + $3000):
-;   $70A0..$70AB   LS_FILE_COUNT / LS_TOTAL_LO / LS_TOTAL_HI /
-;                  LS_SIZE_TMP / LS_DRIVE_TMP / LS_INDEX_TMP
-;   $73B2..$73B7   DISK_DRIVE_TMP / DISK_SECTORS_TMP / DISK_WALK_TMP
-;   $75B8..$75BF   CP_SRC_FD_TMP / CP_DST_FD_TMP / CP_SRC_PATH_TMP /
-;                  CP_DST_PATH_TMP
-;   $75F0..$75F7   LOAD_NAME_TMP / LOAD_FORCE_TMP / LOAD_DST_FD_TMP /
-;                  LOAD_SIZE_TMP
-;   $75FA..$75FD   VOL_FREE_TMP / VOL_TOTAL_TMP
-;   $760E..$7615   VOL_CLSZ_TMP / LOAD_WRITTEN_LO / LOAD_WRITTEN_HI /
-;                  LOAD_ERR_TMP
-;   $7620..$764F   GLOB_DRIVE / GLOB_INDEX / GLOB_COUNT / GLOB_MAX /
-;                  GLOB_TABLE / GLOB_PATPTR / GLOB_DIRENT_BUF (32 B)
-;   $7650..$7655   CP_DSTDRV_TMP / CP_NAME_TMP / GLOB_RSVSIZE (= $764C)
-;   $764E          LS_PAT_PTR
-;
-; These were the "multi-shell race risk" set: until r41 they lived in
-; kernel page $00 ($40xx-$46xx) as a singleton, so a second kosh task
-; would clobber the first's state. r41 moved them into the per-task page
-; ($7000-$76FF), making kosh re-entrant. Genuine page-$00 accesses
-; elsewhere (kernel API vectors, KOS_VERSION) legitimately remain
-; LOADZ/STOREZ and are NOT part of this set.
 ; ----------------------------------------------------------------------------
-
-; --- Task-local scratch (lives in kosh task page, above kosh.com code) -----
-
-DUMP_PAGE       .EQU    $6000               ; word - current dump page byte
-DUMP_OFFS       .EQU    $6002               ; word - current dump offset
-DUMP_LEN        .EQU    $6004               ; word - bytes remaining
-DUMP_ROW        .EQU    $6006               ; 16 bytes - row source staging
-
-ROW_BUF         .EQU    $6020               ; 96 bytes - formatted output staging
-
-; --- Phase 16.7 FS-command scratch ------------------------------------------
-; LS_DIRENT_BUF is task-local (Y3-relative, $6080). The LS_* working set is
-; per-shell task-page state at $70xx (r41), accessed via LOADP/STOREP Y3.
-LS_DIRENT_BUF   .EQU    $6080               ; 32 B - sys_dirent destination (task-local)
-LS_FILE_COUNT   .EQU    $70A0               ; word - files seen so far          (task page, Y3-rel)
-LS_TOTAL_LO     .EQU    $70A2               ; word - sum of file sizes (low 16) (task page, Y3-rel)
-LS_TOTAL_HI     .EQU    $70A4               ; word - sum of file sizes (high 16)(task page, Y3-rel)
-                                            ; Part 22: widened from a single
-                                            ; 16-bit LS_TOTAL_BYTES at $40A2;
-                                            ; LS_SIZE_TMP was at $40A4 and has
-                                            ; moved to $40A6.
-LS_SIZE_TMP     .EQU    $70A6               ; word - saved size across _KoshEmitDec (task page, Y3-rel)
-LS_DRIVE_TMP    .EQU    $70A8               ; word - drive across _KoshEmit* calls (task page, Y3-rel)
-LS_INDEX_TMP    .EQU    $70AA               ; word - index across _KoshEmit* calls (task page, Y3-rel)
-
-CAT_BUF         .EQU    $60AC               ; 513 B - sys_read destination (task-local)
-                                            ; (Part 22: bumped from $40AA to
-                                            ; $40AC to make room for new
-                                            ; LS_TOTAL_HI word.)
-                                            ; (Part 40: bumped by +$2000 to
-                                            ; clear kosh.com code.)
+; Value constants (not allocations)
+; ----------------------------------------------------------------------------
+LINE_BUF_MAX    .EQU    79                  ; sys_gets max length (excl. nul)
+; FOPEN_CREATE ($4) | FOPEN_WRITE ($2) | FOPEN_TRUNC ($8) = $E (OR'd at .EQU time)
+OPEN_FLAGS_NEW  .EQU    FOPEN_CREATE+FOPEN_WRITE+FOPEN_TRUNC
 CAT_BUF_SIZE    .EQU    512                 ; max bytes per sys_read
-
-; --- Part 23 disk-command scratch -------------------------------------------
-; LIST_BUF is task-local: HOST_CMD_LIST writes <=256 bytes into the kosh
-; task page. DISK_*_TMP slots are per-shell task-page state at $73xx (r41),
-; accessed via LOADP/STOREP Y3.
-LIST_BUF        .EQU    $62B0               ; 256 B - HOST_CMD_LIST output (task-local)
-LIST_BUF_END    .EQU    $63B0               ; one past last byte           (task-local)
-
-DISK_DRIVE_TMP   .EQU   $73B2               ; word - drive index across CALL24s (task page, Y3-rel)
-DISK_SECTORS_TMP .EQU   $73B4               ; word - sector count for mkdisk     (task page, Y3-rel)
-DISK_WALK_TMP    .EQU   $73B6               ; word - LIST_BUF walk offset        (task page, Y3-rel)
-
-; --- Part 25 cp-command scratch ---------------------------------------------
-; CP_BUF is task-local; CP_*_TMP slots are per-shell task-page state at
-; $75xx/$76xx (r41), via LOADP/STOREP Y3. CP_BUF read/write staging is one
-; cluster (512 B), matching sys_read's natural unit on the
-; cluster=1 disks we use.
-CP_BUF          .EQU    $63B8               ; 512 B - read/write staging (task-local)
-CP_BUF_SIZE     .EQU    512
-CP_SRC_FD_TMP   .EQU    $75B8               ; word - source fd across CALL24s    (task page, Y3-rel)
-CP_DST_FD_TMP   .EQU    $75BA               ; word - destination fd              (task page, Y3-rel)
-CP_SRC_PATH_TMP .EQU    $75BC               ; word - pointer to src path         (task page, Y3-rel)
-CP_DST_PATH_TMP .EQU    $75BE               ; word - pointer to dst path         (task page, Y3-rel)
-CP_DSTDRV_TMP   .EQU    $7650               ; word - glob cp dest drive index    (task page, Y3-rel)
-CP_NAME_TMP     .EQU    $7652               ; word - glob cp current name offset (task page, Y3-rel)
-
-; cp worker error sentinels (returned in D0 with C=1). Chosen to avoid
-; collision with both the kernel ERR_* range (>= $FF00) and short-write
-; byte counts (0..512): $8000-range is in neither.
+CP_BUF_SIZE     .EQU    512                 ; cp read/write staging unit
+; Part 62: 80, not 16. Derivation - a command line is capped at
+; LINE_BUF_MAX (79), so for "cp <src> <dst>" src+dst <= 75; the longest
+; thing ever built in a NORM buffer is _KoshResolveDstPath's join,
+; dst + "/" + basename(src) + nul, and basename(src) <= src, so the
+; join is <= 77 bytes. 80 covers it with the nul and a little slack.
+; This is a bound, not a guess - do not shrink it without redoing the
+; arithmetic against LINE_BUF_MAX. Enforced by _KoshCopyBounded and by
+; the explicit capacity checks in _KoshResolveDstPath.
+KOSH_NORM_LEN   .EQU    80                  ; max bytes per KOSH_NORM buffer
+KOSH_NORM_LEN_P .EQU    78                  ; = KOSH_NORM_LEN - 2, capacity left
+                                            ;   after a 2-byte "X:" drive prefix
+; Part 64: 32, not 14. The table now carries the DISPLAY name, which is the
+; VFAT long name whenever one exists - LFN_MAX (31) chars + nul = 32. The old
+; 14 was 8.3-shaped (12 chars + nul + pad); it was never undersized for that
+; purpose, so this is a deliberate widening, not a bug fix.
+;
+; 32 is also the cheap number: entry offset = index << GLOB_ENTRY_SHIFT is
+; SHL4 + SHL - two instructions - against the six-instruction shift/add chain
+; that *14 needed at all eight arithmetic sites in kosh_cmds_fs.asm.
+;
+; Stack cost: the worst-case reservation is GLOB_MAX * GLOB_ENTRY_SIZE, and
+; GLOB_MAX is the drive's root_entries, which _ComputeFAT16Layout pins at 32
+; (volumes of 1024 sectors or fewer) or 256 (larger) - so the ceiling is
+; 256*32 = 8192 bytes against a free stack region of roughly 30 KB
+; ($FFF0 task stack top down to the end of KSTATE). One glob is live at a
+; time; the reservations never nest.
+;
+; GLOB_ENTRY_SHIFT and GLOB_ENTRY_SIZE must move together. The code uses the
+; SHIFT, spelled as literal SHL4/SHL pairs; the SIZE never appears in an
+; instruction operand, because immediate-operand arithmetic on a symbol is
+; not attested anywhere in this tree - only .EQU-time folding is.
+GLOB_ENTRY_SIZE .EQU    32                  ; bytes per glob table entry (LFN_MAX + nul)
+GLOB_ENTRY_SHIFT .EQU   5                   ; log2(GLOB_ENTRY_SIZE) - see above
+; Part 62: dirent attrs that _KoshGlobExpand refuses to collect. The glob
+; helper feeds cat/rm/cp/mv only - all file operations - so a directory or
+; a volume label in the table is always a bug waiting to happen. Named
+; because the assembler is only proven to fold arithmetic in .EQU, not in
+; an immediate operand.
+GLOB_SKIP_ATTR  .EQU    DIR_ATTR_DIRECTORY+DIR_ATTR_VOLUME_LABEL
+SCRIPT_MAX_DEPTH .EQU   4                   ; kosh script nesting cap (fd stack size)
+; Part 61: per-level script presentation flags (SCRIPT_FLAGS stack).
+SCRIPT_FLAG_BRIEF .EQU  $0001               ; -b: join echo + output on one line
+SCRIPT_ARROW_LEN  .EQU  4                   ; visible width of msg_brief_arrow
+                                            ;   (" -> ") - keep in step with the
+                                            ;   string in kosh_script.asm
+; cp worker sentinels (D0 with C=1); $8000-range avoids ERR_* (>=$FF00) and
+; short-write byte counts (0..512).
 CP_ERR_SAMEPATH .EQU    $8001               ; src == dst
 CP_ERR_EXISTS   .EQU    $8002               ; dst already exists
-MV_WARN_ROSRC   .EQU    $8003               ; mv: copied OK, source on r/o vol (not removed)
+MV_WARN_ROSRC   .EQU    $8003               ; mv: copied OK, source r/o (not removed)
+CP_ERR_TOOLONG  .EQU    $8004               ; Part 62: joined path exceeds KOSH_NORM_LEN
+; Part 64: the HARD counterpart to MV_WARN_ROSRC. Cross-drive mv is
+; copy-then-unlink; if the unlink fails for any reason other than a
+; read-only source, the copy has already landed and THE FILE NOW EXISTS AT
+; BOTH ENDS. That is a different volume state from "the move did not
+; happen", and reporting it as a generic mv failure invites the user to
+; re-run the mv or delete the wrong copy. The raw kernel code is kept in
+; MV_UNLINK_ERR so the report can still name it.
+MV_ERR_UNLINK   .EQU    $8005               ; copied OK, source unlink failed
 
-; --- Part 25 r4 CWD scratch (task-local, Y3-relative) ----------------------
-; KOSH_CWD is the current-drive letter ('B' at boot). Path-taking commands
-; prepend "<KOSH_CWD>:" via _KoshNormPath when the user supplies a bare
-; filename. Two scratch buffers because cp/mv carry two paths in flight.
-; A 16-byte buffer easily fits "X:NNNNNNNN.EEE\0" (14 chars max).
-KOSH_CWD        .EQU    $65C0               ; byte - current drive letter
-                                            ; (allocate word for alignment)
-KOSH_NORM_A     .EQU    $65D0               ; 16 B - normalised path A
-KOSH_NORM_B     .EQU    $65E0               ; 16 B - normalised path B
-KOSH_NORM_LEN   .EQU    16                  ; max bytes per buffer
+; ----------------------------------------------------------------------------
+; KCORE - persistent shell state (survives across commands; not zero-filled).
+;   Initialised explicitly at kosh_entry (CWD = 'B', cluster = root).
+; ----------------------------------------------------------------------------
+KCORE           .REGION $8000
+KOSH_CWD         .RS 1w       ; current drive letter (byte; word slot for alignment)
+KOSH_CWD_CLU     .RS 1w       ; current directory cluster (0 = root)
+CD_BARE          .RS 1w       ; Part 61: how .cd_resolve was entered.
+                              ;   0 = explicit `cd <path>` - a non-directory
+                              ;       target is an error, report it.
+                              ;   1 = bare colon token (ram:boot.ksh) - a
+                              ;       non-directory target is an executable,
+                              ;       fall through to the exec path.
+.ENDREGION
 
-; --- Part 25 r6 load-command scratch (per-shell task-page words) -----------
-; The load command holds these across CALL24 boundaries (_HostFOpen,
-; _KoshNormPath, _HostFRead, _HostFClose, _KoshPrintErr). Per-shell
-; task-page state at $75xx (r41), via LOADP/STOREP Y3 — same convention
-; as the CP_*_TMP slots.
-LOAD_NAME_TMP   .EQU    $75F0               ; word - page-offset of name in LINE_BUF
-LOAD_FORCE_TMP  .EQU    $75F2               ; word - 0 = refuse on exists, 1 = -f
-LOAD_DST_FD_TMP .EQU    $75F4               ; word - dest fd across host calls
-LOAD_SIZE_TMP   .EQU    $75F6               ; word - file size for success msg
+; ----------------------------------------------------------------------------
+; KBUFS - staging buffers, each written-before-read within one command.
+;   No init required; deliberately NOT part of the zero-fill span.
+; ----------------------------------------------------------------------------
+KBUFS           .REGION $8100
+LINE_BUF         .RS 40w      ; 80 B sys_gets line buffer (LINE_BUF_MAX = 79 excl nul)
+ROW_BUF          .RS 48w      ; 96 B shared formatted-output staging
+DUMP_ROW         .RS 8w       ; 16 B dump: row source staging
+SIZE_FMT_BUF     .RS 8w       ; 16 B size-string work area
+KOSH_NORM_A      .RS 40w      ; 80 B path buffer A (= KOSH_NORM_LEN)
+KOSH_NORM_B      .RS 40w      ; 80 B path buffer B (= KOSH_NORM_LEN)
+CAT_BUF          .RS 257w     ; 513 B sys_read destination (CAT_BUF_SIZE = 512 + nul)
+LIST_BUF         .RS 128w     ; 256 B HOST_CMD_LIST output
+CP_BUF           .RS 256w     ; 512 B cp read/write staging (CP_BUF_SIZE = 512)
+LS_DIRENT_BUF    .RS 32w      ; 64 B ls sys_dirent destination (DIRENT_INFO)
+GLOB_DIRENT_BUF  .RS 32w      ; 64 B glob sys_dirent destination (DIRENT_INFO)
+.ENDREGION
 
-; --- Part 25 r7 run-command scratch ----------------------------------------
-; RUN_BG_TMP stashes the background flag across TRAP_EXEC. Task-local
-; (was page-$00 in earlier wording, but actually used via LOADI X0,#... +
-; MOVE Y0,Y3 = task page; the access pattern, not the comment, is what
-; matters).
-RUN_BG_TMP      .EQU    $65F8               ; word - 0 = foreground, 1 = background (task-local)
-
-; --- Part 34 vol-command scratch (Part 34 disk-free table refit) -----------
-; vol now calls sys_diskfree per drive and renders a multi-column table.
-; VOL_*_TMP slots are per-shell task-page state at $75xx/$76xx (r41), via
-; LOADP/STOREP Y3. SIZE_FMT_BUF is task-local (Y3-relative
-; in _KoshEmitSize's build loop).
-VOL_FREE_TMP    .EQU    $75FA               ; word - free clusters  (task page, Y3-rel)
-VOL_TOTAL_TMP   .EQU    $75FC               ; word - total clusters (task page, Y3-rel)
-SIZE_FMT_BUF    .EQU    $65FE               ; 16 B - size-string work area (task-local)
-                                            ; (max content "1024.99GB\0" = 10 B;
-                                            ;  rounded up for alignment headroom)
-VOL_CLSZ_TMP    .EQU    $760E               ; word - cluster size in bytes (task page, Y3-rel)
-
-; --- Part 34 load-command cumulative write counter -------------------------
-; Tracks bytes actually written across the load-copy loop so .load_write_err
-; can report "wrote N before disk full" with a real cumulative. Initialised
-; to 0 at .load_open_dest_for_write; each successful sys_write iteration adds
-; D0 (chunk bytes written). On error, this total + sys_write's D1 (partial
-; bytes of the failed chunk) = real on-disk size.
-; 32-bit because load can pull files up to the bay size (~1MB).
-LOAD_WRITTEN_LO  .EQU   $7610               ; word - low 16 bits of cumulative
-LOAD_WRITTEN_HI  .EQU   $7612               ; word - high 16 bits of cumulative
-LOAD_ERR_TMP     .EQU   $7614               ; word - stashed err code across the
-                                            ; .load_write_err preamble build.
-                                            ; D3 isn't safe because _KoshEmitSize
-                                            ; doesn't preserve D3 (its KLIB
-                                            ; callees clobber it).
-
-; --- Part 37 wildcard-glob expander scratch --------------------------------
-; State for _KoshGlobExpand's directory walk. Held in memory (not registers)
-; because the walk calls sys_dirent and _KoshFnMatch, both of which clobber
-; most D/XY registers. Same discipline as .do_ls (LS_DRIVE_TMP etc.).
-GLOB_DRIVE       .EQU   $7620               ; word - drive index being walked
-GLOB_INDEX       .EQU   $7622               ; word - current dirent index
-GLOB_COUNT       .EQU   $7624               ; word - matches collected so far
-GLOB_MAX         .EQU   $7626               ; word - table capacity (root_entries)
-GLOB_TABLE       .EQU   $7628               ; word - table base offset (stack region)
-GLOB_PATPTR      .EQU   $762A               ; word - pattern offset (task page)
-GLOB_DIRENT_BUF  .EQU   $762C               ; 32 B - sys_dirent destination
-                                            ;        ($462C..$464B)
-GLOB_RSVSIZE     .EQU   $764C               ; word - reserved stack table size
-                                            ;        (root_entries*14) for release
-LS_PAT_PTR       .EQU   $764E               ; word - ls wildcard pattern offset
-                                            ;        (task page); points at "*" for
-                                            ;        the match-all cases
-GLOB_ENTRY_SIZE  .EQU   14                  ; bytes per table entry (13 name + pad)
+; ----------------------------------------------------------------------------
+; KSTATE - per-command scratch state, grouped by command family.
+;   Zero-filled by kosh_entry on each new task (KSTATE_START / KSTATE_WORDS),
+;   so a fresh task page never starts on a stale value.
+; ----------------------------------------------------------------------------
+KSTATE          .REGION $8800
+; -- dump (mem) --
+DUMP_PAGE        .RS 1w       ; current dump page byte
+DUMP_OFFS        .RS 1w       ; current dump offset
+DUMP_LEN         .RS 1w       ; bytes remaining
+; -- run --
+RUN_BG           .RS 1w       ; 0 = foreground, 1 = background
+; -- assign --
+ASN_NAME_OFF     .RS 1w       ; saved name-token offset
+ASN_LIST_IDX     .RS 1w       ; list iteration index
+; -- pwd-name (reverse assign map) --
+PWDNM_BUF        .RS 1w       ; saved CWD buffer offset
+PWDNM_BLEN       .RS 1w       ; best backing-prefix length
+PWDNM_BIDX       .RS 1w       ; best assign index ($FFFF = none)
+PWDNM_IDX        .RS 1w       ; scan index
+; -- ls --
+LS_FILE_COUNT    .RS 1w       ; files seen so far
+LS_TOTAL_LO      .RS 1w       ; sum of file sizes (low 16)
+LS_TOTAL_HI      .RS 1w       ; sum of file sizes (high 16)
+LS_SIZE          .RS 1w       ; saved size across _KoshEmitDec
+LS_DRIVE         .RS 1w       ; drive across _KoshEmit* calls
+LS_INDEX         .RS 1w       ; index across _KoshEmit* calls
+LS_CLU           .RS 1w       ; directory cluster to list (0 = root)
+LS_ARG_PTR       .RS 1w       ; ls arg offset during parse
+LS_RD_ARG        .RS 1w       ; _KoshLsResolveDir: path ptr
+LS_RD_OFF        .RS 1w       ; _KoshLsResolveDir: term offset ($FFFF = none)
+LS_RD_BYTE       .RS 1w       ; _KoshLsResolveDir: saved byte
+LS_RD_DRV        .RS 1w       ; _KoshLsResolveDir: resolved drive
+LS_RD_CLU        .RS 1w       ; _KoshLsResolveDir: resolved cluster
+LS_RD_ATTR       .RS 1w       ; _KoshLsResolveDir: resolved attr
+LS_DIR_COUNT     .RS 1w       ; dirs seen incl . and ..
+LS_PAT_PTR       .RS 1w       ; ls wildcard pattern offset ('*' = match-all)
+LS_NAMEPTR       .RS 1w       ; Part 64: offset of the display name within
+                              ;   LS_DIRENT_BUF - +$20 when a long name is
+                              ;   present, else the buffer base (8.3 at +$00).
+                              ;   Computed once per entry by _KoshDirentDisplay
+                              ;   and used for BOTH the wildcard filter and the
+                              ;   row emit. Those two previously disagreed: the
+                              ;   filter matched +$00 while the row printed
+                              ;   +$20, so `ls Mandel*` found nothing it would
+                              ;   then have displayed.
+; -- disk (mkdisk) --
+DISK_DRIVE       .RS 1w       ; drive index across CALL24s
+DISK_SECTORS     .RS 1w       ; sector count for mkdisk
+DISK_WALK        .RS 1w       ; LIST_BUF walk offset
+; -- cp / mv --
+CP_SRC_FD        .RS 1w       ; source fd across CALL24s
+CP_DST_FD        .RS 1w       ; destination fd
+CP_SRC_PATH      .RS 1w       ; pointer to src path
+CP_DST_PATH      .RS 1w       ; pointer to dst path
+CP_DSTDRV        .RS 1w       ; glob cp dest drive index (literal paths only
+                              ;   from Part 64 step 2 - the glob path no
+                              ;   longer builds "<drive>:<name>" by hand)
+CP_GDST          .RS 1w       ; Part 64 step 2: the destination token as the
+                              ;   user typed it. _KoshResolveDstPath repoints
+                              ;   CP_DST_PATH at KOSH_NORM_B for each match,
+                              ;   so the original has to be restored at the
+                              ;   top of every iteration.
+CP_NAME          .RS 1w       ; glob cp current name offset
+CP_CWD_CLU       .RS 1w       ; CWD cluster for cp/mv opens
+CP_CWD_DRV       .RS 1w       ; CWD drive index for cp/mv
+MV_UNLINK_ERR    .RS 1w       ; Part 64: the real ERR_* behind MV_ERR_UNLINK.
+                              ;   The sentinel says WHICH outcome occurred;
+                              ;   this says why, so the report can carry
+                              ;   both. Written only on that one path.
+; -- load --
+LOAD_NAME        .RS 1w       ; page-offset of name in LINE_BUF (full token,
+                              ;   host-folder prefix included)
+LOAD_BASENAME    .RS 1w       ; Part 61: offset of the last '/'-separated
+                              ;   component of LOAD_NAME - the K16-side
+                              ;   destination name, opened with CWD context
+                              ;   (Part 62); equals LOAD_NAME when there is
+                              ;   no host-folder prefix.
+LOAD_FORCE       .RS 1w       ; 0 = refuse on exists, 1 = -f
+LOAD_DST_FD      .RS 1w       ; dest fd across host calls
+LOAD_SIZE_LO     .RS 1w       ; host file size low  (from _HostFOpen, Part 26)
+LOAD_SIZE_HI     .RS 1w       ; host file size high
+LOAD_WRITTEN_LO  .RS 1w       ; low 16 of cumulative bytes written
+LOAD_WRITTEN_HI  .RS 1w       ; high 16 of cumulative bytes written
+LOAD_ERR         .RS 1w       ; stashed err code (D3 unsafe: KLIB clobbers)
+; -- vol --
+VOL_FREE         .RS 1w       ; free clusters
+VOL_TOTAL        .RS 1w       ; total clusters
+VOL_CLSZ         .RS 1w       ; cluster size in bytes
+; -- glob --
+GLOB_DRIVE       .RS 1w       ; drive index being walked
+GLOB_INDEX       .RS 1w       ; current dirent index
+GLOB_COUNT       .RS 1w       ; matches collected so far
+GLOB_MAX         .RS 1w       ; table capacity (root_entries)
+GLOB_TABLE       .RS 1w       ; table base offset (stack region)
+GLOB_PATPTR      .RS 1w       ; pattern offset (task page)
+GLOB_RSVSIZE     .RS 1w       ; reserved stack table size (root_entries*32)
+GLOB_CLU         .RS 1w       ; directory cluster being globbed (0 = root)
+GLOB_PFXPTR      .RS 1w       ; Part 64 step 2: offset of the glob argument
+                              ;   itself, so "<prefix><name>" can be rebuilt
+                              ;   per match. Written by _KoshSplitDirPat.
+GLOB_PFXLEN      .RS 1w       ; Part 64 step 2: length of the directory part
+                              ;   of that argument, INCLUDING its trailing
+                              ;   '/' or ':'. 0 when there is none, in which
+                              ;   case the shell CWD is the globbed dir.
+GLOB_NAMEOFF     .RS 1w       ; Part 64 step 2: offset inside KOSH_NORM_A at
+                              ;   which each match's name is appended - i.e.
+                              ;   just past the directory prefix, which cp/mv
+                              ;   lay down ONCE before the iteration starts.
+GLOB_NAMECAP     .RS 1w       ; Part 64 step 2: bytes still free at
+                              ;   GLOB_NAMEOFF, including the nul. Passed
+                              ;   straight to _KoshCopyBounded, so a long
+                              ;   prefix plus a long name fails loudly with
+                              ;   CP_ERR_TOOLONG instead of overrunning.
+GLOB_NAMEPTR     .RS 1w       ; Part 64: display-name offset within
+                              ;   GLOB_DIRENT_BUF (same rule as LS_NAMEPTR).
+                              ;   The table always stores the DISPLAY name,
+                              ;   even when the pattern only matched via the
+                              ;   8.3 fallback - the display name is the one
+                              ;   that gets opened, copied and created.
+; -- script runner (Part 57+) --
+SCRIPT_DEPTH     .RS 1w       ; nesting depth (0 = no script active)
+SCRIPT_CHAR      .RS 1w       ; 1-byte sys_read landing slot
+SCRIPT_BOOT_DRV  .RS 1w       ; boot cascade cursor (0=inactive, 1=A,2=B,3=C)
+SCRIPT_FDS       .RS 4w       ; fd stack (SCRIPT_MAX_DEPTH entries)
+SCRIPT_ARROW_COL .RS 1w       ; Part 61: column just after a brief-mode " -> ",
+                              ;   or 0 for none pending. _KoshPrintPrompt erases
+                              ;   the arrow when the cursor is still sitting on
+                              ;   it, i.e. the command printed nothing. 0 is a
+                              ;   safe "none" because the guard only consults
+                              ;   this when the column is non-zero, so the
+                              ;   zero-filled initial state can never match.
+SCRIPT_FLAGS     .RS 4w       ; Part 61: per-level presentation flags, parallel
+                              ;   to SCRIPT_FDS. Set at push from the invoking
+                              ;   line's switches; NOT inherited by nested
+                              ;   scripts, which get their own (0 unless they
+                              ;   were themselves invoked with a flag).
+; -- run args (Part 15) --
+RUN_ARG_PTR      .RS 1w       ; cmdline arg-tail offset for sys_exec (0 = none)
+.ENDREGION
+KSTATE_WORDS    .EQU    KSTATE_SIZE/2       ; words for kosh_entry zero-fill

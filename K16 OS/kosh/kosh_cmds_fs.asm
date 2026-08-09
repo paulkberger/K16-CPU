@@ -1,8 +1,131 @@
 ; ============================================================================
 ; kosh_cmds_fs.asm - kosh filesystem commands
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 39 - kosh.com migration.
+; Date:    8 August 2026
+; Status:  Part 64 - glob and ls carry long names and subdirectories.
+; Revision: r33 - 9 August 2026 - Part 64: mv's half-completed cross-drive
+;             move is reported as itself. _KoshMvOne's .m1_unlink_hard
+;             returned the raw unlink error, which both reporters printed
+;             through msg_mv_failed - so "the copy landed, the source is
+;             still there, the file exists at BOTH ends" read as "mv
+;             failed", i.e. as though nothing had happened. Wrong enough to
+;             act on: the obvious responses are to re-run the mv or delete
+;             the copy that did work. msg_mv_unlink_err had been defined
+;             and reserved for this since Part 37 and never wired.
+;             Now raises MV_ERR_UNLINK with the real code in MV_UNLINK_ERR,
+;             mirroring how MV_WARN_ROSRC already handles the SOFT version
+;             of the same event. That asymmetry - soft case named, hard
+;             case generic - was the tell.
+;           r32 - 9 August 2026 - Part 64 step 2: glob understands a
+;             directory part, on both sides.
+;             SOURCE: all four glob sites move from _KoshSplitDrivePat to
+;             _KoshSplitDirPat, so "rm sub/*.com", "cat b:/a/b/*.txt" and
+;             "cp gfx:*.com b:" work. Previously the whole argument became
+;             the basename pattern and matched nothing, with no message.
+;             DESTINATION (cp/mv only): the bare-"X:" requirement is gone;
+;             any existing directory will do. The blocker was never the
+;             destination parsing - it was that the src split overwrote
+;             CP_CWD_* with the GLOBBED SOURCE directory, so a relative dst
+;             would have resolved against the source. _KoshCpOne,
+;             _KoshMvOne and TRAP_RENAME each take ONE context for both
+;             paths, and TRAP_RENAME could not carry a split one without a
+;             kernel ABI change - so instead CP_CWD_* now stays on the
+;             shell CWD for the whole batch and the SOURCE is built as a
+;             full "<prefix><name>" path. Both sides are then shell-
+;             relative and the literal path's _KoshResolveDstPath does the
+;             destination join per item, exactly as it does for a single
+;             cp. The destination is checked ONCE up front and must be a
+;             directory: a file or a missing path would otherwise have
+;             every match join onto the same name, and item 2 would report
+;             "destination exists" - the symptom, not the mistake.
+;             .cp_glob_multidest / .mv_glob_multidest and
+;             msg_glob_multidest retire with the requirement they enforced.
+;           r31 - 9 August 2026 - Part 64 step 1: long names through glob
+;             and ls.
+;             (a) ls matched the wildcard against LS_DIRENT_BUF+$00 while
+;             printing +$20, so the filter and the row disagreed and
+;             `ls Mandel*` found nothing it would then have displayed. The
+;             display offset is now computed ONCE per entry into LS_NAMEPTR
+;             (_KoshDirentDisplay) and drives both, with an 8.3 fallback in
+;             the match (_KoshDirentMatch).
+;             (b) GLOB_ENTRY_SIZE 14 -> 32, so the eight open-coded *14
+;             shift-and-add chains go: the four reservation sites become
+;             SHL4 + SHL, and the four index sites become one CALL16 to
+;             _KoshGlobEntryPtr. Worst-case reservation rises 3584 -> 8192
+;             bytes against ~30 KB of free stack; derivation in
+;             kosh_defs.inc.
+;             Deliberately NOT in this revision: _KoshSplitDrivePat still
+;             has no '/' handling, so a source pattern with a directory
+;             component ("cp sub/*.com b:") still matches nothing, and a
+;             glob destination must still be a bare "X:". Both are step 2 -
+;             they need CP_CWD_* to stop pointing at the globbed source
+;             directory, which is a larger change than this one.
+;           r30 - 9 August 2026 - Part 62: .cp_glob_item_err and
+;             .mv_glob_item_err reported a garbage error code. Both
+;             PUSHed D0, then released the glob-table reservation with
+;             ADD X3 - which winds X3 up PAST the pushed slot - then
+;             POPped, reading residue out of the just-freed region. The
+;             code is now held in D3 across the release. Every observed
+;             "[ERR_UNKNOWN $253A]" was this, not a real status, so any
+;             earlier diagnosis resting on that value is void.
+;           r29 - 9 August 2026 - Part 62: KOSH_NORM_A/B are 80 bytes
+;             (KOSH_NORM_LEN) and every copy into them is bounded. The
+;             six glob name builds go through _KoshCopyBounded; the
+;             literal cp/mv path gets a CP_ERR_TOOLONG arm because
+;             _KoshResolveDstPath can now fail. The old 16-byte buffers
+;             were overrun by any directory-destination cp/mv with a
+;             name of ordinary length - "gfx/Mandelbrot.com" is 19 -
+;             which landed silently in CAT_BUF and so never showed.
+;           r28 - 9 August 2026 - Part 62: .do_load's destination is now
+;             CWD-relative. It was the last command still building its
+;             path through _KoshNormPath, which prepends "<KOSH_CWD>:";
+;             per the resolver convention an explicit "X:" prefix means
+;             start cluster 0, so every load landed in the drive root
+;             regardless of the current directory (`cd graphics` then
+;             `load ramdisk/GUI128F.com` wrote B:/GUI128F.com). Now the
+;             raw basename is passed with CWD context in D1/D2, the same
+;             shape .do_cat and cp/mv took in Part 44. Side effect: the
+;             destination path no longer stages through KOSH_NORM_A, so
+;             the 16-byte buffer no longer caps the name - "B:" +
+;             "Mandelbrot.com" + nul was already a 1-byte overrun into
+;             KOSH_NORM_B.
+;           r27 - 8 August 2026 - Part 61: .cd_resolve's two failure arms
+;             consult CD_BARE. Entered from the bare colon-token route, a
+;             non-directory target (or ERR_NOTFOUND) is an executable rather
+;             than a failed cd, so control returns to .nds_nocolon and takes
+;             the cmd_table-miss -> .unknown -> _KoshExecFile path. Entered
+;             from `cd`, behaviour is unchanged. .do_cd clears CD_BARE.
+;           r26 - 8 August 2026 - Part 61: .do_load accepts an optional
+;             host-folder prefix, e.g. `load ramdisk/zork.com`, selecting
+;             the host's system/ramdisk folder instead of the default
+;             uploads folder. LOAD_NAME keeps the full token (the prefix is
+;             what the EMU resolves the folder from); the new LOAD_BASENAME
+;             holds the last '/'-separated component and is what feeds
+;             _KoshNormPath. Without the split _KoshNormPath reads '/' as a
+;             k/OS separator and tries to create the file inside a directory
+;             named "ramdisk" on the destination drive. Also added an
+;             early silent return on HOST_DIGITAL: A:STARTUP.KSH carries
+;             `load` lines that run on every target, and the host bridge is
+;             EMU-only, so Digital would otherwise print one failure per
+;             line at boot.
+;           r25 - 2 August 2026 - Part 26: .do_load stores the host file
+;             size as a 32-bit pair (LOAD_SIZE_LO/HI) now that _HostFOpen
+;             returns D1:D0, checks it against LOAD_WRITTEN before
+;             reporting success, and renders the count with the new
+;             _KoshEmitDec32. Previously the message truncated at 64 KB.
+;           r24 - 17 June 2026 - Part 44 (Phase 2b): cat/rm/run/cp/mv made
+;             CWD-relative. These commands drop _KoshNormPath (which only
+;             prepended the CWD drive *letter*, pinning everything to root)
+;             and instead pass the raw arg plus CWD context (cluster + drive
+;             index) so the kernel resolver applies an "X:" prefix, a leading
+;             "/", or a CWD-relative subpath. cp/mv share new CP_CWD_CLU/DRV
+;             slots (set via _KoshStashCwd) consumed at each open/rename/
+;             unlink. _KoshExpandBareDst (prefix-only bare-drive hack)
+;             replaced by _KoshResolveDstPath: if the dst resolves to an
+;             existing directory, the path becomes "<dst>/<src-basename>"
+;             (covers bare "b:" and any subdir like "b:/foo"). Glob cp/mv
+;             stay root-only (subdir glob is a later step); _KoshNormPath
+;             is now used only by .do_load.
 ; Revision: r23 - 29 May 2026 - Part 39: kosh.com migration. 126 CALL24
 ;             _Kosh* helper calls converted to CALL16, and 88 string
 ;             references switched from
@@ -128,7 +251,7 @@
 ;             cause; the workaround sidesteps it by always creating fresh.
 ;
 ;           r16 - 11 May 2026 - Part 25 r7 fix: bg flag now stashed in
-;             task-local RUN_BG_TMP word ($45F8) across TRAP_EXEC, instead
+;             task-local RUN_BG word ($45F8) across TRAP_EXEC, instead
 ;             of via PUSH D / POP D. The PUSH/POP approach clobbered D2
 ;             (which holds the returned TID), causing sys_wait to be
 ;             called with a garbage TID -> ERR_BADARG ($FFF9).
@@ -282,7 +405,7 @@
 ;                 HI<>0, fits KB -> "<kb> KB"
 ;                 KB > 65535     -> "BIG"
 ;             - kosh.asm scratch layout extended: LS_TOTAL_HI added
-;               at $40A4; LS_SIZE_TMP / LS_DRIVE_TMP / LS_INDEX_TMP /
+;               at $40A4; LS_SIZE / LS_DRIVE / LS_INDEX /
 ;               CAT_BUF all shifted up by 1 word.
 ;             - ls usage string updated: "drive=A..F" (was "A:|B:").
 ;
@@ -317,9 +440,9 @@
 ;             - Bug was hidden until r17: until disk populate started
 ;               creating multiple files, B: never had more than one
 ;               entry, and ls treats any error as "end of dir".
-;             - Fix: stash drive in LS_DRIVE_TMP, index in LS_INDEX_TMP
+;             - Fix: stash drive in LS_DRIVE, index in LS_INDEX
 ;               (new zero-page kosh-page slots, $40A6/$40A8). Re-load
-;               at top of each iteration; bump LS_INDEX_TMP at the
+;               at top of each iteration; bump LS_INDEX at the
 ;               bottom. CAT_BUF moved up 4 bytes ($40A6 -> $40AA) to
 ;               make room.
 ;
@@ -398,17 +521,18 @@
 
                 ; Loop drives 0..FS_MAX_DRIVES-1.
                 LOADI   D0, #0
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 .dv_loop:
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 CMP     D0, #FS_MAX_DRIVES
                 BHS.S   .dv_done
                 CALL16  _KoshPrintVolLine       ; D0 = drive index
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 ADD     D0, #1
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
                 BRA     .dv_loop
 .dv_done:
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 
@@ -432,109 +556,254 @@
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1                 ; step past nul
 
-                ; Skip leading whitespace.
-.ls_skip_ws:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BEQ     .ls_advance_ws
-                BRA     .ls_check_arg
-.ls_advance_ws:
-                INC     XY0, #1
-                BRA     .ls_skip_ws
-
+                ; Next token = optional drive/path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .ls_default              ; no arg -> default drive
+                LEA     XY0, XY1                 ; XY0 = arg start (ASCIIZ)
 .ls_check_arg:
+                ; Stash the arg pointer (offset; page = Y3) — we re-walk it.
+                MOVE    D0, X0
+                STOREP  D0, Y3, [#LS_ARG_PTR]
                 LOADB   D0, [XY0]
                 CMP     D0, #0
                 BEQ     .ls_default
 
-                ; Arg present. Split into drive + basename pattern. This
-                ; accepts "B:", "B:*.TXT", "*.TXT" (bare pattern -> CWD drive),
-                ; etc. Drive letter is validated A..F inside the helper.
-                CALL16  _KoshSplitDrivePat      ; D0=drive, XY1=basename ptr
-                BCS     .ls_usage               ; bad drive letter
+                ; ============================================================
+                ; Full path/wildcard matrix (Phase 2a):
+                ;   basename = chars after last '/', or after "X:" if no '/',
+                ;              or the whole arg otherwise.
+                ;   If basename has a wildcard ('*'/'?') -> it's the PATTERN and
+                ;      the part before it is the directory to resolve.
+                ;   Else -> the WHOLE arg is the directory; pattern = "*".
+                ; ============================================================
 
-                MOVE    D2, D0                  ; D2 = drive index
-                ; Is the basename empty (arg was just "X:")? If so, match all.
-                LOADB   D0, [XY1]
+                ; --- scan for last '/' and drive prefix -------------------
+                ; XY0 = arg start. Walk to nul, remembering last-slash offset.
+                ; D1 = last-slash absolute offset, $FFFF = none.
+                LOADI   D1, #$FFFF              ; last_slash = none
+.ls_scan:
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
                 CMP     D0, #0
-                BNE.S   .ls_pat_explicit
-                ; Empty basename -> pattern "*".
+                BEQ.S   .ls_scan_done
+                CMP     D0, #'/'
+                BNE.S   .ls_scan_adv
+                MOVE    D1, X0                  ; record this slash offset
+.ls_scan_adv:
+                INC     XY0, #1
+                BRA     .ls_scan
+.ls_scan_done:
+
+                ; --- compute basename start offset ------------------------
+                ; if last_slash != none -> basename = last_slash + 1
+                ; else if "X:" prefix   -> basename = arg + 2
+                ; else                  -> basename = arg
+                CMP     D1, #$FFFF
+                BEQ.S   .ls_no_slash
+                MOVE    D2, D1
+                ADD     D2, #1                  ; basename_start = slash+1
+                BRA     .ls_have_basename
+.ls_no_slash:
+                ; drive prefix? arg[0] alpha and arg[1] == ':'
+                LOADP   D0, Y3, [#LS_ARG_PTR]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                LOADB   D0, [XY0]               ; arg[0]
+                AND     D0, #$FF
+                CALL16  _KoshIsAlpha            ; C=0 if alpha (helper below)
+                BCS     .ls_basename_is_arg
+                INC     XY0, #1
+                LOADB   D0, [XY0]               ; arg[1]
+                AND     D0, #$FF
+                CMP     D0, #':'
+                BNE     .ls_basename_is_arg
+                ; prefix present: basename_start = arg + 2
+                LOADP   D2, Y3, [#LS_ARG_PTR]
+                ADD     D2, #2
+                BRA     .ls_have_basename
+.ls_basename_is_arg:
+                LOADP   D2, Y3, [#LS_ARG_PTR]   ; basename_start = arg
+.ls_have_basename:
+                ; D2 = basename_start offset. Stash it (reuse LS_INDEX
+                ; briefly — it's set to 0 later in loop setup).
+                STOREP  D2, Y3, [#LS_INDEX]
+
+                ; --- wildcard in basename? --------------------------------
+                MOVE    X0, D2
+                MOVE    Y0, Y3
+.ls_wild_scan:
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
+                CMP     D0, #0
+                BEQ     .ls_no_wild
+                CMP     D0, #'*'
+                BEQ     .ls_is_wild
+                CMP     D0, #'?'
+                BEQ     .ls_is_wild
+                INC     XY0, #1
+                BRA     .ls_wild_scan
+
+.ls_is_wild:
+                ; pattern = basename (offset in LS_INDEX); directory =
+                ; part before basename.
+                LOADP   D0, Y3, [#LS_INDEX] ; basename_start
+                STOREP  D0, Y3, [#LS_PAT_PTR]
+                ; Was there a slash? -> resolve the dir up to it.
+                CMP     D1, #$FFFF
+                BEQ     .ls_wild_noslash
+                ; Resolve dir part = arg[0..slash). _KoshLsResolveDir handles
+                ; the temporary nul-at-offset + restore internally.
+                ;   In: XY0 = arg start, D1 = terminate offset (the slash)
+                LOADP   D0, Y3, [#LS_ARG_PTR]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                CALL16  _KoshLsResolveDir       ; D1=term off -> D2=drive, LS_CLU; C=1 err
+                BCS     .ls_resolve_err
+                BRA     .ls_have_drive
+.ls_wild_noslash:
+                ; no slash: dir = CWD, or "X:" root if prefix present.
+                LOADP   D0, Y3, [#LS_ARG_PTR]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                LOADB   D0, [XY0]               ; arg[0]
+                AND     D0, #$FF
+                CALL16  _KoshIsAlpha
+                BCS     .ls_wild_cwd
+                INC     XY0, #1
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
+                CMP     D0, #':'
+                BNE     .ls_wild_cwd
+                ; "X:" prefix -> that drive's root.
+                LOADP   D0, Y3, [#LS_ARG_PTR]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                LOADB   D0, [XY0]
+                CALL16  _KoshFoldChar
+                SUB     D0, #'A'
+                MOVE    D2, D0                  ; D2 = drive index
+                LOADI   D0, #0
+                STOREP  D0, Y3, [#LS_CLU]   ; root
+                BRA     .ls_have_drive
+.ls_wild_cwd:
+                ; CWD drive + CWD cluster.
+                MOVE    Y0, Y3
+                LOADI   X0, #KOSH_CWD
+                LOADB   D0, [XY0]
+                SUB     D0, #'A'
+                MOVE    D2, D0
+                LOADI   X0, #KOSH_CWD_CLU
+                LOADD   D0, [XY0]
+                STOREP  D0, Y3, [#LS_CLU]
+                BRA     .ls_have_drive
+
+.ls_no_wild:
+                ; Whole arg is a directory; pattern = "*".
                 MOVE    Y0, Y3
                 LOADI   X0, #ls_star_pat
                 STOREP  X0, Y3, [#LS_PAT_PTR]
-                BRA     .ls_have_drive
-.ls_pat_explicit:
-                ; Pattern = basename pointer (XY1).
-                MOVE    D0, X1
-                STOREP  D0, Y3, [#LS_PAT_PTR]
+                ; resolve whole arg (terminate offset = $FFFF -> none).
+                LOADP   D0, Y3, [#LS_ARG_PTR]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                LOADI   D1, #$FFFF
+                CALL16  _KoshLsResolveDir       ; -> D2=drive, LS_CLU; C=1 err
+                BCS     .ls_resolve_err
                 BRA     .ls_have_drive
 
+.ls_resolve_err:
+                ; D0 = err from sys_resolve (NOTFOUND/NOTDIR/BADPATH/...).
+                ; ERR_NOTDIR gets a friendlier message.
+                CMP     D0, #ERR_NOTDIR
+                BNE.S   .ls_resolve_err_generic
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_ls_notdir
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+.ls_resolve_err_generic:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_ls_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
 .ls_default:
-                ; No arg: default to current working drive, match-all pattern.
+                ; No arg: list CWD (drive + cluster), match-all pattern.
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_CWD
                 LOADB   D0, [XY0]
                 SUB     D0, #'A'                ; D0 = drive index 0..5
                 MOVE    D2, D0
                 MOVE    Y0, Y3
+                LOADI   X0, #KOSH_CWD_CLU
+                LOADD   D0, [XY0]
+                STOREP  D0, Y3, [#LS_CLU]
+                MOVE    Y0, Y3
                 LOADI   X0, #ls_star_pat
                 STOREP  X0, Y3, [#LS_PAT_PTR]
 
 .ls_have_drive:
-                ; --- Print header: "<DRV>: <LABEL>\n" ---------------------
-                ; D2 = drive index (0..5).
-                ;
-                ; Compute slot offset = VOL_TABLE_BASE + drive*VOL_SLOT_SIZE
-                ; in D3. VOL_SLOT_SIZE = 64. Cheaper than x64 via 6 SHL: do
-                ; x16 via SHL4 then x4 via two SHLs (3 instructions, 9 cyc
-                ; vs 6 instructions, 18 cyc).
-                MOVE    D3, D2
-                SHL4    D3                      ; x16
-                SHL     D3                      ; x32
-                SHL     D3                      ; x64
-                ADD     D3, #VOL_TABLE_BASE     ; D3 = slot offset
+                ; Stash drive early - used by the header pwd and the walk loop
+                ; below (sys_pwd may clobber D2, so don't rely on it after).
+                STOREP  D2, Y3, [#LS_DRIVE]
+
+                ; --- Header: "  <full path>\n" via sys_pwd ----------------
+                ; Reverse-resolve the listed dir (drive + LS_CLU) to its
+                ; full path, so subdirs show e.g. "B:/test dir" rather than
+                ; just the volume label. Lay the 2-space indent into ROW_BUF
+                ; by hand, then let sys_pwd write the path at ROW_BUF+2.
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                LOADI   D0, #CH_SPACE
+                STOREB  D0, [XY0]+
+                STOREB  D0, [XY0]+
+                LOADP   D0, Y3, [#LS_DRIVE]   ; D0 = drive index
+                LOADP   D1, Y3, [#LS_CLU]     ; D1 = listed cluster (0=root)
+                TRAP    #TRAP_PWD
+                BCS     .ls_hdr_fallback
+
+                ; ROW_BUF = "  X:/path"\0 ; append LF + nul.
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                CALL24  KLIB_STRLEN              ; XY0 -> nul
+                LOADI   D0, #CH_LF
+                STOREB  D0, [XY0]+
+                LOADI   D0, #0
+                STOREB  D0, [XY0]
+                BRA     .ls_hdr_emit
+
+.ls_hdr_fallback:
+                ; sys_pwd failed (shouldn't happen) - emit "  X:/\n".
                 MOVE    Y1, Y3
                 LOADI   X1, #ROW_BUF
-
-                ; "  " (2-space indent - matches vol/disks/task layout)
                 LOADI   D0, #CH_SPACE
                 CALL16  _KoshEmitByte
-                LOADI   D0, #CH_SPACE
                 CALL16  _KoshEmitByte
-
-                MOVE    D0, D2
+                LOADP   D0, Y3, [#LS_DRIVE]
                 ADD     D0, #'A'                ; drive index -> letter
                 CALL16  _KoshEmitByte
                 LOADI   D0, #':'
                 CALL16  _KoshEmitByte
-                LOADI   D0, #CH_SPACE
+                LOADI   D0, #'/'
                 CALL16  _KoshEmitByte
-
-                ; Copy 11-byte VOL_LABEL from kernel slot.
-                LOADI   Y0, #$00
-                MOVE    X0, D3
-                ADD     X0, #VOL_LABEL
-                LOADI   D1, #11
-.ls_hdr_lbl_loop:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
-                SUB     D1, #1
-                BNE     .ls_hdr_lbl_loop
-
                 LOADI   D0, #CH_LF
                 CALL16  _KoshEmitByte
                 LOADI   D0, #0
                 CALL16  _KoshEmitByte
 
+.ls_hdr_emit:
+                ; name-aware header: emit the 2-space indent, then substitute
+                ; the drive letter with a named volume if one exists.
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_two_sp
+                TRAP    #TRAP_PUTS
                 MOVE    Y0, Y3
                 LOADI   X0, #ROW_BUF
-                TRAP    #TRAP_PUTS
+                ADD     X0, #2                  ; skip the baked-in indent
+                CALL16  _KoshEmitPwdNamed
 
                 ; --- Walk directory via sys_dirent ------------------------
-                ; D2 = drive (preserved across loop via LS_DRIVE_TMP)
-                ; D3 = index (preserved across loop via LS_INDEX_TMP)
+                ; D2 = drive (preserved across loop via LS_DRIVE)
+                ; D3 = index (preserved across loop via LS_INDEX)
                 ;
                 ; r18: stash D2/D3 in zero-page slots before any _KoshEmit*
                 ; helper call that would clobber them. _KoshEmitDec clobbers
@@ -549,30 +818,41 @@
                 ; revealed it: index jumped 0->2 and second call returned $FFDF.
                 LOADI   D0, #0
                 STOREP  D0, Y3, [#LS_FILE_COUNT]
+                STOREP  D0, Y3, [#LS_DIR_COUNT]
                 STOREP  D0, Y3, [#LS_TOTAL_LO]
                 STOREP  D0, Y3, [#LS_TOTAL_HI]
 
-                STOREP  D2, Y3, [#LS_DRIVE_TMP]
+                ; (LS_DRIVE already stashed at .ls_have_drive.)
                 LOADI   D3, #0                  ; D3 = index
-                STOREP  D3, Y3, [#LS_INDEX_TMP]
+                STOREP  D3, Y3, [#LS_INDEX]
 
 .ls_loop:
-                ; Re-load drive + index (might have been clobbered last iter
-                ; by the row-build helpers).
-                LOADP   D0, Y3, [#LS_DRIVE_TMP]
-                LOADP   D1, Y3, [#LS_INDEX_TMP]
+                ; Re-load drive + index + cluster (clobbered last iter by the
+                ; row-build helpers).
+                LOADP   D0, Y3, [#LS_DRIVE]
+                LOADP   D1, Y3, [#LS_INDEX]
+                LOADP   D2, Y3, [#LS_CLU]   ; directory cluster (0=root)
                 MOVE    Y0, Y3
                 LOADI   X0, #LS_DIRENT_BUF
                 TRAP    #TRAP_DIRENT
                 BCS     .ls_done
 
-                ; --- Wildcard filter (Part 37) ---------------------------
-                LOADP   D0, Y3, [#LS_PAT_PTR]
-                MOVE    Y0, Y3
-                MOVE    X0, D0                  ; XY0 = pattern
-                MOVE    Y1, Y3
-                LOADI   X1, #LS_DIRENT_BUF      ; XY1 = name
-                CALL16  _KoshFnMatch
+                ; --- Display name (Part 64) ------------------------------
+                ; +$20 when this entry has a VFAT long name, else +$00.
+                ; Computed once and kept, because the filter below and the
+                ; row emit further down MUST agree on which name they mean.
+                ; They did not before Part 64: the filter matched the 8.3
+                ; name while the row printed the long one, so `ls Mandel*`
+                ; found nothing it would then have displayed.
+                LOADI   D0, #LS_DIRENT_BUF
+                CALL16  _KoshDirentDisplay
+                STOREP  D0, Y3, [#LS_NAMEPTR]
+
+                ; --- Wildcard filter (Part 37; Part 64: 8.3 fallback) ----
+                MOVE    D2, D0                  ; D2 = display name offset
+                LOADI   D1, #LS_DIRENT_BUF      ; D1 = 8.3 name offset
+                LOADP   D0, Y3, [#LS_PAT_PTR]   ; D0 = pattern offset
+                CALL16  _KoshDirentMatch
                 BCS     .ls_skip                ; no match -> skip entry
 
                 ; Build row in ROW_BUF.
@@ -585,11 +865,17 @@
                 LOADI   D0, #CH_SPACE
                 CALL16  _KoshEmitByte
 
-                ; Emit display name padded to 12 columns.
+                ; Emit the display name selected above (Part 64: LS_NAMEPTR,
+                ; so the row shows exactly what the filter matched). The
+                ; probe that used to sit here has moved to the top of the
+                ; loop - duplicating it was how the two came to disagree.
+                ; _KoshEmitNameLong does not truncate, so names > 12 cols
+                ; overflow the field (that row's size just shifts right).
                 MOVE    Y0, Y3
-                LOADI   X0, #LS_DIRENT_BUF
-                LOADI   D2, #12                 ; field width
-                CALL16  _KoshEmitNamePadded
+                LOADP   D0, Y3, [#LS_NAMEPTR]
+                MOVE    X0, D0
+                LOADI   D2, #32                 ; field width = LFN_MAX+1 (long names align)
+                CALL16  _KoshEmitNameLong
 
                 ; Two-space separator.
                 LOADI   D0, #CH_SPACE
@@ -599,9 +885,12 @@
                 ; Size: read 32-bit field at LS_DIRENT_BUF+$10 (low) and
                 ; LS_DIRENT_BUF+$12 (high).
                 ;
-                ; Print rules (per file):
-                ;   Always show the low 16 bits as decimal if the file fits;
-                ;   otherwise print "BIG". (Existing behaviour - unchanged.)
+                ; Print rules (Part 26):
+                ;   Human form via _KoshEmitSize, right-aligned in 9 to match
+                ;   vol's column. Replaces "low 16 bits as decimal, else the
+                ;   literal string BIG" -- files above 64 KB are ordinary now
+                ;   that the fd layer carries a 32-bit position, and BIG was
+                ;   never a size.
                 ;
                 ; Tally rules (Part 22):
                 ;   ALWAYS accumulate the full 32-bit size into LS_TOTAL_LO/HI,
@@ -614,6 +903,46 @@
                 LOADI   X0, #LS_DIRENT_BUF+$12
                 LOADD   D3, [XY0]               ; D3 = size_hi
 
+                ; --- Directory? show "<DIR>" instead of a size -------------
+                ; DIRENT_INFO attribute byte is at +$0C (set by
+                ; _FatEntryToInfo from raw dirent $0B). If DIR_ATTR_DIRECTORY
+                ; is set, emit "<DIR>" and skip both the size accumulate and
+                ; the decimal/BIG print. (A dir's size field is 0, so the
+                ; total is unaffected either way; skipping is just cleaner.)
+                MOVE    Y0, Y3
+                LOADI   X0, #LS_DIRENT_BUF+$0C
+                LOADB   D0, [XY0]
+                AND     D0, #DIR_ATTR_DIRECTORY
+                BEQ     .ls_not_dir
+                ; It's a directory. Part 26: the size column is now
+                ; right-aligned in 9, so "<DIR>" (5 chars) needs 4 leading
+                ; spaces to sit in the same column as a size.
+                LOADI   D0, #CH_SPACE
+                CALL16  _KoshEmitByte
+                CALL16  _KoshEmitByte
+                CALL16  _KoshEmitByte
+                CALL16  _KoshEmitByte
+                LOADI   D0, #'<'
+                CALL16  _KoshEmitByte
+                LOADI   D0, #'D'
+                CALL16  _KoshEmitByte
+                LOADI   D0, #'I'
+                CALL16  _KoshEmitByte
+                LOADI   D0, #'R'
+                CALL16  _KoshEmitByte
+                LOADI   D0, #'>'
+                CALL16  _KoshEmitByte
+                ; count this directory (Windows counts . and .. too).
+                LOADP   D0, Y3, [#LS_DIR_COUNT]
+                ADD     D0, #1
+                STOREP  D0, Y3, [#LS_DIR_COUNT]
+                BRA     .ls_after_size
+
+.ls_not_dir:
+                ; count this file.
+                LOADP   D0, Y3, [#LS_FILE_COUNT]
+                ADD     D0, #1
+                STOREP  D0, Y3, [#LS_FILE_COUNT]
                 ; --- 32-bit accumulate: total += (D3:D2) ------------------
                 LOADP   D0, Y3, [#LS_TOTAL_LO]
                 LOADP   D1, Y3, [#LS_TOTAL_HI]
@@ -622,23 +951,15 @@
                 STOREP  D0, Y3, [#LS_TOTAL_LO]
                 STOREP  D1, Y3, [#LS_TOTAL_HI]
 
-                ; --- Per-row print: decide BIG vs decimal -----------------
-                CMP     D3, #0
-                BNE     .ls_size_big
-
-                ; Low-word fits in 16 bits - print as decimal.
-                ; D2 holds size_lo; _KoshEmitDec wants D0.
-                MOVE    D0, D2
-                CALL16  _KoshEmitDec
-                BRA     .ls_after_size
-
-.ls_size_big:
-                LOADI   D0, #'B'
-                CALL16  _KoshEmitByte
-                LOADI   D0, #'I'
-                CALL16  _KoshEmitByte
-                LOADI   D0, #'G'
-                CALL16  _KoshEmitByte
+                ; --- Per-row print: human form, right-aligned in 9 --------
+                ; _KoshEmitSize takes D1:D0 = count and D2 = field width, and
+                ; clobbers D0..D3 -- safe here, the 32-bit accumulate above
+                ; has already consumed D3:D2 and nothing past .ls_after_size
+                ; reads them.
+                MOVE    D0, D2                  ; D0 = size low
+                MOVE    D1, D3                  ; D1 = size high
+                LOADI   D2, #9                  ; field width, matches vol
+                CALL16  _KoshEmitSize
 
 .ls_after_size:
                 LOADI   D0, #CH_LF
@@ -650,102 +971,242 @@
                 LOADI   X0, #ROW_BUF
                 TRAP    #TRAP_PUTS
 
-                ; Tally and advance.
-                LOADP   D0, Y3, [#LS_FILE_COUNT]
+                ; Advance index (the file/dir count was bumped in its branch).
+                LOADP   D0, Y3, [#LS_INDEX]
                 ADD     D0, #1
-                STOREP  D0, Y3, [#LS_FILE_COUNT]
-
-                LOADP   D0, Y3, [#LS_INDEX_TMP]
-                ADD     D0, #1
-                STOREP  D0, Y3, [#LS_INDEX_TMP]
+                STOREP  D0, Y3, [#LS_INDEX]
                 BRA     .ls_loop
 
 .ls_skip:
                 ; Non-matching entry: advance index only (no row, no tally).
-                LOADP   D0, Y3, [#LS_INDEX_TMP]
+                LOADP   D0, Y3, [#LS_INDEX]
                 ADD     D0, #1
-                STOREP  D0, Y3, [#LS_INDEX_TMP]
+                STOREP  D0, Y3, [#LS_INDEX]
                 BRA     .ls_loop
 
 .ls_done:
-                ; --- Footer: "<n> file(s), <total> bytes\n"  or
-                ;             "<n> file(s), <total> KB\n"     or
-                ;             "<n> file(s), BIG\n"
-                ;
-                ; Rule: if HI=0 and LO < $10000, print bytes (always true
-                ; when HI=0). If HI != 0, divide (HI:LO) by 1024 and print KB.
-                ; If KB total still exceeds 16 bits (>= 64 MB), print "BIG".
+                ; --- Footer: two aligned, pluralised lines ----------------
+                ;     "  <count> <word> <size> used"
+                ;     "  <count> <word> <size> free"
+                ; Fixed columns so size + used/free line up: count right-
+                ; aligned (w4), word left-padded (w5), size right-aligned (w9).
+                ; used = sum of file sizes; free = disk free. Singular word
+                ; when the count is exactly 1.
+
+                ; ---- Line 1: files + used ----
                 MOVE    Y1, Y3
                 LOADI   X1, #ROW_BUF
-
-                ; "  " (2-space indent - matches vol/disks/task layout)
                 LOADI   D0, #CH_SPACE
                 CALL16  _KoshEmitByte
-                LOADI   D0, #CH_SPACE
                 CALL16  _KoshEmitByte
 
                 LOADP   D0, Y3, [#LS_FILE_COUNT]
-                CALL16  _KoshEmitDec
+                LOADI   D2, #3                  ; count field (left-aligned)
+                CALL16  _KoshEmitDecL
 
+                LOADP   D0, Y3, [#LS_FILE_COUNT]
+                CMP     D0, #1
+                BNE     .ls_word_files
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_ls_files
-                CALL16  _KoshEmitStrZ
+                LOADI   X0, #msg_cnt_file
+                BRA     .ls_word_femit
+.ls_word_files:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_cnt_files
+.ls_word_femit:
+                LOADI   D2, #6                  ; word field (left-padded)
+                CALL16  _KoshEmitNamePadded
 
-                ; --- Used size: human-readable via _KoshEmitSize (Part 34) ---
-                ; Pre-r19 this branched into bytes/KB/BIG paths with a 32-bit
-                ; shift-divide; _KoshEmitSize now picks the unit and handles
-                ; sizes up to GB cleanly. Width=0 = raw (no padding, no
-                ; clipping).
                 LOADP   D0, Y3, [#LS_TOTAL_LO]
                 LOADP   D1, Y3, [#LS_TOTAL_HI]
-                LOADI   D2, #0                  ; raw mode
+                LOADI   D2, #9                  ; size field (right-aligned)
                 CALL16  _KoshEmitSize
-
+                LOADI   D0, #CH_SPACE
+                CALL16  _KoshEmitByte
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_ls_used
+                LOADI   X0, #msg_ls_used        ; "used\n"
                 CALL16  _KoshEmitStrZ
+                LOADI   D0, #0
+                CALL16  _KoshEmitByte
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                TRAP    #TRAP_PUTS
 
-                ; --- Free size on the listed drive (Part 34) ------------------
-                ; sys_diskfree(D0=drive) -> D0=free_clusters, D1=total_clusters,
-                ; D2=cluster_size_bytes. Compute free_bytes = free*cluster_sz.
-                LOADP   D0, Y3, [#LS_DRIVE_TMP]
+                ; ---- Line 2: dirs + free ----
+                MOVE    Y1, Y3
+                LOADI   X1, #ROW_BUF
+                LOADI   D0, #CH_SPACE
+                CALL16  _KoshEmitByte
+                CALL16  _KoshEmitByte
+
+                LOADP   D0, Y3, [#LS_DIR_COUNT]
+                LOADI   D2, #3
+                CALL16  _KoshEmitDecL
+
+                LOADP   D0, Y3, [#LS_DIR_COUNT]
+                CMP     D0, #1
+                BNE     .ls_word_dirs
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_cnt_dir
+                BRA     .ls_word_demit
+.ls_word_dirs:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_cnt_dirs
+.ls_word_demit:
+                LOADI   D2, #6
+                CALL16  _KoshEmitNamePadded
+
+                ; free bytes = free_clusters * cluster_size on the listed drive
+                LOADP   D0, Y3, [#LS_DRIVE]
                 TRAP    #TRAP_DISKFREE
-                BCS.S   .ls_skip_free
-
-                ; D0 = free clusters; D2 = cluster_sz. KLIB_MUL takes D0,D1
-                ; -> D1:D0 product. Move cluster_sz into D1.
-                MOVE    D1, D2
+                BCS     .ls_skip_free
+                MOVE    D1, D2                  ; D1 = cluster_sz
                 CALL24  KLIB_MUL16x16_32        ; D1:D0 = free bytes
-                LOADI   D2, #0                  ; raw
+                LOADI   D2, #9                  ; size field (right-aligned)
                 CALL16  _KoshEmitSize
-
+                LOADI   D0, #CH_SPACE
+                CALL16  _KoshEmitByte
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_ls_free
+                LOADI   X0, #msg_ls_free        ; "free\n"
                 CALL16  _KoshEmitStrZ
-                BRA.S   .ls_emit_row
+                BRA     .ls_emit_row
 
 .ls_skip_free:
-                ; sys_diskfree failed - shouldn't happen (we just walked the
-                ; directory, so the volume is mounted). Close the line with
-                ; a bare LF and skip the free figure.
                 LOADI   D0, #CH_LF
                 CALL16  _KoshEmitByte
 
 .ls_emit_row:
                 LOADI   D0, #0
                 CALL16  _KoshEmitByte
-
                 MOVE    Y0, Y3
                 LOADI   X0, #ROW_BUF
                 TRAP    #TRAP_PUTS
 
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
+
 
 .ls_usage:
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_ls_usage
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
+; _KoshIsAlpha - C=0 if D0 (low byte) is A..Z or a..z, else C=1.
+;   D0 preserved. Clobbers nothing else.
+; ----------------------------------------------------------------------------
+_KoshIsAlpha:
+                PUSH    D1, XY3
+                MOVE    D1, D0
+                AND     D1, #$FF
+                CMP     D1, #'A'
+                BLO.S   .kia_no
+                CMP     D1, #$5B                ; 'Z'+1
+                BLO.S   .kia_yes
+                CMP     D1, #'a'
+                BLO.S   .kia_no
+                CMP     D1, #$7B                ; 'z'+1
+                BHS.S   .kia_no
+.kia_yes:
+                POP     D1, XY3
+                CLC
+                RET
+.kia_no:
+                POP     D1, XY3
+                SEC
+                RET
+
+
+; ----------------------------------------------------------------------------
+; _KoshLsResolveDir - resolve a directory path for `ls`, set D2=drive +
+;   LS_CLU=cluster. Optionally terminates the path at an offset first
+;   (for "dir/PATTERN" splitting) and restores it after.
+;
+;   In:  XY0 = path start (task page)
+;        D1  = terminate offset within the page ($FFFF = use whole string)
+;   Out: C=0 with D2 = drive index, LS_CLU = directory cluster
+;        C=1 with D0 = ERR_* (NOTDIR if the path resolves to a non-directory)
+;   Clobbers: D0, D1, D2, D3, XY0, XY1
+;   Preserves: XY2, XY3
+;
+;   Uses sys_resolve with CWD context (KOSH_CWD drive + KOSH_CWD_CLU), so
+;   relative paths and "X:" prefixes both work. The result must be a
+;   directory; a file yields ERR_NOTDIR. State is kept in LS_* ZP scratch
+;   (no stack juggling): LS_RD_ARG (path ptr), LS_RD_OFF (term offset),
+;   LS_RD_BYTE (saved byte).
+; ----------------------------------------------------------------------------
+_KoshLsResolveDir:
+                ; Stash path ptr + term offset.
+                MOVE    D2, X0
+                STOREP  D2, Y3, [#LS_RD_ARG]
+                STOREP  D1, Y3, [#LS_RD_OFF]
+
+                ; If terminating, save the byte and write a nul.
+                CMP     D1, #$FFFF
+                BEQ.S   .lrd_resolve
+                MOVE    X1, D1
+                MOVE    Y1, Y3
+                LOADB   D2, [XY1]
+                STOREP  D2, Y3, [#LS_RD_BYTE]   ; saved original byte
+                LOADI   D2, #0
+                STOREB  D2, [XY1]               ; nul-terminate the dir part
+
+.lrd_resolve:
+                ; sys_resolve(XY0=path, D0=cwd drive, D1=cwd clu).
+                LOADP   D0, Y3, [#LS_RD_ARG]
+                MOVE    X0, D0
+                MOVE    Y0, Y3                  ; XY0 = path start
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]
+                SUB     D0, #'A'                ; CWD drive index
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
+                TRAP    #TRAP_RESOLVE           ; -> D0=drive, D1=clu, D2=attr
+
+                ; Stash resolve outputs in ZP before the byte-restore.
+                STOREP  D0, Y3, [#LS_RD_DRV]
+                STOREP  D1, Y3, [#LS_RD_CLU]
+                STOREP  D2, Y3, [#LS_RD_ATTR]
+                ; Capture carry by branching now (before any flag-touching op).
+                BCS     .lrd_restore_then_err
+
+                ; --- success path: restore byte, then validate dir --------
+                CALL16  _KoshLsRestoreByte
+                LOADP   D2, Y3, [#LS_RD_ATTR]
+                AND     D2, #DIR_ATTR_DIRECTORY
+                BEQ.S   .lrd_notdir
+                LOADP   D2, Y3, [#LS_RD_DRV]    ; D2 = drive index
+                LOADP   D0, Y3, [#LS_RD_CLU]
+                STOREP  D0, Y3, [#LS_CLU]
+                CLC
+                RET
+
+.lrd_notdir:
+                LOADI   D0, #ERR_NOTDIR
+                SEC
+                RET
+
+.lrd_restore_then_err:
+                CALL16  _KoshLsRestoreByte
+                LOADP   D0, Y3, [#LS_RD_DRV]    ; resolve put err code in D0
+                SEC
+                RET
+
+; _KoshLsRestoreByte - if LS_RD_OFF != $FFFF, write LS_RD_BYTE back at that
+;   offset (page = Y3). Clobbers D0, D1, XY1.
+_KoshLsRestoreByte:
+                LOADP   D1, Y3, [#LS_RD_OFF]
+                CMP     D1, #$FFFF
+                BEQ.S   .lrb_done
+                MOVE    X1, D1
+                MOVE    Y1, Y3
+                LOADP   D0, Y3, [#LS_RD_BYTE]
+                STOREB  D0, [XY1]
+.lrb_done:
+                RET
 
 
 ; ----------------------------------------------------------------------------
@@ -765,16 +1226,10 @@
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1                 ; step past nul
 
-                ; Skip leading whitespace.
-.cat_skip_ws:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BEQ     .cat_advance_ws
-                BRA     .cat_check_path
-.cat_advance_ws:
-                INC     XY0, #1
-                BRA     .cat_skip_ws
-
+                ; Next token = path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .cat_usage               ; no arg
+                LEA     XY0, XY1                 ; XY0 = arg start (ASCIIZ)
 .cat_check_path:
                 LOADB   D0, [XY0]
                 CMP     D0, #0
@@ -787,11 +1242,17 @@
                 BCC     .cat_glob               ; C=0 -> has wildcard
 
                 ; --- Literal path (no wildcard) ------------------------------
+                ; Part 44: pass the raw arg (NO _KoshNormPath) plus CWD context
+                ; so the resolver applies an "X:" prefix, a leading "/", or a
+                ; CWD-relative subpath ("cat sub/notes.txt"). XY0 already = arg
+                ; start. _KoshCatOne open ABI: D1 = start cluster, D2 = start
+                ; drive index (D0 = flags is set inside _KoshCatOne).
                 MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                MOVE    Y0, Y1
-                MOVE    X0, X1
+                LOADI   X1, #KOSH_CWD
+                LOADB   D2, [XY1]               ; CWD drive letter
+                SUB     D2, #'A'                ; -> drive index 0..5
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
                 CALL16  _KoshCatOne
                 BCS     .cat_literal_err
                 BRA     .repl_loop
@@ -806,10 +1267,16 @@
 ; --- Glob path -------------------------------------------------------------
 ; cat each matching file's contents in directory order (continue-on-error).
 .cat_glob:
-                CALL16  _KoshSplitDrivePat      ; D0=drive, XY1=basename pattern
-                BCS     .cat_glob_baddrv
+                ; Part 64 step 2: _KoshSplitDirPat, not _KoshSplitDrivePat -
+                ; the pattern may carry a directory part ("cat sub/*.txt").
+                ; cat has no destination, so the bare match name resolved in
+                ; the globbed directory is still the right idiom; only the
+                ; choice of that directory has widened.
+                CALL16  _KoshSplitDirPat        ; D0=drive, D1=clu, XY1=pattern
+                BCS     .cat_glob_srcdir        ; D0 = ERR_* / CP_ERR_TOOLONG
 
                 STOREP  D0, Y3, [#GLOB_DRIVE]
+                STOREP  D1, Y3, [#GLOB_CLU]     ; Part 44 step 4: dir to glob (CWD or root)
 
                 ; root_entries from volume slot (kernel page $00).
                 MOVE    D2, D0
@@ -822,14 +1289,14 @@
                 ADD     X0, #VOL_ROOT_ENTRIES
                 LOADD   D2, [XY0]               ; D2 = root_entries
 
-                ; Reserve stack table: root_entries * 14.
-                MOVE    D3, D2
-                SHL     D3
-                MOVE    D0, D3                  ; *2
-                SHL     D3
-                ADD     D0, D3                  ; *6
-                SHL     D3
-                ADD     D0, D3                  ; *14
+                ; Reserve stack table: bytes = root_entries * GLOB_ENTRY_SIZE.
+                ; Part 64: GLOB_ENTRY_SIZE is 32, so this is SHL4 + SHL. The
+                ; shift count IS GLOB_ENTRY_SHIFT; the symbol cannot be spelled
+                ; in the operand, so keep the two in step by hand. Worst case
+                ; is 256*32 = 8192 bytes - derivation in kosh_defs.inc.
+                MOVE    D0, D2
+                SHL4    D0                      ; *16
+                SHL     D0                      ; *32 = GLOB_ENTRY_SIZE
                 STOREP  D0, Y3, [#GLOB_RSVSIZE]
                 SUB     X3, D0
                 MOVE    D0, X3
@@ -853,43 +1320,35 @@
                 CMP     D0, D1
                 BHS     .cat_glob_release
 
-                ; Build "<DRV>:<name>" in KOSH_NORM_A (name = GLOB_TABLE + idx*14).
-                MOVE    D2, D0
-                SHL     D0
-                MOVE    D3, D0
-                SHL     D0
-                ADD     D3, D0                  ; *6
-                SHL     D0
-                ADD     D3, D0                  ; *14
-                LOADP   D0, Y3, [#GLOB_TABLE]
-                ADD     D3, D0                  ; D3 = name source offset
+                ; Build the bare match name in KOSH_NORM_A. Part 44 step 4:
+                ; no "<DRV>:" prefix — open the bare name with the globbed
+                ; directory as context, so it resolves in the CWD (or the
+                ; prefixed drive's root) rather than always root.
+                CALL16  _KoshGlobEntryPtr       ; D0 = index -> D3 = entry offset
 
                 MOVE    Y1, Y3
                 LOADI   X1, #KOSH_NORM_A
-                LOADP   D0, Y3, [#GLOB_DRIVE]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
                 MOVE    Y0, Y3
                 MOVE    X0, D3
-.cat_glob_namecpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .cat_glob_namedone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .cat_glob_namecpy
+                ; Part 62: bounded. Part 64 is the case it was written for -
+                ; GLOB_ENTRY_SIZE is now 32, so a 31-char long name plus its
+                ; nul lands in an 80-byte KOSH_NORM_A with room to spare, and
+                ; anything that would not fit fails loudly here instead of
+                ; silently writing past the buffer.
+                LOADI   D1, #KOSH_NORM_LEN
+                CALL16  _KoshCopyBounded
+                BCS     .cat_glob_item_err
 .cat_glob_namedone:
-                ; cat this file.
+                ; cat this file. KOSH_NORM_A holds the bare name; resolve it in
+                ; the globbed directory (GLOB_CLU : GLOB_DRIVE).
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_NORM_A
+                LOADP   D1, Y3, [#GLOB_CLU]     ; start cluster = globbed dir
+                LOADP   D2, Y3, [#GLOB_DRIVE]   ; start drive
                 CALL16  _KoshCatOne
                 BCC     .cat_glob_advance
 
+.cat_glob_item_err:
                 ; Per-item error (continue): print "<path> <err>".
                 PUSH    D0, XY3
                 MOVE    Y0, Y3
@@ -911,12 +1370,14 @@
 .cat_glob_release:
                 LOADP   D0, Y3, [#GLOB_RSVSIZE]
                 ADD     X3, D0
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
-.cat_glob_baddrv:
+.cat_glob_srcdir:
+                ; Nothing is reserved yet - the split runs before the table.
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_drivewild
-                TRAP    #TRAP_PUTS
+                LOADI   X0, #msg_glob_srcdir
+                CALL16  _KoshPrintErr
                 BRA     .repl_loop
 
 .cat_glob_nomatch:
@@ -944,7 +1405,11 @@
 ; ----------------------------------------------------------------------------
 ; _KoshCatOne - stream one file's contents to stdout.
 ;
-;   In:   XY0 = literal path (ASCIIZ, "X:NAME"; task page)
+;   In:   XY0 = path (ASCIIZ, task page): "X:NAME", a CWD-relative name, or
+;               a subpath ("sub/notes.txt").
+;         D1  = start cluster (CWD cluster, or 0 for root)   — Part 44
+;         D2  = start drive index                            — Part 44
+;               (an "X:" prefix in the path overrides D2 and forces root)
 ;   Out:  C = 0 OK / C = 1 error (D0 = err code; any open fd already closed)
 ;   Clobbers: D0, D1, D2, D3, XY0, XY1
 ;   Preserves: XY3
@@ -954,7 +1419,9 @@
 ;   before returning so no descriptor leaks across the glob iteration.
 ; ----------------------------------------------------------------------------
 _KoshCatOne:
-                ; sys_open(path=XY0, flags=READ).
+                ; sys_open(path=XY0, flags=READ, D1=start clu, D2=start drive).
+                ; D1/D2 were set by the caller; they flow untouched into the
+                ; TRAP (only D0 is loaded here).
                 LOADI   D0, #FOPEN_READ
                 TRAP    #TRAP_OPEN
                 BCS     .c1_open_err
@@ -1139,9 +1606,8 @@ _KoshCatOne:
                 CMP     D0, #$5B                ; 'Z'+1
                 BHS     .format_bad_label
 .format_lbl_ok_char:
-                STOREB  D0, [XY1]
+                STOREB  D0, [XY1]+
                 INC     XY0, #1
-                INC     XY1, #1
                 SUB     D1, #1
                 BRA     .format_lbl_copy
 
@@ -1150,8 +1616,7 @@ _KoshCatOne:
                 CMP     D1, #0
                 BEQ     .format_lbl_done
                 LOADI   D0, #' '
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 SUB     D1, #1
                 BRA     .format_lbl_pad
 
@@ -1220,8 +1685,7 @@ _KoshCatOne:
                 CMP     D1, #11
                 BHS.S   .format_issue_from_pad
                 LOADI   D0, #' '
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 ADD     D1, #1
                 BRA     .format_bn_pad
 .format_issue_from_pad:
@@ -1233,34 +1697,24 @@ _KoshCatOne:
                 MOVE    Y1, Y3
                 LOADI   X1, #kosh_format_label
                 LOADI   D0, #'U'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'S'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'E'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'R'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'D'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'T'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 LOADI   D0, #' '
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
+                STOREB  D0, [XY1]+
                 STOREB  D0, [XY1]
 
 .format_issue:
@@ -1315,6 +1769,7 @@ _KoshCatOne:
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_format_ok
                 TRAP    #TRAP_PUTS
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 .format_rename_warn:
@@ -1442,106 +1897,54 @@ _KoshCatOne:
                 BRA     .run_trim_bg
 
 .run_no_bg:
-                ; Stash bg flag in task-local word -- survives TRAP_EXEC
-                ; without the PUSH/POP D clobber issue (POP D would overwrite
-                ; D2 which we use to hold the TID returned by sys_exec).
-                MOVE    Y1, Y3
-                LOADI   X1, #RUN_BG_TMP
-                STORED  D3, [XY1]
-
-                ; Normalise path (prepend CWD if needed).
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                MOVE    Y0, Y1
-                MOVE    X0, X1
-
-                ; sys_exec(path=XY0, flags=0).
-                ; flags bit 0 (block) is reserved/ignored in P16-P19;
-                ; we still do an explicit sys_wait below in the FG case.
+                ; --- Strip a surrounding "..." quote pair -----------------
+                ; Consistency with the other path commands; run keeps interior
+                ; spaces either way, so quotes are optional. If quoted, drop the
+                ; opening quote and nul the closing one; else leave untouched.
+                ; (An '&' inside quotes was never treated as bg: the bg scan
+                ; above only inspects the last non-space char, which for a
+                ; quoted arg is the closing quote.)
+                LOADB   D0, [XY0]
+                AND     D0, #$FF
+                CMP     D0, #CH_QUOTE
+                BNE     .run_no_strip
+                INC     XY0, #1                  ; skip opening quote (new start)
+                LEA     XY1, XY0
+.run_strip_scan:
+                LOADB   D0, [XY1]
+                AND     D0, #$FF
+                CMP     D0, #0
+                BEQ     .run_strip_close
+                INC     XY1, #1
+                BRA     .run_strip_scan
+.run_strip_close:
+                CMP     X1, X0                   ; empty body ("") -> leave as-is
+                BEQ     .run_no_strip
+                DEC     XY1, #1
+                LOADB   D0, [XY1]
+                AND     D0, #$FF
+                CMP     D0, #CH_QUOTE
+                BNE     .run_no_strip            ; no closing quote -> leave
                 LOADI   D0, #0
-                TRAP    #TRAP_EXEC
-                BCS     .run_exec_err
-
-                ; D0 = child TID. Stash in D2 (safe -- no PUSH/POP coming).
-                MOVE    D2, D0
-
-                ; Re-read bg flag.
-                MOVE    Y1, Y3
-                LOADI   X1, #RUN_BG_TMP
-                LOADD   D3, [XY1]
-
-                CMP     D3, #0
-                BNE     .run_bg_report          ; backgrounded - skip wait
-
-                ; --- Foreground: wait for child --------------------------
-                MOVE    D0, D2                  ; D0 = TID for sys_wait
-                TRAP    #TRAP_WAIT
-                BCS     .run_wait_err
-
-                ; D0 = exit code. Build "[exit N]\n" in ROW_BUF.
-                MOVE    D2, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #ROW_BUF
-                LOADI   D0, #'['
-                CALL16  _KoshEmitByte
+                STOREB  D0, [XY1]                ; drop closing quote
+.run_no_strip:
+                ; XY0 = path, D3 = bg flag. Hand off to the shared exec core
+                ; (_KoshExecFile tries XY0 as-typed; on ERR_NOTFOUND retries
+                ; once with ".com" appended; runs FG/BG and prints
+                ; [exit N]/[bg N] itself). C=1 return = exec failed, unreported.
+                CALL16  _KoshExecFile
+                BCC     .run_done                ; C=0 -> ran & reported
+                ; C=1 -> exec failed (D0=ERR_*). run is explicit: always report.
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_run_exit_lbl
-                CALL16  _KoshEmitStrZ
-                MOVE    D0, D2
-                CALL16  _KoshEmitDec
-                LOADI   D0, #']'
-                CALL16  _KoshEmitByte
-                LOADI   D0, #CH_LF
-                CALL16  _KoshEmitByte
-                LOADI   D0, #0
-                CALL16  _KoshEmitByte
-                MOVE    Y0, Y3
-                LOADI   X0, #ROW_BUF
-                TRAP    #TRAP_PUTS
-                BRA     .repl_loop
-
-                ; --- Background: print "[bg N]\n" and return -------------
-.run_bg_report:
-                ; D2 = TID.
-                MOVE    Y1, Y3
-                LOADI   X1, #ROW_BUF
-                LOADI   D0, #'['
-                CALL16  _KoshEmitByte
-                MOVE    Y0, Y3
-                LOADI   X0, #msg_run_bg_lbl
-                CALL16  _KoshEmitStrZ
-                MOVE    D0, D2
-                CALL16  _KoshEmitDec
-                LOADI   D0, #']'
-                CALL16  _KoshEmitByte
-                LOADI   D0, #CH_LF
-                CALL16  _KoshEmitByte
-                LOADI   D0, #0
-                CALL16  _KoshEmitByte
-                MOVE    Y0, Y3
-                LOADI   X0, #ROW_BUF
-                TRAP    #TRAP_PUTS
+                LOADI   X0, #msg_run_execerr
+                CALL16  _KoshPrintErr
+.run_done:
                 BRA     .repl_loop
 
 .run_usage:
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_run_usage
                 TRAP    #TRAP_PUTS
-                BRA     .repl_loop
-
-.run_exec_err:
-                ; D0 = ERR_*. _KoshPrintErr emits the full line.
-                MOVE    Y0, Y3
-                LOADI   X0, #msg_run_execerr
-                CALL16  _KoshPrintErr
-                BRA     .repl_loop
-
-.run_wait_err:
-                ; D0 = ERR_NOTCHILD / ERR_DEADLOCK / similar.
-                MOVE    Y0, Y3
-                LOADI   X0, #msg_run_waiterr
-                CALL16  _KoshPrintErr
                 BRA     .repl_loop
 
 
@@ -1568,10 +1971,10 @@ _KoshCatOne:
 ;
 ;   Scratch use:
 ;     CP_BUF              - 512 B I/O staging (kosh user page)
-;     CP_SRC_FD_TMP       - src fd preserved across CALL24/TRAP boundaries
-;     CP_DST_FD_TMP       - dst fd
-;     CP_SRC_PATH_TMP     - src path pointer preserved across pre-flight close
-;     CP_DST_PATH_TMP     - dst path pointer preserved across pre-flight close
+;     CP_SRC_FD       - src fd preserved across CALL24/TRAP boundaries
+;     CP_DST_FD       - dst fd
+;     CP_SRC_PATH     - src path pointer preserved across pre-flight close
+;     CP_DST_PATH     - dst path pointer preserved across pre-flight close
 ;
 ;   Registers: D2 holds the src fd in the inner read/write loop (same
 ;   idiom as .do_cat). D3 holds bytes-read (== bytes-to-write) for the
@@ -1583,97 +1986,33 @@ _KoshCatOne:
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1                 ; step past nul
 
-                ; --- Skip leading whitespace before src --------------------
-.cp_skip_ws1:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .cp_have_src
-                INC     XY0, #1
-                BRA     .cp_skip_ws1
-
-.cp_have_src:
-                CMP     D0, #0
-                BEQ     .cp_usage
-
-                ; XY0 = src path start. Save pointer.
-                LEA     XY1, XY0
+                ; --- src + dst tokens (quote-aware) ------------------------
+                ; A quoted token keeps interior spaces, so a spaced long
+                ; filename survives:  cp notes.txt "test test.txt"
+                CALL16  _KoshNextToken           ; src
+                BCS     .cp_usage
                 MOVE    D0, X1
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
-
-                ; --- Find end of src, nul-terminate ------------------------
-.cp_src_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ     .cp_usage               ; no dst arg
-                CMP     D0, #CH_SPACE
-                BEQ.S   .cp_term_src
-                INC     XY0, #1
-                BRA     .cp_src_find_end
-
-.cp_term_src:
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-
-                ; --- Skip whitespace before dst ----------------------------
-.cp_skip_ws2:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .cp_have_dst
-                INC     XY0, #1
-                BRA     .cp_skip_ws2
-
-.cp_have_dst:
-                CMP     D0, #0
-                BEQ     .cp_usage
-
-                ; XY0 = dst path start. Save pointer.
-                MOVE    D0, X0
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
-
-                ; --- Find end of dst, nul-terminate ------------------------
-.cp_dst_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ.S   .cp_dst_terminated
-                CMP     D0, #CH_SPACE
-                BNE.S   .cp_dst_advance
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                BRA.S   .cp_dst_terminated
-.cp_dst_advance:
-                INC     XY0, #1
-                BRA     .cp_dst_find_end
+                STOREP  D0, Y3, [#CP_SRC_PATH]
+                CALL16  _KoshNextToken           ; dst
+                BCS     .cp_usage
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#CP_DST_PATH]
 
 .cp_dst_terminated:
                 ; Does the SRC contain a wildcard?
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
                 CALL16  _KoshHasWildcard
                 BCC     .cp_glob                ; C=0 -> wildcard src
 
-                ; --- Literal path (no wildcard) - normalise both, copy one ---
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
-                MOVE    X0, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                LOADI   D0, #KOSH_NORM_A
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
-
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_B
-                CALL16  _KoshNormPath
-                LOADI   D0, #KOSH_NORM_B
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
-
-                ; Part 37: bare-drive dst ("B:") -> "B:<src-basename>".
-                CALL16  _KoshExpandBareDst
+                ; --- Literal path (no wildcard) - Part 44 CWD-relative -------
+                ; Keep the raw src/dst pointers (CP_SRC_PATH/CP_DST_PATH already
+                ; point at the nul-terminated args). Stash CWD context for the
+                ; opens, then rewrite a directory dst to "<dst>/<src-basename>".
+                CALL16  _KoshStashCwd
+                CALL16  _KoshResolveDstPath
+                BCS     .cp_report_err          ; Part 62: CP_ERR_TOOLONG
 
                 CALL16  _KoshCpOne
                 ; C=0 OK, C=1 error (D0=err, or special codes - see worker).
@@ -1691,6 +2030,8 @@ _KoshCatOne:
                 BEQ     .cp_same_path
                 CMP     D0, #CP_ERR_EXISTS
                 BEQ     .cp_exists_msg
+                CMP     D0, #CP_ERR_TOOLONG
+                BEQ     .cp_toolong_msg
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_cp_writeerr
                 CALL16  _KoshPrintErr
@@ -1702,47 +2043,90 @@ _KoshCatOne:
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
-; --- Glob path -------------------------------------------------------------
-; cp <pattern> <destdrive>: - copy each matching file to the dest drive,
-; keeping its basename. Destination MUST be a bare drive (no filename, no
-; wildcard). Stop-on-error policy.
-.cp_glob:
-                ; Validate dst: must be "X:" exactly (alpha, colon, nul).
-                ; Reject dst wildcards and dst filenames.
+.cp_toolong_msg:
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADI   X0, #msg_path_toolong
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+; --- Glob path -------------------------------------------------------------
+; cp <pattern> <dst> - copy each match into dst, keeping its basename.
+; Part 64 step 2: dst may be a bare drive, a named assign, or any existing
+; directory - but it must be a DIRECTORY, and it may not contain a wildcard.
+; Stop-on-error policy.
+.cp_glob:
+                MOVE    Y0, Y3
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X0, D0
                 CALL16  _KoshHasWildcard
                 BCC     .cp_glob_destwild       ; dst has wildcard -> reject
 
-                ; Parse dst into drive + remainder; remainder must be empty.
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat      ; D0=destdrive, XY1=remainder
-                BCS     .cp_glob_baddrv
-                ; Remainder must be empty (bare "X:").
-                LOADB   D0, [XY1]
-                CMP     D0, #0
-                BNE     .cp_glob_multidest      ; dst had a filename part
-                ; Stash dest drive.
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]  ; (re-derive drive below cleanly)
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat
-                STOREP  D0, Y3, [#CP_DSTDRV_TMP]    ; dest drive index
+                ; --- Context: SHELL CWD, for the whole batch --------------
+                ; Part 64 step 2. Before this, the src split overwrote
+                ; CP_CWD_* with the globbed SOURCE directory, which is the
+                ; real reason dst had to be a fully-qualified bare "X:" - a
+                ; relative dst would have resolved against the source. The
+                ; context cannot simply be split in two: TRAP_RENAME takes
+                ; one (D1, D2) pair for BOTH of its paths, so _KoshMvOne
+                ; could not carry a split one without a kernel ABI change.
+                ; Instead both sides are made shell-relative - the source by
+                ; being rebuilt as a full "<prefix><name>" path below.
+                CALL16  _KoshStashCwd
 
-                ; Split SRC into drive + pattern.
+                ; Remember the dst token as typed: _KoshResolveDstPath
+                ; repoints CP_DST_PATH at KOSH_NORM_B for each match, so the
+                ; original must be restored at the top of every iteration.
+                LOADP   D0, Y3, [#CP_DST_PATH]
+                STOREP  D0, Y3, [#CP_GDST]
+
+                ; --- dst must be an existing DIRECTORY, checked once ------
+                ; If it were a file or absent, every match would join onto
+                ; the same name: item 1 would copy and item 2 would report
+                ; "destination exists", which describes the symptom and not
+                ; the mistake. Checked here, before anything is reserved.
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                MOVE    X0, D0                  ; XY0 = dst token
+                LOADP   D0, Y3, [#CP_CWD_DRV]
+                LOADP   D1, Y3, [#CP_CWD_CLU]
+                TRAP    #TRAP_RESOLVE           ; -> D0=drive, D1=clu, D2=attr
+                BCS     .cp_glob_dstmissing
+                AND     D2, #DIR_ATTR_DIRECTORY
+                BEQ     .cp_glob_dstnotdir
+
+                ; --- Split SRC into a directory part + a pattern ----------
+                MOVE    Y0, Y3
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat      ; D0=srcdrive, XY1=pattern
-                BCS     .cp_glob_baddrv
+                CALL16  _KoshSplitDirPat        ; D0=drv, D1=clu, D2=pfxlen, XY1=pat
+                BCS     .cp_glob_srcdir
                 STOREP  D0, Y3, [#GLOB_DRIVE]
+                STOREP  D1, Y3, [#GLOB_CLU]
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#GLOB_PATPTR]  ; _KoshGlobExpand re-stashes this,
+                                                ;   but the prefix copy below
+                                                ;   clobbers XY1 before it runs
 
-                ; root_entries for src drive.
-                MOVE    D2, D0
+                ; --- Lay the source prefix into KOSH_NORM_A, once ---------
+                ; Each item then appends only its own name, so every source
+                ; path is spelled the way the user spelled it ("gfx:",
+                ; "sub/", "b:/a/") and resolves in the same frame as the
+                ; destination. An empty prefix is the ordinary CWD case and
+                ; leaves the buffer empty.
+                LOADP   D0, Y3, [#GLOB_PFXPTR]
+                MOVE    Y0, Y3
+                MOVE    X0, D0
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_NORM_A
+                MOVE    D0, D2                  ; count = prefix length
+                LOADI   D1, #KOSH_NORM_LEN
+                CALL16  _KoshCopyCounted
+                BCS     .cp_glob_pathlong
+                MOVE    D0, X1                  ; XY1 was left AT the nul
+                STOREP  D0, Y3, [#GLOB_NAMEOFF]
+                STOREP  D1, Y3, [#GLOB_NAMECAP] ; capacity left, incl the nul
+
+                ; root_entries for the globbed drive.
+                LOADP   D2, Y3, [#GLOB_DRIVE]
                 SHL4    D2
                 SHL     D2
                 SHL     D2
@@ -1752,20 +2136,24 @@ _KoshCatOne:
                 ADD     X0, #VOL_ROOT_ENTRIES
                 LOADD   D2, [XY0]
 
-                ; Reserve stack table.
-                MOVE    D3, D2
-                SHL     D3
-                MOVE    D0, D3
-                SHL     D3
-                ADD     D0, D3
-                SHL     D3
-                ADD     D0, D3                  ; D0 = root_entries*14
+                ; Reserve stack table: bytes = root_entries * GLOB_ENTRY_SIZE.
+                ; Part 64: GLOB_ENTRY_SIZE is 32, so this is SHL4 + SHL. The
+                ; shift count IS GLOB_ENTRY_SHIFT; the symbol cannot be spelled
+                ; in the operand, so keep the two in step by hand. Worst case
+                ; is 256*32 = 8192 bytes - derivation in kosh_defs.inc.
+                MOVE    D0, D2
+                SHL4    D0                      ; *16
+                SHL     D0                      ; *32 = GLOB_ENTRY_SIZE
                 STOREP  D0, Y3, [#GLOB_RSVSIZE]
                 SUB     X3, D0
                 MOVE    D0, X3
                 STOREP  D0, Y3, [#GLOB_TABLE]
 
-                ; Expand src pattern.
+                ; Expand src pattern. XY1 was consumed by the prefix copy,
+                ; so rebuild it from GLOB_PATPTR; D2 still holds root_entries.
+                LOADP   D0, Y3, [#GLOB_PATPTR]
+                MOVE    Y1, Y3
+                MOVE    X1, D0
                 LOADP   D0, Y3, [#GLOB_DRIVE]
                 CALL16  _KoshGlobExpand
                 BCS     .cp_glob_toomany
@@ -1783,67 +2171,37 @@ _KoshCatOne:
                 CMP     D0, D1
                 BHS     .cp_glob_release
 
-                ; name source offset = GLOB_TABLE + idx*14.
-                MOVE    D2, D0
-                SHL     D0
-                MOVE    D3, D0
-                SHL     D0
-                ADD     D3, D0                  ; *6
-                SHL     D0
-                ADD     D3, D0                  ; *14
-                LOADP   D0, Y3, [#GLOB_TABLE]
-                ADD     D3, D0                  ; D3 = name source offset
-                STOREP  D3, Y3, [#CP_NAME_TMP]      ; remember for both src and dst
+                CALL16  _KoshGlobEntryPtr       ; D0 = index -> D3 = entry offset
+                STOREP  D3, Y3, [#CP_NAME]      ; remember for both src and dst
 
-                ; Build SRC path "<srcdrive>:<name>" in KOSH_NORM_A.
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                LOADP   D0, Y3, [#GLOB_DRIVE]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADP   D0, Y3, [#CP_NAME_TMP]
+                ; SRC = "<prefix><name>" in KOSH_NORM_A. The prefix is
+                ; already there; append at GLOB_NAMEOFF with whatever
+                ; capacity it left. A long prefix plus a long name fails
+                ; here with CP_ERR_TOOLONG rather than silently truncating
+                ; onto some other file.
+                LOADP   D0, Y3, [#CP_NAME]
                 MOVE    Y0, Y3
-                MOVE    X0, D0
-.cp_glob_srccpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .cp_glob_srcdone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .cp_glob_srccpy
+                MOVE    X0, D0                  ; XY0 = the table entry
+                LOADP   D0, Y3, [#GLOB_NAMEOFF]
+                MOVE    Y1, Y3
+                MOVE    X1, D0
+                LOADP   D1, Y3, [#GLOB_NAMECAP]
+                CALL16  _KoshCopyBounded
+                BCS     .cp_glob_item_err
 .cp_glob_srcdone:
                 LOADI   D0, #KOSH_NORM_A
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
+                STOREP  D0, Y3, [#CP_SRC_PATH]
 
-                ; Build DST path "<dstdrive>:<name>" in KOSH_NORM_B.
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_B
-                LOADP   D0, Y3, [#CP_DSTDRV_TMP]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADP   D0, Y3, [#CP_NAME_TMP]
-                MOVE    Y0, Y3
-                MOVE    X0, D0
-.cp_glob_dstcpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .cp_glob_dstdone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .cp_glob_dstcpy
+                ; DST: restore the token as typed, then let
+                ; _KoshResolveDstPath join basename(src) onto it in
+                ; KOSH_NORM_B. This is the SAME helper the literal cp path
+                ; uses, so a directory destination behaves identically
+                ; whether or not a wildcard was involved.
+                LOADP   D0, Y3, [#CP_GDST]
+                STOREP  D0, Y3, [#CP_DST_PATH]
+                CALL16  _KoshResolveDstPath     ; C=1 -> D0 = CP_ERR_TOOLONG
+                BCS     .cp_glob_item_err
 .cp_glob_dstdone:
-                LOADI   D0, #KOSH_NORM_B
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
 
                 ; Copy this file.
                 CALL16  _KoshCpOne
@@ -1870,10 +2228,16 @@ _KoshCatOne:
 .cp_glob_item_err:
                 ; Stop-on-error policy: report and abort the batch.
                 ; D0 = err code (or sentinel). Release stack first.
-                PUSH    D0, XY3
+                ; Part 62: hold the code in D3, NOT on the stack. The release
+                ; below moves X3 past the pushed slot, so a PUSH/POP pair
+                ; straddling it pops residue from the freed glob table - that
+                ; is where the bogus "[ERR_UNKNOWN $253A]" came from. D3 is
+                ; dead on entry (the worker clobbers it) and is restored
+                ; before any TRAP that could touch it.
+                MOVE    D3, D0
                 LOADP   D0, Y3, [#GLOB_RSVSIZE]
                 ADD     X3, D0
-                POP     D0, XY3
+                MOVE    D0, D3
                 ; Print the failing src path then the error.
                 PUSH    D0, XY3
                 MOVE    Y0, Y3
@@ -1912,15 +2276,29 @@ _KoshCatOne:
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
-.cp_glob_multidest:
+; The four arms below all fire BEFORE the glob table is reserved, so none
+; of them releases stack. Keep it that way if any of them ever moves.
+.cp_glob_dstmissing:
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_multidest
+                LOADI   X0, #msg_glob_dstnotfound
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+.cp_glob_dstnotdir:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_glob_dstnotdir
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
-.cp_glob_baddrv:
+.cp_glob_srcdir:
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_drivewild
+                LOADI   X0, #msg_glob_srcdir
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+.cp_glob_pathlong:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_path_toolong
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
@@ -1953,7 +2331,7 @@ _KoshCatOne:
                 BRA     .repl_loop
 
 ; ----------------------------------------------------------------------------
-; _KoshCpOne - copy one file. src in CP_SRC_PATH_TMP, dst in CP_DST_PATH_TMP
+; _KoshCpOne - copy one file. src in CP_SRC_PATH, dst in CP_DST_PATH
 ;   (both pointers into the task page, already normalised).
 ;
 ;   Out:  C = 0 OK
@@ -1969,14 +2347,14 @@ _KoshCatOne:
 _KoshCpOne:
                 ; --- Same-path check (case-insensitive) --------------------
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
                 MOVE    Y1, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X1, D0
 .c2_cmp_loop:
-                LOADB   D0, [XY0]
-                LOADB   D1, [XY1]
+                LOADB   D0, [XY0]+
+                LOADB   D1, [XY1]+
                 CMP     D0, #'a'
                 BLO.S   .c2_d0_noup
                 CMP     D0, #$7B
@@ -1993,8 +2371,6 @@ _KoshCpOne:
                 BNE.S   .c2_differ
                 CMP     D0, #0
                 BEQ     .c2_same
-                INC     XY0, #1
-                INC     XY1, #1
                 BRA     .c2_cmp_loop
 
 .c2_same:
@@ -2005,23 +2381,27 @@ _KoshCpOne:
 .c2_differ:
                 ; --- Open src for reading ----------------------------------
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
                 LOADI   D0, #FOPEN_READ
+                LOADP   D1, Y3, [#CP_CWD_CLU]   ; Part 44: CWD context
+                LOADP   D2, Y3, [#CP_CWD_DRV]
                 TRAP    #TRAP_OPEN
                 BCS     .c2_src_openerr
-                STOREP  D0, Y3, [#CP_SRC_FD_TMP]
+                STOREP  D0, Y3, [#CP_SRC_FD]
 
                 ; --- Pre-flight: does dst already exist? -------------------
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X0, D0
                 LOADI   D0, #FOPEN_READ
+                LOADP   D1, Y3, [#CP_CWD_CLU]   ; Part 44: CWD context
+                LOADP   D2, Y3, [#CP_CWD_DRV]
                 TRAP    #TRAP_OPEN
                 BCS.S   .c2_dst_new             ; not found -> good
                 ; Dst exists: close probe + src, return EXISTS.
                 TRAP    #TRAP_CLOSE             ; D0 = probe fd
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 TRAP    #TRAP_CLOSE
                 LOADI   D0, #CP_ERR_EXISTS
                 SEC
@@ -2030,16 +2410,18 @@ _KoshCpOne:
 .c2_dst_new:
                 ; --- Open dst for writing ----------------------------------
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X0, D0
                 LOADI   D0, #OPEN_FLAGS_NEW
+                LOADP   D1, Y3, [#CP_CWD_CLU]   ; Part 44: CWD context
+                LOADP   D2, Y3, [#CP_CWD_DRV]
                 TRAP    #TRAP_OPEN
                 BCS     .c2_dst_createerr
-                STOREP  D0, Y3, [#CP_DST_FD_TMP]
+                STOREP  D0, Y3, [#CP_DST_FD]
 
                 ; --- Copy loop ---------------------------------------------
 .c2_loop:
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 LOADI   D1, #CP_BUF_SIZE
                 MOVE    Y0, Y3
                 LOADI   X0, #CP_BUF
@@ -2049,7 +2431,7 @@ _KoshCpOne:
                 BEQ     .c2_eof
                 MOVE    D3, D0                  ; D3 = bytes read
 
-                LOADP   D0, Y3, [#CP_DST_FD_TMP]
+                LOADP   D0, Y3, [#CP_DST_FD]
                 MOVE    D1, D3
                 MOVE    Y0, Y3
                 LOADI   X0, #CP_BUF
@@ -2060,9 +2442,9 @@ _KoshCpOne:
                 BRA     .c2_loop
 
 .c2_eof:
-                LOADP   D0, Y3, [#CP_DST_FD_TMP]
+                LOADP   D0, Y3, [#CP_DST_FD]
                 TRAP    #TRAP_CLOSE
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 TRAP    #TRAP_CLOSE
                 CLC
                 RET
@@ -2075,7 +2457,7 @@ _KoshCpOne:
 .c2_dst_createerr:
                 ; D0 = err. Close src.
                 MOVE    D2, D0
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 TRAP    #TRAP_CLOSE
                 MOVE    D0, D2
                 SEC
@@ -2084,9 +2466,9 @@ _KoshCpOne:
 .c2_read_err:
 .c2_write_err:
                 MOVE    D2, D0
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 TRAP    #TRAP_CLOSE
-                LOADP   D0, Y3, [#CP_DST_FD_TMP]
+                LOADP   D0, Y3, [#CP_DST_FD]
                 TRAP    #TRAP_CLOSE
                 MOVE    D0, D2
                 SEC
@@ -2095,9 +2477,9 @@ _KoshCpOne:
 .c2_short:
                 ; D0 = bytes written (< D3). Return it as the "code".
                 MOVE    D2, D0
-                LOADP   D0, Y3, [#CP_SRC_FD_TMP]
+                LOADP   D0, Y3, [#CP_SRC_FD]
                 TRAP    #TRAP_CLOSE
-                LOADP   D0, Y3, [#CP_DST_FD_TMP]
+                LOADP   D0, Y3, [#CP_DST_FD]
                 TRAP    #TRAP_CLOSE
                 MOVE    D0, D2
                 SEC
@@ -2120,16 +2502,11 @@ _KoshCpOne:
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-.rm_skip_ws:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .rm_have_path
-                INC     XY0, #1
-                BRA     .rm_skip_ws
-
+                ; Next token = path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .rm_usage
+                LEA     XY0, XY1                 ; XY0 = path arg (ASCIIZ)
 .rm_have_path:
-                CMP     D0, #0
-                BEQ     .rm_usage
 
                 ; XY0 = path arg. Wildcard present?
                 ; (_KoshHasWildcard preserves XY1..XY3; advances XY0, so save it.)
@@ -2138,12 +2515,16 @@ _KoshCpOne:
                 LEA     XY0, XY1                ; restore arg start
                 BCC     .rm_glob                ; C=0 -> has wildcard
 
-                ; --- Literal path (no wildcard) - unchanged behaviour --------
+                ; --- Literal path (no wildcard) - Part 44 CWD-relative -------
+                ; Raw arg + CWD context; sys_unlink resolves the path (an "X:"
+                ; prefix, a leading "/", or a CWD-relative subpath).
+                ; XY0 already = arg start. D1 = CWD cluster, D2 = CWD drive idx.
                 MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                MOVE    Y0, Y1
-                MOVE    X0, X1
+                LOADI   X1, #KOSH_CWD
+                LOADB   D2, [XY1]               ; CWD drive letter
+                SUB     D2, #'A'                ; -> drive index 0..5
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
                 CALL16  _KoshRmOne
                 BCS     .rm_failed
                 MOVE    Y0, Y3
@@ -2156,11 +2537,14 @@ _KoshCpOne:
 ; expand against the drive's directory onto a stack-reserved table, then
 ; rm each match (continue-on-error policy).
 .rm_glob:
-                CALL16  _KoshSplitDrivePat      ; D0=drive, XY1=basename pattern
-                BCS     .rm_glob_baddrv
+                ; Part 64 step 2: see .cat_glob. "rm sub/*.tmp" now resolves
+                ; its directory part instead of folding it into the pattern.
+                CALL16  _KoshSplitDirPat        ; D0=drive, D1=clu, XY1=pattern
+                BCS     .rm_glob_srcdir         ; D0 = ERR_* / CP_ERR_TOOLONG
 
-                ; Stash drive; copy pattern pointer for _KoshGlobExpand (XY1).
+                ; Stash drive + globbed-dir cluster; pattern ptr (XY1) -> expander.
                 STOREP  D0, Y3, [#GLOB_DRIVE]       ; (also re-stashed inside expander)
+                STOREP  D1, Y3, [#GLOB_CLU]         ; Part 44 step 4: CWD or root
 
                 ; Read root_entries from the volume slot (kernel page $00).
                 ; slot = VOL_TABLE_BASE + drive*64.
@@ -2174,16 +2558,14 @@ _KoshCpOne:
                 ADD     X0, #VOL_ROOT_ENTRIES
                 LOADD   D2, [XY0]               ; D2 = root_entries (table capacity)
 
-                ; Reserve stack table: bytes = root_entries * 14.
-                ; D2*14 = D2*8 + D2*4 + D2*2.
-                MOVE    D3, D2
-                SHL     D3                      ; *2
-                MOVE    D0, D3                  ; D0 = *2
-                SHL     D3                      ; *4
-                ADD     D0, D3                  ; D0 = *2 + *4 = *6
-                SHL     D3                      ; *8
-                ADD     D0, D3                  ; D0 = *6 + *8 = *14
-                ; Save table byte-size to release later.
+                ; Reserve stack table: bytes = root_entries * GLOB_ENTRY_SIZE.
+                ; Part 64: GLOB_ENTRY_SIZE is 32, so this is SHL4 + SHL. The
+                ; shift count IS GLOB_ENTRY_SHIFT; the symbol cannot be spelled
+                ; in the operand, so keep the two in step by hand. Worst case
+                ; is 256*32 = 8192 bytes - derivation in kosh_defs.inc.
+                MOVE    D0, D2
+                SHL4    D0                      ; *16
+                SHL     D0                      ; *32 = GLOB_ENTRY_SIZE
                 STOREP  D0, Y3, [#GLOB_RSVSIZE]
                 SUB     X3, D0                  ; reserve region [X3 .. X3+size)
                 ; Table base offset = current X3.
@@ -2212,46 +2594,30 @@ _KoshCpOne:
                 CMP     D0, D1
                 BHS     .rm_glob_release        ; done all matches
 
-                ; Build "<DRV>:<name>" in KOSH_NORM_A.
-                ; name source = GLOB_TABLE + index*14.
-                MOVE    D2, D0
-                SHL     D0                      ; *2
-                MOVE    D3, D0
-                SHL     D0                      ; *4
-                ADD     D3, D0                  ; *6
-                SHL     D0                      ; *8
-                ADD     D3, D0                  ; *14
-                LOADP   D0, Y3, [#GLOB_TABLE]
-                ADD     D3, D0                  ; D3 = name source offset
+                ; Build the bare match name in KOSH_NORM_A (Part 44 step 4: no
+                ; "<DRV>:" prefix — resolve it in the globbed directory below).
+                CALL16  _KoshGlobEntryPtr       ; D0 = index -> D3 = entry offset
 
-                ; Write drive letter + ':' into KOSH_NORM_A.
                 MOVE    Y1, Y3
                 LOADI   X1, #KOSH_NORM_A
-                LOADP   D0, Y3, [#GLOB_DRIVE]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                ; Append name (ASCIIZ) from [Y3:D3].
+                ; Copy name (ASCIIZ) from [Y3:D3].
                 MOVE    Y0, Y3
                 MOVE    X0, D3
-.rm_glob_namecpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .rm_glob_namedone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .rm_glob_namecpy
+                ; Part 62: bounded (see .cat_glob_namedone).
+                LOADI   D1, #KOSH_NORM_LEN
+                CALL16  _KoshCopyBounded
+                BCS     .rm_glob_item_err
 .rm_glob_namedone:
-                ; KOSH_NORM_A now holds the full path. rm it.
+                ; KOSH_NORM_A holds the bare name; resolve + unlink it in the
+                ; globbed directory (GLOB_CLU : GLOB_DRIVE).
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_NORM_A
+                LOADP   D1, Y3, [#GLOB_CLU]     ; start cluster = globbed dir
+                LOADP   D2, Y3, [#GLOB_DRIVE]   ; start drive
                 CALL16  _KoshRmOne
                 BCC     .rm_glob_ok_one
 
+.rm_glob_item_err:
                 ; Per-item error (continue policy): print the failing path
                 ; then the error, and carry on to the next match.
                 PUSH    D0, XY3                 ; save err code
@@ -2288,10 +2654,10 @@ _KoshCpOne:
                 ADD     X3, D0                  ; restore SP
                 BRA     .repl_loop
 
-.rm_glob_baddrv:
+.rm_glob_srcdir:
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_drivewild
-                TRAP    #TRAP_PUTS
+                LOADI   X0, #msg_glob_srcdir
+                CALL16  _KoshPrintErr
                 BRA     .repl_loop
 
 .rm_glob_nomatch:
@@ -2327,20 +2693,436 @@ _KoshCpOne:
                 BRA     .repl_loop
 
 ; ----------------------------------------------------------------------------
-; _KoshRmOne - delete a single file given a literal normalised path.
+; _KoshRmOne - delete a single file given a path.
 ;
-;   In:   XY0 = literal path (ASCIIZ, "X:NAME"; task page)
+;   In:   XY0 = path (ASCIIZ, task page): "X:NAME", CWD-relative, or subpath
+;         D1  = CWD cluster (0 = root)   — Part 44 (flows into TRAP_UNLINK)
+;         D2  = CWD drive index          — Part 44 (an "X:" prefix overrides)
 ;   Out:  C = 0 OK / C = 1 error (D0 = err code)
 ;   Clobbers: per TRAP_UNLINK
 ;   Preserves: XY3 (and whatever TRAP_UNLINK preserves)
 ;
 ;   Thin wrapper over TRAP_UNLINK. Both the literal and glob rm paths call
 ;   this so deletion semantics are identical regardless of how the path
-;   was produced.
+;   was produced. D1/D2 are set by the caller and flow untouched into the TRAP.
 ; ----------------------------------------------------------------------------
 _KoshRmOne:
                 TRAP    #TRAP_UNLINK
                 RET
+
+
+
+; ----------------------------------------------------------------------------
+; .do_mkdir - create a directory.
+;
+;   Args: path   (e.g. "mkdir B:STUFF")
+;
+;   Thin wrapper over TRAP_MKDIR. No wildcard expansion (mkdir of a glob
+;   makes no sense). Normalises the path (prepends "<CWD>:" if bare), then
+;   the kernel parses drive + name and does the alloc/'.'/'..'/link work.
+;   Output:
+;     OK                 - on success
+;     mkdir: <message>   - usage / failed (with [ERR_NAME $XXXX])
+; ----------------------------------------------------------------------------
+.do_mkdir:
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN
+                INC     XY0, #1
+
+                ; Next token = path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .mkdir_usage
+                LEA     XY0, XY1                 ; XY0 = path arg (ASCIIZ)
+.mkdir_have_path:
+
+                ; New ABI (option b): sys_mkdir resolves the path itself,
+                ; relative to the CWD. Pass raw path + CWD context; no
+                ; drive-prepend (the resolver handles "X:" / "/" / relative).
+                ;   XY0 = path arg, D0 = CWD drive index, D1 = CWD cluster.
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]               ; CWD drive letter
+                SUB     D0, #'A'                ; -> drive index
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
+                TRAP    #TRAP_MKDIR
+                BCS     .mkdir_failed
+
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_format_ok      ; shared "OK\n"
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.mkdir_usage:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_mkdir_usage
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.mkdir_failed:
+                ; D0 = err code. _KoshPrintErr appends " [ERR_NAME $HHHH]\n".
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_mkdir_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
+; .do_cd - change the current working directory.
+;
+;   Args: optional path. No arg -> root of current drive. "X:" / "/" /
+;   relative all handled by the kernel resolver (sys_resolve).
+;
+;   Algorithm:
+;     1. Skip the command word + whitespace to the arg.
+;     2. No arg -> KOSH_CWD_CLU = 0 (root of current drive), done.
+;     3. sys_resolve(path, CWD drive, CWD cluster) -> drive, cluster, attr.
+;     4. attr must be a directory, else "cd: not a directory".
+;     5. Store drive (as letter -> KOSH_CWD) + cluster (-> KOSH_CWD_CLU).
+; ----------------------------------------------------------------------------
+.do_cd:
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN
+                INC     XY0, #1
+                ; Next token = optional path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .cd_no_arg               ; no arg -> root of current drive
+                LEA     XY0, XY1                 ; XY0 = path arg (ASCIIZ)
+                LOADI   D0, #0                   ; Part 61: explicit cd - a
+                STOREP  D0, Y3, [#CD_BARE]       ;   non-dir target IS an error
+                BRA     .cd_resolve
+.cd_no_arg:
+                ; --- no arg: go to root of current drive ------------------
+                LOADI   D0, #0
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD_CLU
+                STORED  D0, [XY1]
+                BRA     .repl_loop
+
+.cd_resolve:
+                ; XY0 = path arg. Load CWD context: D0 = drive idx, D1 = clu.
+                ; (Stash path pointer; the CWD reads use XY1.)
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]               ; CWD drive letter
+                SUB     D0, #'A'                ; -> drive index
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
+                TRAP    #TRAP_RESOLVE           ; -> D0=drive,D1=clu,D2=attr
+                BCS     .cd_failed
+
+                ; --- must be a directory ----------------------------------
+                ; (Hold D0=drive, D1=clu across the attr check via the test
+                ; on D2 only.)
+                MOVE    D3, D2                  ; D3 = attr (D2 may be clobbered)
+                AND     D3, #DIR_ATTR_DIRECTORY
+                BEQ     .cd_notdir
+
+                ; --- store new CWD ----------------------------------------
+                ; D0 = drive index -> letter into KOSH_CWD; D1 = cluster.
+                ADD     D0, #'A'
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                STOREB  D0, [XY1]
+                LOADI   X1, #KOSH_CWD_CLU
+                STORED  D1, [XY1]
+                BRA     .repl_loop
+
+.cd_notdir:
+                ; Part 61: a bare colon token that resolved to a FILE is an
+                ; executable, not a failed cd. Resume the normal dispatch at
+                ; .nds_nocolon: cmd_table can't match a token containing ':',
+                ; so it falls to .unknown -> _KoshExecFile, which handles the
+                ; '&' background suffix and the arg tail exactly as for any
+                ; other command. XY2 still holds the command word - the CWD
+                ; reads above used XY0/XY1, and TRAP_RESOLVE preserves XY2
+                ; (callee-saved frame pointer in the V2 ABI).
+                LOADP   D0, Y3, [#CD_BARE]
+                CMP     D0, #0
+                BNE     .nds_nocolon
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_cd_notdir
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.cd_failed:
+                ; D0 = err code.
+                ; Part 61: ERR_NOTFOUND on a bare token also goes to the exec
+                ; path - that is what makes the extension-less form work
+                ; (`ram:hello` resolves to nothing, but _KoshExecFile retries
+                ; as "hello.com"). A genuinely absent name then reports as an
+                ; unknown command rather than a cd failure, which is the right
+                ; register for something typed as a command. Other errors
+                ; (ERR_BADDRIVE, ERR_BADPATH) keep the cd message: those are
+                ; about the path itself and would only be obscured by a
+                ; second, vaguer failure.
+                MOVE    D3, D0                   ; keep err across the test
+                LOADP   D0, Y3, [#CD_BARE]
+                CMP     D0, #0
+                BEQ     .cd_failed_report
+                CMP     D3, #ERR_NOTFOUND
+                BEQ     .nds_nocolon
+.cd_failed_report:
+                MOVE    D0, D3                   ; restore err for _KoshPrintErr
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_cd_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
+; .do_pwd - print the current working directory.
+;
+;   sys_pwd reconstructs "X:/a/b/c" from (CWD drive, CWD cluster) into
+;   ROW_BUF; then print it with a trailing newline.
+; ----------------------------------------------------------------------------
+.do_pwd:
+                ; D0 = CWD drive idx, D1 = CWD cluster, XY0 = ROW_BUF dest.
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]
+                SUB     D0, #'A'
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                TRAP    #TRAP_PWD
+                BCS     .pwd_failed
+
+                ; Append "\n" then print ROW_BUF. ROW_BUF holds "X:/..."\0;
+                ; find the nul, write LF + nul, then puts.
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                CALL24  KLIB_STRLEN             ; XY0 -> nul
+                LOADI   D0, #CH_LF
+                STOREB  D0, [XY0]+
+                LOADI   D0, #0
+                STOREB  D0, [XY0]
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                CALL16  _KoshEmitPwdNamed
+                CALL16  _KoshBlankLine
+                BRA     .repl_loop
+
+.pwd_failed:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_pwd_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
+; .do_assign - list / set / clear named-volume assigns (named drives v2).
+;
+;   assign               -> list every assign as "NAME: -> X:/backing/path"
+;   assign NAME PATH      -> set (PATH resolved with CWD context; must be a dir)
+;   assign NAME           -> clear
+;
+;   Set/clear mutate the kernel assign table via sys_assign (TRAP_ASSIGN);
+;   the target path is resolved here via TRAP_RESOLVE. List reads the table
+;   directly (kernel page $00) and reconstructs each backing path via sys_pwd.
+; ----------------------------------------------------------------------------
+.do_assign:
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN
+                INC     XY0, #1                 ; past verb nul -> args
+                CALL16  _KoshNextToken          ; token1 = NAME
+                BCS     .asn_list               ; no args -> list
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#ASN_NAME_OFF] ; save name-token offset
+                CALL16  _KoshNextToken          ; token2 = PATH
+                BCS     .asn_clear              ; name only -> clear
+
+                ; --- set: resolve PATH (CWD context), require a directory ---
+                LEA     XY0, XY1                 ; XY0 = path token
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]
+                SUB     D0, #'A'                ; CWD drive index
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster
+                TRAP    #TRAP_RESOLVE           ; -> D0=drive, D1=clu, D2=attr
+                BCS     .asn_fail               ; resolve error (D0=err)
+                MOVE    D3, D2
+                AND     D3, #DIR_ATTR_DIRECTORY
+                BEQ     .asn_notdir             ; target is a file
+                ; sys_assign(set): XY0=name, D0=drive, D1=clu, D2=flags, D3=op
+                LOADP   D3, Y3, [#ASN_NAME_OFF]
+                MOVE    X0, D3
+                MOVE    Y0, Y3                  ; XY0 = name (D0/D1 intact)
+                LOADI   D2, #0                  ; flags = 0 (user assign)
+                LOADI   D3, #0                  ; op = set
+                TRAP    #TRAP_ASSIGN
+                BCS     .asn_fail
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_ok
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.asn_clear:
+                ; sys_assign(clear): XY0=name, op=1
+                LOADP   D0, Y3, [#ASN_NAME_OFF]
+                MOVE    X0, D0
+                MOVE    Y0, Y3
+                LOADI   D0, #0
+                LOADI   D1, #0
+                LOADI   D2, #0
+                LOADI   D3, #1                  ; op = clear
+                TRAP    #TRAP_ASSIGN
+                BCS     .asn_fail
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_ok
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.asn_notdir:
+                LOADI   D0, #ERR_NOTDIR
+.asn_fail:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_fail
+                CALL16  _KoshPrintErr           ; prints "assign: failed [ERR $HHHH]"
+                BRA     .repl_loop
+
+.asn_list:
+                LOADI   D3, #0                  ; entry index
+.asn_l_loop:
+                STOREP  D3, Y3, [#ASN_LIST_IDX]
+                ; entry base = AS_TABLE_BASE + index*16 (kernel page $00)
+                MOVE    D0, D3
+                SHL4    D0
+                ADD     D0, #AS_TABLE_BASE
+                MOVE    X0, D0
+                LOADI   Y0, #$00
+                LOADB   D1, [XY0]               ; AS_NAME[0]
+                AND     D1, #$FF
+                BEQ     .asn_l_next             ; empty slot
+                ; "  " indent (match ls)
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_two_sp
+                TRAP    #TRAP_PUTS
+                ; NAME (page $00)
+                LOADP   D3, Y3, [#ASN_LIST_IDX]
+                MOVE    D0, D3
+                SHL4    D0
+                ADD     D0, #AS_TABLE_BASE
+                MOVE    X0, D0
+                LOADI   Y0, #$00
+                TRAP    #TRAP_PUTS              ; "NAME"
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_colon
+                TRAP    #TRAP_PUTS              ; ":"
+                ; namelen (cap 11) to align the "->" column
+                LOADP   D3, Y3, [#ASN_LIST_IDX]
+                MOVE    D0, D3
+                SHL4    D0
+                ADD     D0, #AS_TABLE_BASE
+                MOVE    X0, D0
+                LOADI   Y0, #$00
+                LOADI   D2, #0
+.asn_l_nlen:
+                LOADB   D0, [XY0]+
+                AND     D0, #$FF
+                BEQ     .asn_l_nlend
+                ADD     D2, #1
+                CMP     D2, #11
+                BLO     .asn_l_nlen
+.asn_l_nlend:
+                ; pad: msg_asn_pad + namelen -> emits (12 - namelen) spaces
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_asn_pad
+                ADD     X0, D2
+                TRAP    #TRAP_PUTS
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_arrow   ; "-> "
+                TRAP    #TRAP_PUTS
+                ; backing path: sys_pwd(drive, cluster) -> ROW_BUF
+                LOADP   D3, Y3, [#ASN_LIST_IDX]
+                MOVE    D0, D3
+                SHL4    D0
+                ADD     D0, #AS_TABLE_BASE
+                MOVE    X0, D0
+                LOADI   Y0, #$00
+                LOADB   D0, [XY0+#AS_FLAGS]     ; deleted backing? (dirty)
+                AND     D0, #AS_FLAG_DIRTY
+                BNE     .asn_l_deleted
+                LOADB   D0, [XY0+#AS_DRIVE]
+                AND     D0, #$FF
+                LOADD   D1, [XY0+#AS_ROOTCLU]
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                TRAP    #TRAP_PWD
+                BCS     .asn_l_nl               ; couldn't rebuild -> bare newline
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                CALL24  KLIB_STRLEN
+                LOADI   D0, #CH_LF
+                STOREB  D0, [XY0]+
+                LOADI   D0, #0
+                STOREB  D0, [XY0]
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                TRAP    #TRAP_PUTS
+                BRA     .asn_l_next
+.asn_l_deleted:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_deleted
+                TRAP    #TRAP_PUTS
+                BRA     .asn_l_next
+.asn_l_nl:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_assign_nl
+                TRAP    #TRAP_PUTS
+.asn_l_next:
+                LOADP   D3, Y3, [#ASN_LIST_IDX]
+                ADD     D3, #1
+                CMP     D3, #AS_MAX
+                BLO     .asn_l_loop
+                CALL16  _KoshBlankLine
+                BRA     .repl_loop
+
+
+; ----------------------------------------------------------------------------
+; .do_rmdir - remove an empty directory.
+;
+;   Args: path (required). Resolve-aware + relative, like mkdir. The kernel
+;   refuses non-directories (ERR_NOTDIR) and non-empty dirs (ERR_NOTEMPTY).
+; ----------------------------------------------------------------------------
+.do_rmdir:
+                LEA     XY0, XY2
+                CALL24  KLIB_STRLEN
+                INC     XY0, #1
+                ; Next token = path arg (quote-aware).
+                CALL16  _KoshNextToken
+                BCS     .rmdir_usage
+                LEA     XY0, XY1                 ; XY0 = path arg (ASCIIZ)
+.rmdir_have_path:
+
+                ; XY0 = path; D0 = CWD drive idx, D1 = CWD cluster.
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D0, [XY1]
+                SUB     D0, #'A'
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]
+                TRAP    #TRAP_RMDIR
+                BCS     .rmdir_failed
+
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_format_ok      ; shared "OK\n"
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.rmdir_usage:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_rmdir_usage
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
+.rmdir_failed:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_rmdir_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
 
 
 
@@ -2359,12 +3141,12 @@ _KoshRmOne:
 ;     4. If unlink fails after a successful copy, the file is now at both
 ;        locations; print a warning but don't unwind.
 ;
-;   The CP_BUF scratch and CP_SRC_FD_TMP / CP_DST_FD_TMP slots are
+;   The CP_BUF scratch and CP_SRC_FD / CP_DST_FD slots are
 ;   shared with .do_cp (no concurrent use - kosh is single-task; the
 ;   slots are kosh-local).
 ;
 ;   Scratch additions: MV_SRC_PATH_TMP / MV_DST_PATH_TMP reuse the
-;   CP_SRC_PATH_TMP / CP_DST_PATH_TMP slots - same purpose, same shape,
+;   CP_SRC_PATH / CP_DST_PATH slots - same purpose, same shape,
 ;   no need for new storage.
 ; ----------------------------------------------------------------------------
 .do_mv:
@@ -2372,91 +3154,30 @@ _KoshRmOne:
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-                ; --- Skip leading whitespace ------------------------------
-.mv_skip_ws1:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .mv_have_src
-                INC     XY0, #1
-                BRA     .mv_skip_ws1
-
-.mv_have_src:
-                CMP     D0, #0
-                BEQ     .mv_usage
-
-                MOVE    D0, X0
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
-
-.mv_src_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ     .mv_usage
-                CMP     D0, #CH_SPACE
-                BEQ.S   .mv_term_src
-                INC     XY0, #1
-                BRA     .mv_src_find_end
-
-.mv_term_src:
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-
-.mv_skip_ws2:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .mv_have_dst
-                INC     XY0, #1
-                BRA     .mv_skip_ws2
-
-.mv_have_dst:
-                CMP     D0, #0
-                BEQ     .mv_usage
-
-                MOVE    D0, X0
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
-
-.mv_dst_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ.S   .mv_dst_terminated
-                CMP     D0, #CH_SPACE
-                BNE.S   .mv_dst_advance
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                BRA.S   .mv_dst_terminated
-.mv_dst_advance:
-                INC     XY0, #1
-                BRA     .mv_dst_find_end
+                ; --- src + dst tokens (quote-aware) ------------------------
+                CALL16  _KoshNextToken           ; src
+                BCS     .mv_usage
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#CP_SRC_PATH]
+                CALL16  _KoshNextToken           ; dst
+                BCS     .mv_usage
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#CP_DST_PATH]
 
 .mv_dst_terminated:
                 ; Does the SRC contain a wildcard?
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
                 CALL16  _KoshHasWildcard
                 BCC     .mv_glob                ; C=0 -> wildcard src
 
-                ; --- Literal path - normalise both, move one ----------------
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
-                MOVE    X0, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                LOADI   D0, #KOSH_NORM_A
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
-
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_B
-                CALL16  _KoshNormPath
-                LOADI   D0, #KOSH_NORM_B
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
-
-                ; Part 37: bare-drive dst ("B:") -> "B:<src-basename>".
-                CALL16  _KoshExpandBareDst
+                ; --- Literal path - Part 44 CWD-relative --------------------
+                ; Raw src/dst pointers + CWD context. Resolve a directory dst
+                ; to "<dst>/<src-basename>" (so "mv f b:/foo" lands in foo).
+                CALL16  _KoshStashCwd
+                CALL16  _KoshResolveDstPath
+                BCS     .mv_report_err          ; Part 62: CP_ERR_TOOLONG
 
                 CALL16  _KoshMvOne
                 BCS     .mv_report_err
@@ -2473,8 +3194,21 @@ _KoshRmOne:
                 BEQ     .mv_same_path
                 CMP     D0, #CP_ERR_EXISTS
                 BEQ     .mv_exists_msg
+                CMP     D0, #CP_ERR_TOOLONG
+                BEQ     .mv_toolong_msg
+                CMP     D0, #MV_ERR_UNLINK
+                BEQ     .mv_unlink_msg
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_mv_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+.mv_unlink_msg:
+                ; Copy landed, source could not be removed - the file is at
+                ; both ends. Print the REAL kernel code, not the sentinel.
+                LOADP   D0, Y3, [#MV_UNLINK_ERR]
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_mv_unlink_err
                 CALL16  _KoshPrintErr
                 BRA     .repl_loop
 
@@ -2497,38 +3231,67 @@ _KoshRmOne:
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
+.mv_toolong_msg:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_path_toolong
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
+
 ; --- Glob path -------------------------------------------------------------
 ; mv <pattern> <destdrive>: - move each matching file to the dest drive,
 ; keeping its basename. Same dest rules as cp glob. Stop-on-error.
 .mv_glob:
+                ; Part 44 step 4: CP_CWD context for the bare src matches is set
+                ; from the src split below (glob in CWD or, if prefixed, root).
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X0, D0
                 CALL16  _KoshHasWildcard
                 BCC     .mv_glob_destwild
 
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat
-                BCS     .mv_glob_baddrv
-                LOADB   D0, [XY1]
-                CMP     D0, #0
-                BNE     .mv_glob_multidest
-                MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
-                MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat
-                STOREP  D0, Y3, [#CP_DSTDRV_TMP]
+                ; Part 64 step 2: mirrors .cp_glob exactly - see the long
+                ; comment there for why CP_CWD_* stays on the shell CWD and
+                ; the source is rebuilt as a full path. It matters more here:
+                ; TRAP_RENAME takes ONE (D1, D2) context for both of its
+                ; paths, so a split context was never expressible.
+                CALL16  _KoshStashCwd
+
+                LOADP   D0, Y3, [#CP_DST_PATH]
+                STOREP  D0, Y3, [#CP_GDST]
 
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                MOVE    X0, D0                  ; XY0 = dst token
+                LOADP   D0, Y3, [#CP_CWD_DRV]
+                LOADP   D1, Y3, [#CP_CWD_CLU]
+                TRAP    #TRAP_RESOLVE           ; -> D0=drive, D1=clu, D2=attr
+                BCS     .mv_glob_dstmissing
+                AND     D2, #DIR_ATTR_DIRECTORY
+                BEQ     .mv_glob_dstnotdir
+
+                MOVE    Y0, Y3
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
-                CALL16  _KoshSplitDrivePat
-                BCS     .mv_glob_baddrv
+                CALL16  _KoshSplitDirPat        ; D0=drv, D1=clu, D2=pfxlen, XY1=pat
+                BCS     .mv_glob_srcdir
                 STOREP  D0, Y3, [#GLOB_DRIVE]
+                STOREP  D1, Y3, [#GLOB_CLU]
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#GLOB_PATPTR]
 
-                MOVE    D2, D0
+                LOADP   D0, Y3, [#GLOB_PFXPTR]
+                MOVE    Y0, Y3
+                MOVE    X0, D0
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_NORM_A
+                MOVE    D0, D2                  ; count = prefix length
+                LOADI   D1, #KOSH_NORM_LEN
+                CALL16  _KoshCopyCounted
+                BCS     .mv_glob_pathlong
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#GLOB_NAMEOFF]
+                STOREP  D1, Y3, [#GLOB_NAMECAP]
+
+                LOADP   D2, Y3, [#GLOB_DRIVE]
                 SHL4    D2
                 SHL     D2
                 SHL     D2
@@ -2538,18 +3301,23 @@ _KoshRmOne:
                 ADD     X0, #VOL_ROOT_ENTRIES
                 LOADD   D2, [XY0]
 
-                MOVE    D3, D2
-                SHL     D3
-                MOVE    D0, D3
-                SHL     D3
-                ADD     D0, D3
-                SHL     D3
-                ADD     D0, D3                  ; root_entries*14
+                ; Reserve stack table: bytes = root_entries * GLOB_ENTRY_SIZE.
+                ; Part 64: GLOB_ENTRY_SIZE is 32, so this is SHL4 + SHL. The
+                ; shift count IS GLOB_ENTRY_SHIFT; the symbol cannot be spelled
+                ; in the operand, so keep the two in step by hand. Worst case
+                ; is 256*32 = 8192 bytes - derivation in kosh_defs.inc.
+                MOVE    D0, D2
+                SHL4    D0                      ; *16
+                SHL     D0                      ; *32 = GLOB_ENTRY_SIZE
                 STOREP  D0, Y3, [#GLOB_RSVSIZE]
                 SUB     X3, D0
                 MOVE    D0, X3
                 STOREP  D0, Y3, [#GLOB_TABLE]
 
+                ; XY1 was consumed by the prefix copy; D2 still = root_entries.
+                LOADP   D0, Y3, [#GLOB_PATPTR]
+                MOVE    Y1, Y3
+                MOVE    X1, D0
                 LOADP   D0, Y3, [#GLOB_DRIVE]
                 CALL16  _KoshGlobExpand
                 BCS     .mv_glob_toomany
@@ -2567,66 +3335,29 @@ _KoshRmOne:
                 CMP     D0, D1
                 BHS     .mv_glob_release
 
-                MOVE    D2, D0
-                SHL     D0
-                MOVE    D3, D0
-                SHL     D0
-                ADD     D3, D0
-                SHL     D0
-                ADD     D3, D0                  ; idx*14
-                LOADP   D0, Y3, [#GLOB_TABLE]
-                ADD     D3, D0
-                STOREP  D3, Y3, [#CP_NAME_TMP]
+                CALL16  _KoshGlobEntryPtr       ; D0 = index -> D3 = entry offset
+                STOREP  D3, Y3, [#CP_NAME]
 
-                ; Build src "<srcdrive>:<name>" in KOSH_NORM_A.
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                LOADP   D0, Y3, [#GLOB_DRIVE]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADP   D0, Y3, [#CP_NAME_TMP]
+                ; SRC = "<prefix><name>" in KOSH_NORM_A - see .cp_glob_iter.
+                LOADP   D0, Y3, [#CP_NAME]
                 MOVE    Y0, Y3
                 MOVE    X0, D0
-.mv_glob_srccpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .mv_glob_srcdone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .mv_glob_srccpy
+                LOADP   D0, Y3, [#GLOB_NAMEOFF]
+                MOVE    Y1, Y3
+                MOVE    X1, D0
+                LOADP   D1, Y3, [#GLOB_NAMECAP]
+                CALL16  _KoshCopyBounded
+                BCS     .mv_glob_item_err
 .mv_glob_srcdone:
                 LOADI   D0, #KOSH_NORM_A
-                STOREP  D0, Y3, [#CP_SRC_PATH_TMP]
+                STOREP  D0, Y3, [#CP_SRC_PATH]
 
-                ; Build dst "<dstdrive>:<name>" in KOSH_NORM_B.
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_B
-                LOADP   D0, Y3, [#CP_DSTDRV_TMP]
-                ADD     D0, #'A'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADI   D0, #':'
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                LOADP   D0, Y3, [#CP_NAME_TMP]
-                MOVE    Y0, Y3
-                MOVE    X0, D0
-.mv_glob_dstcpy:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                CMP     D0, #0
-                BEQ.S   .mv_glob_dstdone
-                INC     XY0, #1
-                INC     XY1, #1
-                BRA     .mv_glob_dstcpy
+                ; DST via _KoshResolveDstPath, same as the literal mv path.
+                LOADP   D0, Y3, [#CP_GDST]
+                STOREP  D0, Y3, [#CP_DST_PATH]
+                CALL16  _KoshResolveDstPath     ; C=1 -> D0 = CP_ERR_TOOLONG
+                BCS     .mv_glob_item_err
 .mv_glob_dstdone:
-                LOADI   D0, #KOSH_NORM_B
-                STOREP  D0, Y3, [#CP_DST_PATH_TMP]
 
                 CALL16  _KoshMvOne
                 BCS     .mv_glob_check_warn
@@ -2674,10 +3405,16 @@ _KoshRmOne:
 
 .mv_glob_item_err:
                 ; Stop-on-error: release stack, report, abort.
-                PUSH    D0, XY3
+                ; Part 62: hold the code in D3, NOT on the stack. The release
+                ; below moves X3 past the pushed slot, so a PUSH/POP pair
+                ; straddling it pops residue from the freed glob table - that
+                ; is where the bogus "[ERR_UNKNOWN $253A]" came from. D3 is
+                ; dead on entry (the worker clobbers it) and is restored
+                ; before any TRAP that could touch it.
+                MOVE    D3, D0
                 LOADP   D0, Y3, [#GLOB_RSVSIZE]
                 ADD     X3, D0
-                POP     D0, XY3
+                MOVE    D0, D3
                 PUSH    D0, XY3
                 MOVE    Y0, Y3
                 LOADI   X0, #KOSH_NORM_A
@@ -2689,8 +3426,19 @@ _KoshRmOne:
                 BEQ     .mv_glob_item_exists
                 CMP     D0, #CP_ERR_SAMEPATH
                 BEQ     .mv_glob_item_same
+                CMP     D0, #MV_ERR_UNLINK
+                BEQ     .mv_glob_item_unlink
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_mv_failed
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+.mv_glob_item_unlink:
+                ; Stop-on-error, as for any hard failure - but say which
+                ; failure. The stack was released above, so reading
+                ; MV_UNLINK_ERR here touches nothing that was freed.
+                LOADP   D0, Y3, [#MV_UNLINK_ERR]
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_mv_unlink_err
                 CALL16  _KoshPrintErr
                 BRA     .repl_loop
 .mv_glob_item_exists:
@@ -2715,15 +3463,29 @@ _KoshRmOne:
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
-.mv_glob_multidest:
+; As in .cp_glob: all four fire before the table is reserved, so none of
+; them releases stack.
+.mv_glob_dstmissing:
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_multidest
+                LOADI   X0, #msg_glob_dstnotfound
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+.mv_glob_dstnotdir:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_glob_dstnotdir
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
-.mv_glob_baddrv:
+.mv_glob_srcdir:
                 MOVE    Y0, Y3
-                LOADI   X0, #msg_glob_drivewild
+                LOADI   X0, #msg_glob_srcdir
+                CALL16  _KoshPrintErr
+                BRA     .repl_loop
+
+.mv_glob_pathlong:
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_path_toolong
                 TRAP    #TRAP_PUTS
                 BRA     .repl_loop
 
@@ -2750,7 +3512,7 @@ _KoshRmOne:
                 BRA     .repl_loop
 
 ; ----------------------------------------------------------------------------
-; _KoshMvOne - move one file. src in CP_SRC_PATH_TMP, dst in CP_DST_PATH_TMP
+; _KoshMvOne - move one file. src in CP_SRC_PATH, dst in CP_DST_PATH
 ;   (both normalised pointers in the task page).
 ;
 ;   Out:  C = 0 OK
@@ -2768,11 +3530,13 @@ _KoshRmOne:
 _KoshMvOne:
                 ; Try kernel rename first (XY0 = old, XY1 = new).
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
                 MOVE    Y1, Y3
-                LOADP   D0, Y3, [#CP_DST_PATH_TMP]
+                LOADP   D0, Y3, [#CP_DST_PATH]
                 MOVE    X1, D0
+                LOADP   D1, Y3, [#CP_CWD_CLU]   ; Part 44: CWD context
+                LOADP   D2, Y3, [#CP_CWD_DRV]
                 TRAP    #TRAP_RENAME
                 BCC     .m1_ok                  ; C=0 -> renamed in place
 
@@ -2794,8 +3558,10 @@ _KoshMvOne:
 
                 ; Copy OK. Unlink the source.
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#CP_SRC_PATH_TMP]
+                LOADP   D0, Y3, [#CP_SRC_PATH]
                 MOVE    X0, D0
+                LOADP   D1, Y3, [#CP_CWD_CLU]   ; Part 44: CWD context
+                LOADP   D2, Y3, [#CP_CWD_DRV]
                 TRAP    #TRAP_UNLINK
                 BCS     .m1_unlink_failed
                 CLC
@@ -2811,12 +3577,24 @@ _KoshMvOne:
                 ; on a read-only volume (e.g. A:/ROM), this is not a real
                 ; failure - the file IS at the destination; ROM simply can't
                 ; be modified. Signal a soft warning so the caller reports
-                ; success-with-note and (for globs) keeps going. Any other
-                ; unlink error is a genuine failure (file now at both ends).
+                ; success-with-note and (for globs) keeps going.
                 CMP     D0, #ERR_READONLY
                 BNE.S   .m1_unlink_hard
                 LOADI   D0, #MV_WARN_ROSRC
+                SEC
+                RET
+
 .m1_unlink_hard:
+                ; Any other unlink error: the copy IS at the destination and
+                ; the source is still there, so the file now exists at both
+                ; ends. Part 64: raise a distinct sentinel rather than
+                ; returning the raw code, which the reporters could not tell
+                ; apart from an ordinary "the move never happened" failure.
+                ; The raw code is stashed so the report can still name it.
+                ; Y3 is the task page and _KoshMvOne preserves XY3, so a
+                ; STOREP here is safe.
+                STOREP  D0, Y3, [#MV_UNLINK_ERR]
+                LOADI   D0, #MV_ERR_UNLINK
                 SEC
                 RET
 
@@ -2830,7 +3608,7 @@ _KoshMvOne:
 ;   Workflow:
 ;     1. Parse name + optional -f flag.
 ;     2. _HostFOpen(name) -> file size in D0.
-;     3. Normalise dest path "<CWD>:<NAME>" via _KoshNormPath.
+;     3. Point XY0 at LOAD_BASENAME; opens carry CWD context (D1/D2).
 ;     4. If dest exists and no -f: print "exists", FCLOSE, abort.
 ;     5. sys_open dest WRITE|CREATE|TRUNC.
 ;     6. Loop: _HostFRead(CP_BUF, 512) -> sys_write until EOF (0 bytes).
@@ -2841,100 +3619,135 @@ _KoshMvOne:
 ;   The EMU's singleton lock means an unclosed FOPEN blocks all future
 ;   load commands until reboot.
 ;
-;   Reuses CP_BUF (512 B) for the read/write buffer, KOSH_NORM_A for
-;   the destination path. Load doesn't run concurrently with cp/mv so
-;   the shared buffer is safe.
+;   Reuses CP_BUF (512 B) for the read/write buffer. The destination
+;   path is read in place from LINE_BUF via LOAD_BASENAME - no staging
+;   buffer, so long names are not capped by KOSH_NORM_A's 16 bytes.
 ; ----------------------------------------------------------------------------
 .do_load:
+                ; --- Digital guard (Part 61) ------------------------------
+                ; The host file bridge is EMU-only: _HostFOpen rejects
+                ; HOST_DIGITAL with ERR_INVALID before touching MMIO. The
+                ; Part 57 boot cascade runs A:STARTUP.KSH on every target,
+                ; and that script carries `load ramdisk/...` lines, so on
+                ; Digital return silently rather than printing a failure per
+                ; line at boot. Interactive `load` on Digital is likewise a
+                ; no-op, which is honest - there is no host to load from.
+                LOADZ   D0, [#KOS_HOST]
+                LOW     D0
+                CMP     D0, #HOST_DIGITAL
+                BEQ     .repl_loop
+
                 LEA     XY0, XY2
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-.load_skip_ws1:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .load_have_name
-                INC     XY0, #1
-                BRA     .load_skip_ws1
-
-.load_have_name:
-                CMP     D0, #0
-                BEQ     .load_usage
-
-                ; XY0 = start of name. Walk to end-of-token; capture in-place.
-                LEA     XY1, XY0
+                ; Name token (quote-aware -> spaced host filenames OK).
                 ; Default: no -f.
                 LOADI   D2, #0
-                STOREP  D2, Y3, [#LOAD_FORCE_TMP]
+                STOREP  D2, Y3, [#LOAD_FORCE]
+                CALL16  _KoshNextToken
+                BCS     .load_usage
+                ; XY1 = name (ASCIIZ); XY0 = cursor past name -> scan for -f.
+                ; Stash the name offset for the dest-path build below.
+                MOVE    D0, X1
+                STOREP  D0, Y3, [#LOAD_NAME]
 
-.load_name_find_end:
-                LOADB   D0, [XY1]
+                ; --- Host-folder prefix split (Part 61) -------------------
+                ; The token may carry a host-folder prefix:
+                ;     load zork.com            -> uploads folder
+                ;     load ramdisk/zork.com    -> system/ramdisk folder
+                ; LOAD_NAME keeps the FULL token - EMULIB_HOST_FOPEN needs
+                ; the prefix to pick the folder. LOAD_BASENAME points at the
+                ; last component only and is what the K16-side open uses;
+                ; without the split the resolver reads '/' as a k/OS
+                ; separator and tries to create the file inside a
+                ; nonexistent "ramdisk" directory on the destination drive.
+                ; Walk to nul, tracking the offset just past the last '/'.
+                ; With no '/' present, LOAD_BASENAME == LOAD_NAME.
+                ; Walk XY1, NOT XY0: _KoshNextToken left XY0 as the cursor
+                ; past the name and .load_scan_flag below consumes it. XY1
+                ; (the name pointer) is dead after the MOVE D0, X1 above.
+                MOVE    D2, D0                  ; D2 = basename offset so far
+                MOVE    Y1, Y3
+                MOVE    X1, D0                  ; XY1 = token cursor
+.load_base_scan:
+                LOADB   D0, [XY1]               ; flag-transparent - CMP below
                 CMP     D0, #0
-                BEQ     .load_name_terminated   ; line ended at name (>31B away)
-                CMP     D0, #CH_SPACE
-                BEQ.S   .load_term_name
+                BEQ     .load_base_done
                 INC     XY1, #1
-                BRA     .load_name_find_end
+                CMP     D0, #'/'
+                BNE     .load_base_scan
+                MOVE    D2, X1                  ; char after '/' = new base
+                BRA     .load_base_scan
+.load_base_done:
+                STOREP  D2, Y3, [#LOAD_BASENAME]
 
-.load_term_name:
-                ; Nul-terminate the name, then look for -f in the rest.
-                LOADI   D0, #0
-                STOREB  D0, [XY1]
-                INC     XY1, #1
-                ; Now scan rest of line for -f.
 .load_scan_flag:
-                LOADB   D0, [XY1]
+                LOADB   D0, [XY0]
                 CMP     D0, #0
-                BEQ     .load_name_terminated   ; (>31B away)
+                BEQ     .load_name_terminated
                 CMP     D0, #CH_SPACE
                 BEQ.S   .load_scan_skip
                 CMP     D0, #'-'
                 BNE.S   .load_scan_skip         ; ignore unknown tokens
                 ; '-' - check next char for 'f' or 'F'.
-                INC     XY1, #1
-                LOADB   D0, [XY1]
+                INC     XY0, #1
+                LOADB   D0, [XY0]
                 CMP     D0, #'f'
                 BEQ.S   .load_set_force
                 CMP     D0, #'F'
                 BNE.S   .load_scan_skip
 .load_set_force:
                 LOADI   D0, #1
-                STOREP  D0, Y3, [#LOAD_FORCE_TMP]
+                STOREP  D0, Y3, [#LOAD_FORCE]
 .load_scan_skip:
-                INC     XY1, #1
+                INC     XY0, #1
                 BRA     .load_scan_flag
 
 .load_name_terminated:
-                ; XY0 still = start of (now nul-terminated) name. Save it.
-                MOVE    D0, X0
-                STOREP  D0, Y3, [#LOAD_NAME_TMP]
+                ; Restore XY0 = name ptr (saved in LOAD_NAME above).
+                MOVE    Y0, Y3
+                LOADP   D0, Y3, [#LOAD_NAME]
+                MOVE    X0, D0
 
                 ; --- _HostFOpen(name) -> file size in D0 -------------------
                 ; (XY0 already points at the name in the line buffer.)
                 CALL24  EMULIB_HOST_FOPEN
                 BCS     .load_fopen_err
 
-                ; Save file size for the success message.
-                STOREP  D0, Y3, [#LOAD_SIZE_TMP]
+                ; Save file size (32-bit, Part 26) for the success message
+                ; and the short-copy check at .load_eof.
+                STOREP  D0, Y3, [#LOAD_SIZE_LO]
+                STOREP  D1, Y3, [#LOAD_SIZE_HI]
 
-                ; --- Build destination path "<CWD>:<NAME>" in KOSH_NORM_A -
+                ; --- Destination path = LOAD_BASENAME, in place ----------
+                ; Part 61: LOAD_BASENAME, not LOAD_NAME - the host-folder
+                ; prefix must not reach the K16 destination path.
+                ; Part 62: no _KoshNormPath. That helper prepends
+                ; "<KOSH_CWD>:", and a leading "X:" tells the resolver to
+                ; start at cluster 0 (see _KoshSplitDrivePat), which forced
+                ; every load into the drive root. The bare basename plus
+                ; CWD context in D1/D2 resolves inside the current
+                ; directory; a name that carries its own "X:" still goes to
+                ; that drive's root, matching every other command.
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#LOAD_NAME_TMP]
+                LOADP   D0, Y3, [#LOAD_BASENAME]
                 MOVE    X0, D0
-                MOVE    Y1, Y3
-                LOADI   X1, #KOSH_NORM_A
-                CALL16  _KoshNormPath
-                ; XY1 = normalised path; copy to XY0 for sys_open.
-                MOVE    Y0, Y1
-                MOVE    X0, X1
 
                 ; --- If not -f, check whether dest already exists ---------
-                LOADP   D0, Y3, [#LOAD_FORCE_TMP]
+                LOADP   D0, Y3, [#LOAD_FORCE]
                 CMP     D0, #0
-                BNE.S   .load_open_dest_for_write
+                BNE     .load_open_dest_for_write
 
                 ; Probe sys_open(dest, READ). On success, dest exists -> refuse.
-                ; XY0 still points at normalised path.
+                ; XY0 still points at the basename in LINE_BUF.
+                ; Part 62: CWD context (D1 = cluster, D2 = drive index).
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D2, [XY1]               ; CWD drive letter
+                SUB     D2, #'A'                ; -> drive index 0..5
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster (0 = root)
                 LOADI   D0, #FOPEN_READ
                 TRAP    #TRAP_OPEN
                 BCS.S   .load_open_dest_for_write   ; doesn't exist -> proceed
@@ -2948,14 +3761,22 @@ _KoshMvOne:
                 BRA     .repl_loop
 
 .load_open_dest_for_write:
-                ; Rebuild XY0 from KOSH_NORM_A (sys_open may have clobbered).
+                ; Rebuild XY0 from LOAD_BASENAME (sys_open may have
+                ; clobbered it). Part 62: CWD context in D1/D2.
                 MOVE    Y0, Y3
-                LOADI   X0, #KOSH_NORM_A
+                LOADP   D0, Y3, [#LOAD_BASENAME]
+                MOVE    X0, D0
+                MOVE    Y1, Y3
+                LOADI   X1, #KOSH_CWD
+                LOADB   D2, [XY1]               ; CWD drive letter
+                SUB     D2, #'A'                ; -> drive index 0..5
+                LOADI   X1, #KOSH_CWD_CLU
+                LOADD   D1, [XY1]               ; CWD cluster (0 = root)
                 LOADI   D0, #OPEN_FLAGS_NEW         ; CREATE | WRITE | TRUNC
                 TRAP    #TRAP_OPEN
                 BCS     .load_create_err
 
-                STOREP  D0, Y3, [#LOAD_DST_FD_TMP]
+                STOREP  D0, Y3, [#LOAD_DST_FD]
 
                 ; Part 34: initialise cumulative bytes-written counter to 0.
                 LOADI   D0, #0
@@ -2977,7 +3798,7 @@ _KoshMvOne:
                 MOVE    D3, D0                  ; D3 = bytes read
 
                 ; sys_write(fd, count=D3, buf=CP_BUF)
-                LOADP   D0, Y3, [#LOAD_DST_FD_TMP]
+                LOADP   D0, Y3, [#LOAD_DST_FD]
                 MOVE    D1, D3
                 MOVE    Y0, Y3
                 LOADI   X0, #CP_BUF
@@ -3000,12 +3821,25 @@ _KoshMvOne:
 
 .load_eof:
                 ; --- Close everything cleanly ----------------------------
-                LOADP   D0, Y3, [#LOAD_DST_FD_TMP]
+                LOADP   D0, Y3, [#LOAD_DST_FD]
                 TRAP    #TRAP_CLOSE
                 CALL24  EMULIB_HOST_FCLOSE
 
+                ; --- Integrity: host size vs bytes actually written -------
+                ; Part 26. A silent short copy is invisible until something
+                ; downstream fails a checksum, three layers from the cause.
+                ; Compare here, where the cause is still in view.
+                LOADP   D0, Y3, [#LOAD_WRITTEN_LO]
+                LOADP   D1, Y3, [#LOAD_SIZE_LO]
+                CMP     D0, D1
+                BNE     .load_short_copy
+                LOADP   D0, Y3, [#LOAD_WRITTEN_HI]
+                LOADP   D1, Y3, [#LOAD_SIZE_HI]
+                CMP     D0, D1
+                BNE     .load_short_copy
+
                 ; --- Print "loaded <N> bytes\n" --------------------------
-                ; Build in ROW_BUF: "loaded " + dec(N) + " bytes\n\0"
+                ; Build in ROW_BUF: "loaded " + dec32(N) + " bytes\n\0"
                 MOVE    Y1, Y3
                 LOADI   X1, #ROW_BUF
 
@@ -3014,9 +3848,11 @@ _KoshMvOne:
                 LOADI   X0, #msg_load_ok
                 CALL16  _KoshEmitStrZ
 
-                ; Emit decimal byte count.
-                LOADP   D0, Y3, [#LOAD_SIZE_TMP]
-                CALL16  _KoshEmitDec
+                ; Emit decimal byte count (32-bit: an 85 KB story overflows
+                ; the old 16-bit _KoshEmitDec).
+                LOADP   D0, Y3, [#LOAD_WRITTEN_LO]
+                LOADP   D1, Y3, [#LOAD_WRITTEN_HI]
+                CALL16  _KoshEmitDec32
 
                 ; Emit " bytes\n" suffix.
                 MOVE    Y0, Y3
@@ -3034,6 +3870,33 @@ _KoshMvOne:
                 BRA     .repl_loop
 
 ; --- Error paths (must always close any open resources before returning) ----
+
+.load_short_copy:
+                ; Part 26. Everything is already closed by .load_eof; this
+                ; arm only reports. "load: short copy - wrote N of M bytes".
+                MOVE    Y1, Y3
+                LOADI   X1, #ROW_BUF
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_load_short_copy
+                CALL16  _KoshEmitStrZ
+                LOADP   D0, Y3, [#LOAD_WRITTEN_LO]
+                LOADP   D1, Y3, [#LOAD_WRITTEN_HI]
+                CALL16  _KoshEmitDec32
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_load_of
+                CALL16  _KoshEmitStrZ
+                LOADP   D0, Y3, [#LOAD_SIZE_LO]
+                LOADP   D1, Y3, [#LOAD_SIZE_HI]
+                CALL16  _KoshEmitDec32
+                MOVE    Y0, Y3
+                LOADI   X0, #msg_load_bytes
+                CALL16  _KoshEmitStrZ
+                LOADI   D0, #0
+                CALL16  _KoshEmitByte
+                MOVE    Y0, Y3
+                LOADI   X0, #ROW_BUF
+                TRAP    #TRAP_PUTS
+                BRA     .repl_loop
 
 .load_usage:
                 MOVE    Y0, Y3
@@ -3067,7 +3930,7 @@ _KoshMvOne:
                 ; TRAP_CLOSE (which returns its own D0) and _HostFClose
                 ; (clobbers D0/D1/D2). Both preserve D3.
                 MOVE    D3, D0
-                LOADP   D0, Y3, [#LOAD_DST_FD_TMP]
+                LOADP   D0, Y3, [#LOAD_DST_FD]
                 TRAP    #TRAP_CLOSE
                 CALL24  EMULIB_HOST_FCLOSE
                 MOVE    D0, D3
@@ -3088,7 +3951,7 @@ _KoshMvOne:
                 ; _KoshEmitSize does NOT preserve D3 (its KLIB callees
                 ; clobber it), so we stash the err code in a page-$00 slot
                 ; rather than D3.
-                STOREP  D0, Y3, [#LOAD_ERR_TMP]
+                STOREP  D0, Y3, [#LOAD_ERR]
 
                 ; Add partial-chunk count (D1) to cumulative.
                 LOADP   D0, Y3, [#LOAD_WRITTEN_LO]
@@ -3099,7 +3962,7 @@ _KoshMvOne:
                 STOREP  D0, Y3, [#LOAD_WRITTEN_HI]
 
                 ; Close the destination file (truncated to whatever made it).
-                LOADP   D0, Y3, [#LOAD_DST_FD_TMP]
+                LOADP   D0, Y3, [#LOAD_DST_FD]
                 TRAP    #TRAP_CLOSE
                 CALL24  EMULIB_HOST_FCLOSE
 
@@ -3124,7 +3987,7 @@ _KoshMvOne:
 
                 ; Then the standard "load: write error [...]" line with the
                 ; stashed err code.
-                LOADP   D0, Y3, [#LOAD_ERR_TMP]
+                LOADP   D0, Y3, [#LOAD_ERR]
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_load_write_err
                 CALL16  _KoshPrintErr
@@ -3136,7 +3999,7 @@ _KoshMvOne:
                 ; counts are never surfaced. If sys_write semantics change to
                 ; POSIX-style (C=0 with short count permitted), this path
                 ; activates. See Phase 11 partial-write design note.
-                LOADP   D0, Y3, [#LOAD_DST_FD_TMP]
+                LOADP   D0, Y3, [#LOAD_DST_FD]
                 TRAP    #TRAP_CLOSE
                 CALL24  EMULIB_HOST_FCLOSE
                 MOVE    Y0, Y3
@@ -3160,7 +4023,8 @@ _KoshMvOne:
 ;   "Drive  "     (7)   "Label       "  (12)
 ;   "   Total "   (9)   "    Used "     (9)
 ;   "    Free "   (9)   "Use%"          (4)
-msg_vol_hdr:       .TEXT "Drive  Label          Total     Used     Free Use%\n",0
+msg_vol_hdr:       .TEXT "Drive  Label       Name        Total     Used     Free Use%\n",0
+msg_two_sp:        .TEXT "  ",0
 msg_vol_unmounted: .TEXT "(not mounted)",0
 ; 28 May 2026 - distinguish "bay bound but image is not formatted FAT16"
 ; from "no bay bound at all". Emitted as: "(unformatted: <name>)" so the
@@ -3170,10 +4034,15 @@ msg_vol_unfmt_pre: .TEXT "(unformatted: ",0
 msg_vol_unfmt_post: .TEXT ")",0
 
 ; --- ls --------------------------------------------------------------------
-msg_ls_usage:     .TEXT  "usage: ls [drive][pattern]  e.g. ls B:  ls *.COM\n",0
-msg_ls_files:     .TEXT  " file(s), ",0
-msg_ls_used:      .TEXT  " used, ",0
-msg_ls_free:      .TEXT  " free\n",0
+msg_ls_usage:     .TEXT  "usage: ls [path][pattern]  e.g. ls  ls FOO  ls *.COM\n",0
+msg_ls_notdir:    .TEXT  "ls: not a directory\n",0
+msg_ls_failed:    .TEXT  "ls: failed",0
+msg_cnt_file:     .TEXT  "file",0
+msg_cnt_files:    .TEXT  "files",0
+msg_cnt_dir:      .TEXT  "dir",0
+msg_cnt_dirs:     .TEXT  "dirs",0
+msg_ls_used:      .TEXT  "used\n",0
+msg_ls_free:      .TEXT  "free\n",0
 ls_star_pat:      .TEXT  "*",0             ; match-all pattern (Part 37)
 ; Pre-Part 34 strings (msg_ls_bytes, msg_ls_kb, msg_ls_big) removed -
 ; size formatting is now done by _KoshEmitSize (kosh_helpers.asm r3+).
@@ -3226,6 +4095,7 @@ msg_run_bg_lbl:   .TEXT  "bg ",0
 msg_cp_usage:        .TEXT "usage: cp <src> <dst>   e.g. cp A:HI.COM B:HI.COM  cp *.COM B:\n",0
 msg_cp_samepath:     .TEXT "cp: source and destination are the same\n",0
 msg_cp_exists:       .TEXT "cp: destination exists\n",0
+msg_path_toolong:    .TEXT "path too long\n",0
 msg_cp_writeerr:     .TEXT "cp: write error",0
 msg_cp_ok:           .TEXT "OK\n",0
 
@@ -3233,13 +4103,36 @@ msg_cp_ok:           .TEXT "OK\n",0
 msg_rm_usage:        .TEXT "usage: rm <path>     e.g. rm B:HELLO.COM  rm *.TMP\n",0
 msg_rm_failed:       .TEXT "rm: failed",0
 
+; --- mkdir -----------------------------------------------------------------
+msg_mkdir_usage:     .TEXT "usage: mkdir <path>     e.g. mkdir B:STUFF\n",0
+msg_mkdir_failed:    .TEXT "mkdir: failed",0
+msg_cd_notdir:       .TEXT "cd: not a directory\n",0
+msg_cd_failed:       .TEXT "cd: failed",0
+msg_pwd_failed:      .TEXT "pwd: failed",0
+msg_rmdir_usage:     .TEXT "usage: rmdir <path>     e.g. rmdir B:STUFF\n",0
+msg_rmdir_failed:    .TEXT "rmdir: failed",0
+
 ; --- wildcard glob (Part 37) -----------------------------------------------
 msg_glob_nomatch:    .TEXT "no matches\n",0
 msg_glob_toomany:    .TEXT "too many matches; refine pattern\n",0
-msg_glob_drivewild:  .TEXT "drive letter cannot be a wildcard\n",0
 msg_glob_removed:    .TEXT " removed\n",0
 msg_glob_destwild:   .TEXT "destination cannot contain wildcards\n",0
-msg_glob_multidest:  .TEXT "multiple sources need a drive target (e.g. B:)\n",0
+; Part 64 step 2: two strings deleted with the rules they enforced.
+;   msg_glob_multidest ("multiple sources need a drive target") went with
+;     the bare-"X:" destination requirement - any directory is valid now.
+;   msg_glob_drivewild ("drive letter cannot be a wildcard") was reachable
+;     only from the four .*_glob_baddrv arms. A bad drive now comes back
+;     from sys_resolve as a real ERR_BADDRIVE and prints through
+;     msg_glob_srcdir with the code attached, which says more.
+; Both verified to have zero live references before removal, per the
+; Part 37 string-cleanup practice recorded in the r22 note above.
+; NOT deleted: msg_mv_unlink_err and msg_run_waiterr. Neither is dead
+; weight - each names a real outcome that its handler currently reports as
+; something else. See the Part 64 handover; wiring them is a behaviour
+; change, not a sweep.
+msg_glob_dstnotdir:  .TEXT "destination is not a directory\n",0
+msg_glob_dstnotfound: .TEXT "destination directory not found",0
+msg_glob_srcdir:     .TEXT "bad source directory",0
 msg_cp_arrow:        .TEXT " -> ",0
 
 ; --- mv --------------------------------------------------------------------
@@ -3259,6 +4152,8 @@ msg_load_fread_err:     .TEXT "load: host read error",0
 msg_load_write_err:     .TEXT "load: write error",0
 msg_load_short_write:   .TEXT "load: short write\n",0
 msg_load_ok:            .TEXT "loaded ",0
+msg_load_short_copy:    .TEXT "load: short copy - wrote ",0
+msg_load_of:            .TEXT " of ",0
 msg_load_bytes:         .TEXT " bytes\n",0
 ; Part 34 partial-write reporting: when sys_write fails mid-stream we now
 ; print "load: wrote <SIZE> then failed:" before the standard error line.
@@ -3273,6 +4168,17 @@ cmd_format_str:   .TEXT  "format",0
 cmd_run_str:      .TEXT  "run",0
 cmd_cp_str:       .TEXT  "cp",0
 cmd_rm_str:       .TEXT  "rm",0
+cmd_mkdir_str:    .TEXT  "mkdir",0
+cmd_cd_str:       .TEXT  "cd",0
+cmd_pwd_str:      .TEXT  "pwd",0
+cmd_rmdir_str:    .TEXT  "rmdir",0
+cmd_assign_str:   .TEXT  "assign",0
+msg_assign_arrow: .TEXT  "-> ",0
+msg_asn_pad:      .TEXT  "            ",0
+msg_assign_deleted: .TEXT "[deleted]\n",0
+msg_assign_ok:    .TEXT  "OK\n",0
+msg_assign_fail:  .TEXT  "assign: failed",0
+msg_assign_nl:    .TEXT  "\n",0
 cmd_mv_str:       .TEXT  "mv",0
 cmd_load_str:     .TEXT  "load",0
 
@@ -3321,6 +4227,58 @@ _KoshEmitDec:
                 POP     XY0, XY3
                 RET
 
+; ----------------------------------------------------------------------------
+; _KoshEmitDec32 - append decimal text of D1:D0 (unsigned 32) at the cursor.
+;
+;   In:       D0 = value low, D1 = value high
+;             XY1 = cursor
+;   Out:      digits stored at [XY1]; XY1 advanced past them; KLIB_UTOA32
+;             writes a nul at the new position (harmless - overwritten by
+;             the next emit, or kept if you nul-terminate as part of build)
+;   Clobbers: D0, D1, D2, D3
+;   Preserves: XY0, XY2, XY3
+;
+;   Twin of _KoshEmitDec for values above 64 KB (Part 26 - file sizes).
+;   Same XY1<->XY0 bridge, two LEAs. Unlike _KoshEmitDec this CANNOT
+;   preserve D1/D2/D3: D1 is an input and KLIB_UTOA32 clobbers D1..D3.
+;   Callers needing a value across this call must stash it in a page-$00
+;   slot, not a register.
+; ----------------------------------------------------------------------------
+_KoshEmitDec32:
+                PUSH    XY0, XY3
+
+                LEA     XY0, XY1                ; XY0 = cursor
+                CALL24  KLIB_UTOA32             ; advances XY0, writes nul
+                LEA     XY1, XY0                ; XY1 = advanced cursor
+
+                POP     XY0, XY3
+                RET
+
+; ----------------------------------------------------------------------------
+; _KoshEmitDecL - emit unsigned D0 as decimal at the ROW_BUF cursor XY1,
+;   LEFT-aligned in a field of width D2 (padded on the RIGHT with spaces).
+;   A number wider than D2 overflows the field (no clipping). Advances XY1.
+;   Clobbers D0, D1, D2, D3.
+; ----------------------------------------------------------------------------
+_KoshEmitDecL:
+                MOVE    D3, D2                  ; D3 = field width
+                MOVE    D1, X1                  ; D1 = cursor offset before emit
+                CALL16  _KoshEmitDec            ; emit digits (preserves D1/D2/D3)
+                MOVE    D0, X1
+                SUB     D0, D1                  ; D0 = digits emitted
+                MOVE    D2, D3
+                SUB     D2, D0                  ; D2 = pad = width - digits (C=0 if wider)
+                BCC     .kdl_done               ; number wider than field -> no pad
+.kdl_pad:
+                CMP     D2, #0
+                BEQ     .kdl_done
+                LOADI   D0, #CH_SPACE
+                CALL16  _KoshEmitByte           ; preserves D2/D3, advances XY1
+                SUB     D2, #1
+                BRA     .kdl_pad
+.kdl_done:
+                RET
+
 
 ; ----------------------------------------------------------------------------
 ; _KoshEmitStrZ - append a zstring source at XY0 to ROW_BUF cursor.
@@ -3334,12 +4292,10 @@ _KoshEmitDec:
 _KoshEmitStrZ:
                 PUSH    XY0, XY3
 .es_loop:
-                LOADB   D0, [XY0]
+                LOADB   D0, [XY0]+
                 CMP     D0, #0
                 BEQ     .es_done
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 BRA     .es_loop
 .es_done:
                 POP     XY0, XY3
@@ -3366,12 +4322,10 @@ _KoshEmitNamePadded:
 .enp_copy_loop:
                 CMP     D1, #0
                 BEQ     .enp_done
-                LOADB   D0, [XY0]
+                LOADB   D0, [XY0]+
                 CMP     D0, #0
                 BEQ     .enp_pad
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 SUB     D1, #1
                 BRA     .enp_copy_loop
 .enp_pad:
@@ -3379,11 +4333,52 @@ _KoshEmitNamePadded:
                 CMP     D1, #0
                 BEQ     .enp_done
                 LOADI   D0, #' '
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 SUB     D1, #1
                 BRA     .enp_pad
 .enp_done:
+                POP     D1, XY3
+                POP     XY0, XY3
+                RET
+
+
+; ----------------------------------------------------------------------------
+; _KoshEmitNameLong - emit a zstring at XY0 in FULL (no truncation), then
+;   space-pad to a MINIMUM of D2 columns. Unlike _KoshEmitNamePadded, a source
+;   longer than D2 is emitted whole and overflows the field. Used by `ls` so
+;   VFAT long names (up to 31 chars) display in full while short 8.3 names
+;   still align to the 12-column field.
+;
+;   In:       XY0 = source zstring (in caller's page)
+;             XY1 = cursor
+;             D2  = minimum field width (1..255)
+;   Out:      Source bytes up to its nul, then spaces to reach >= D2 columns.
+;             XY1 advanced by max(strlen, D2).
+;   Clobbers: D0
+;   Preserves: D1, D2, D3, XY0, XY2, XY3
+; ----------------------------------------------------------------------------
+_KoshEmitNameLong:
+                PUSH    XY0, XY3
+                PUSH    D1, XY3
+
+                MOVE    D1, D2                  ; D1 = columns still owed to width
+.enl_copy_loop:
+                LOADB   D0, [XY0]+
+                CMP     D0, #0
+                BEQ     .enl_pad
+                STOREB  D0, [XY1]+
+                CMP     D1, #0
+                BEQ     .enl_copy_loop          ; width met; keep emitting overflow
+                SUB     D1, #1
+                BRA     .enl_copy_loop
+.enl_pad:
+                CMP     D1, #0
+                BEQ     .enl_done
+                LOADI   D0, #' '
+                STOREB  D0, [XY1]+
+                SUB     D1, #1
+                BRA     .enl_pad
+.enl_done:
                 POP     D1, XY3
                 POP     XY0, XY3
                 RET
@@ -3416,7 +4411,7 @@ _KoshEmitNamePadded:
 ;     1. Resolve slot ptr (slot offset = drive << 6 + VOL_TABLE_BASE).
 ;     2. If VOL_PRESENT==0 -> emit unmounted line, return.
 ;     3. sys_diskfree(drive) -> free, total, cluster_sz_bytes (stashed in
-;        VOL_FREE_TMP / VOL_TOTAL_TMP / VOL_CLSZ_TMP).
+;        VOL_FREE / VOL_TOTAL / VOL_CLSZ).
 ;     4. Build row in ROW_BUF using _KoshEmitByte / _KoshEmitNamePadded
 ;        for the drive + label cells, then _KoshEmitSize for each size
 ;        cell. The 4 cells (Total, Used, Free, Use%) need:
@@ -3428,16 +4423,16 @@ _KoshEmitNamePadded:
 ;     5. TRAP_PUTS to emit.
 ; ----------------------------------------------------------------------------
 _KoshPrintVolLine:
-                ; Stash drive index in DISK_DRIVE_TMP - needed across multiple
+                ; Stash drive index in DISK_DRIVE - needed across multiple
                 ; CALL24s below.
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 
                 ; Build line cursor in ROW_BUF.
                 MOVE    Y1, Y3
                 LOADI   X1, #ROW_BUF
 
                 ; --- col0 Drive: "X:     " (7 chars) ----------------------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 ADD     D0, #'A'
                 CALL16  _KoshEmitByte           ; letter
                 LOADI   D0, #':'
@@ -3453,18 +4448,18 @@ _KoshPrintVolLine:
                 ; This doubles as the "is it mounted?" test: ERR_BADDRIVE
                 ; if not present. Saves us a separate VOL_PRESENT read AND
                 ; the manual SHL chain that was earlier giving wrong slots.
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 TRAP    #TRAP_DISKFREE
                 BCS     .pvl_unmounted
                 ; D0=free, D1=total, D2=cluster_sz.
-                STOREP  D0, Y3, [#VOL_FREE_TMP]
-                STOREP  D1, Y3, [#VOL_TOTAL_TMP]
-                STOREP  D2, Y3, [#VOL_CLSZ_TMP]
+                STOREP  D0, Y3, [#VOL_FREE]
+                STOREP  D1, Y3, [#VOL_TOTAL]
+                STOREP  D2, Y3, [#VOL_CLSZ]
 
                 ; --- col1 Label: 11-byte VOL_LABEL + 1 space (12 chars) --
                 ; Compute slot offset = drive x 64 + VOL_TABLE_BASE.
                 ; x64 = x16 (SHL4) + x2 + x2: 3 instructions vs 6.
-                LOADP   D2, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D2, Y3, [#DISK_DRIVE]
                 SHL4    D2                      ; x16
                 SHL     D2                      ; x32
                 SHL     D2                      ; x64
@@ -3475,55 +4470,57 @@ _KoshPrintVolLine:
                 ADD     X0, #VOL_LABEL
                 LOADI   D1, #11
 .pvl_lbl_loop:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D1, #1
                 BNE     .pvl_lbl_loop
                 ; One separator space -> col1 total width 12
                 LOADI   D0, #' '
                 CALL16  _KoshEmitByte
 
+                ; --- Name: "NAME:" padded to 9 (blank if no volume) -------
+                LOADP   D0, Y3, [#DISK_DRIVE]
+                LOADI   D2, #9
+                CALL16  _KoshEmitVolName
+
                 ; --- col2 Total: total_clusters * cluster_sz, 9-wide -----
-                LOADP   D0, Y3, [#VOL_TOTAL_TMP]
-                LOADP   D1, Y3, [#VOL_CLSZ_TMP]
+                ; Part 26: cell is 9 with NO trailing separator, was 8+1.
+                ; KB gained two decimals, and the KB unit's whole part runs
+                ; to 1023, so "1023.99KB" is 9 chars -- an 8-wide cell clips
+                ; it from the right to "1023.99K". Reachable on any volume of
+                ; 1,047,552..1,048,575 bytes, i.e. a 1 MB RAM disk. Row length
+                ; and the header literal are unchanged.
+                LOADP   D0, Y3, [#VOL_TOTAL]
+                LOADP   D1, Y3, [#VOL_CLSZ]
                 CALL24  KLIB_MUL16x16_32        ; D1:D0 = total bytes
-                LOADI   D2, #8                  ; size cell width 8
-                CALL16  _KoshEmitSize
-                LOADI   D0, #' '
-                CALL16  _KoshEmitByte           ; col2 = 8+1 = 9 chars
+                LOADI   D2, #9                  ; col2 = 9 chars
 
                 ; --- col3 Used: (total-free)*cluster_sz, 9-wide ---------
-                LOADP   D0, Y3, [#VOL_TOTAL_TMP]
-                LOADP   D1, Y3, [#VOL_FREE_TMP]
+                LOADP   D0, Y3, [#VOL_TOTAL]
+                LOADP   D1, Y3, [#VOL_FREE]
                 SUB     D0, D1                  ; D0 = used clusters
-                LOADP   D1, Y3, [#VOL_CLSZ_TMP]
+                LOADP   D1, Y3, [#VOL_CLSZ]
                 CALL24  KLIB_MUL16x16_32        ; D1:D0 = used bytes
-                LOADI   D2, #8
+                LOADI   D2, #9
                 CALL16  _KoshEmitSize
-                LOADI   D0, #' '
-                CALL16  _KoshEmitByte
 
                 ; --- col4 Free: free * cluster_sz, 9-wide ---------------
-                LOADP   D0, Y3, [#VOL_FREE_TMP]
-                LOADP   D1, Y3, [#VOL_CLSZ_TMP]
+                LOADP   D0, Y3, [#VOL_FREE]
+                LOADP   D1, Y3, [#VOL_CLSZ]
                 CALL24  KLIB_MUL16x16_32        ; D1:D0 = free bytes
-                LOADI   D2, #8
+                LOADI   D2, #9
                 CALL16  _KoshEmitSize
-                LOADI   D0, #' '
-                CALL16  _KoshEmitByte
 
                 ; --- col5 Use%: (used*100) / total, 4-wide value + '%' --
                 ; Compute used = total - free.
-                LOADP   D0, Y3, [#VOL_TOTAL_TMP]
-                LOADP   D1, Y3, [#VOL_FREE_TMP]
+                LOADP   D0, Y3, [#VOL_TOTAL]
+                LOADP   D1, Y3, [#VOL_FREE]
                 SUB     D0, D1                  ; D0 = used clusters
                 ; D1:D0 = used * 100 (32-bit)
                 LOADI   D1, #100
                 CALL24  KLIB_MUL16x16_32        ; D1:D0 = used*100
                 ; Divide by total clusters.
-                LOADP   D2, Y3, [#VOL_TOTAL_TMP]
+                LOADP   D2, Y3, [#VOL_TOTAL]
                 CALL24  KLIB_DIVMOD32           ; D1:D0=pct, D2=rem (ignored)
                 ; pct in D0 (0..100 fits in low word). Render as
                 ; right-aligned 3-wide field + '%'.
@@ -3554,8 +4551,7 @@ _KoshPrintVolLine:
 .pvl_pct_pad:
                 CMP     D2, #0
                 BEQ.S   .pvl_pct_digits
-                STOREB  D0, [XY1]
-                INC     XY1, #1
+                STOREB  D0, [XY1]+
                 SUB     D2, #1
                 BRA     .pvl_pct_pad
 .pvl_pct_digits:
@@ -3566,10 +4562,8 @@ _KoshPrintVolLine:
 .pvl_pct_cpy:
                 CMP     D3, #0
                 BEQ.S   .pvl_pct_cpy_done
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D3, #1
                 BRA     .pvl_pct_cpy
 .pvl_pct_cpy_done:
@@ -3597,7 +4591,7 @@ _KoshPrintVolLine:
                 ; "(unformatted: <name>)" and exit. Otherwise fall through
                 ; to the original "(not mounted)" path. Drives A: and B:
                 ; (index 0/1) have no bay concept - skip the probe.
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 CMP     D0, #2
                 BLO     .pvl_um_notmounted          ; A: or B:
 
@@ -3642,6 +4636,87 @@ _KoshPrintVolLine:
                 LOADI   X0, #ROW_BUF
                 TRAP    #TRAP_PUTS
                 RET
+
+
+; ----------------------------------------------------------------------------
+; _KoshEmitVolName - append " NAME:" for a drive's named volume, if any.
+;   Scans the kernel assign table (page $00) for a RootClu-0 entry whose
+;   AS_DRIVE == D0; on a hit, emits a separator space, the name, and ':'
+;   into the ROW_BUF cursor. Display-only - no resolution effect. Emits
+;   nothing if the drive has no named volume (path-mounts, RootClu<>0, are
+;   not volumes and are skipped).
+;
+;   In:    D0  = drive index
+;          XY1 = ROW_BUF cursor (X1=offset, Y1=Y3)
+;   Out:   XY1 advanced past any emitted text
+;   Clobbers: D0, D1, D2, D3, X0, Y0, flags
+;   Preserves: Y1, XY2, XY3
+; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; _KoshEmitVolName - emit the drive's volume name "NAME:" as a fixed-width
+;   column at the ROW_BUF cursor, space-padded to D2 columns. Blank (D2 spaces)
+;   if the drive has no RootClu-0 named volume. A name+colon wider than D2
+;   overflows (no truncation).
+;   In:    D0 = drive index, XY1 = cursor, D2 = field width
+;   Out:   XY1 advanced by >= D2
+;   Clobbers: D0, D1, D2, D3, X0, Y0
+; ----------------------------------------------------------------------------
+_KoshEmitVolName:
+                PUSH    D2, XY3                 ; save field width
+                MOVE    D3, D0                  ; D3 = target drive
+                LOADI   D2, #AS_MAX             ; entries to scan
+                LOADI   X0, #AS_TABLE_BASE
+                LOADI   Y0, #$00                ; assign table = kernel page $00
+.kevn_loop:
+                LOADB   D0, [XY0]               ; AS_NAME[0]
+                AND     D0, #$FF
+                BEQ     .kevn_next              ; empty entry
+                LOADD   D1, [XY0+#AS_ROOTCLU]   ; 0 = named volume
+                CMP     D1, #0
+                BNE     .kevn_next              ; path-mount -> skip
+                LOADB   D1, [XY0+#AS_DRIVE]
+                AND     D1, #$FF
+                CMP     D1, D3
+                BEQ     .kevn_hit
+.kevn_next:
+                ADD     X0, #AS_ENTRY_SIZE
+                SUB     D2, #1
+                BNE     .kevn_loop
+                ; no named volume -> emit a blank field
+                POP     D1, XY3                 ; D1 = field width
+.kevn_padonly:
+                CMP     D1, #0
+                BEQ     .kevn_done
+                LOADI   D0, #' '
+                STOREB  D0, [XY1]+
+                SUB     D1, #1
+                BRA     .kevn_padonly
+.kevn_done:
+                RET
+.kevn_hit:
+                ; X0 = AS_NAME (Y0=0). Emit "NAME:" (name cap 11) then pad.
+                POP     D1, XY3                 ; D1 = field width
+                LOADI   D2, #0                  ; D2 = chars emitted
+                LOADI   D3, #11                 ; name char cap
+.kevn_cpy:
+                LOADB   D0, [XY0]+
+                AND     D0, #$FF
+                BEQ     .kevn_colon
+                STOREB  D0, [XY1]+
+                ADD     D2, #1
+                SUB     D3, #1
+                BNE     .kevn_cpy
+.kevn_colon:
+                LOADI   D0, #':'
+                STOREB  D0, [XY1]+
+                ADD     D2, #1
+.kevn_pad:
+                CMP     D2, D1
+                BHS     .kevn_done              ; emitted >= width -> stop
+                LOADI   D0, #' '
+                STOREB  D0, [XY1]+
+                ADD     D2, #1
+                BRA     .kevn_pad
 
 
 ; ============================================================================

@@ -1,11 +1,35 @@
 ; ============================================================================
 ; kos_switcher.asm — k/OS Phase B foreground-switcher kernel module
 ; ============================================================================
-; Date:    27 May 2026
-; Status:  Phase B complete (all steps shipped) + 80×80 geometry +
-;          auto-trim repaint + ESC[3J integration + auto-wrap row-advance.
+; Date:    28 June 2026
+; Status:  Part 50 — lone-foreground ring close + reap sub-pool guard (DATA FAULT fix).
 ;
-; Revision: r7 — 27 May 2026. _RepaintFromBackbuf: host-conditional row
+; Revision: r10 — 28 June 2026. Part 50: two changes.
+;             • _SpliceAfterForeground closes the ring back to a lone foreground
+;               (SHELL_NEXT = 0) instead of copying the 0 — fixes graphics-task
+;               / 2nd-shell splice producing a dangling next that crashed the
+;               reap walk (DATA FAULT $00014F).
+;             • .first_shell no longer writes a self-loop (the store never took
+;               effect and disagreed with the readers). SHELL_NEXT is already 0
+;               from _BuildTask; 0 = lone shell is now the single convention.
+;             • Doc fix: sys_setforeground's ERR_INVALID note said TF_HAS_BACKBUF;
+;               the code has accepted TF_FOCUSABLE since Part 49. Comment only.
+; Revision: r8 — 28 June 2026. Part 49: graphics tasks join the foreground ring.
+;             • Added _CommitForeground — the single commit tail now shared by
+;               _SwitchForegroundNext / _Prev / _ByIndex and sys_setforeground.
+;               It writes VID_MODE on every switch (saved mode for a graphics
+;               target, 0 for a shell), which is what makes the WebEMU host
+;               follow the foreground to the graphics / terminal tab. Shell
+;               targets are additionally repainted from their back-buffer.
+;             • Added _SpliceAfterForeground (factored out of sys_register_shell;
+;               register_shell now calls it) and _UnspliceFromRing (alive-task
+;               ring removal, used by sys_setvidmode release).
+;             • Focusable guards in the three walkers + sys_setforeground's
+;               validation broadened TF_HAS_BACKBUF -> TF_FOCUSABLE so a graphics
+;               task can be cycled to / set as foreground.
+;             Requires kos_defs.inc r45+ and kos_video.asm r2+ (_VideoSetModeRaw).
+;
+;           r7 — 27 May 2026. _RepaintFromBackbuf: host-conditional row
 ;             terminator.
 ;             • Digital: relies on dumb-TTY auto-wrap to advance row.
 ;               Emitting exactly 80 chars puts cursor at col 80, which
@@ -98,7 +122,8 @@
 ;       TCB_BACKBUF_OFFS ($4C)  word  offset of back-buffer in its page
 ;       TCB_BACKBUF_PAGE ($4E)  word  page byte of back-buffer (low byte used)
 ;       TCB_SHELL_NEXT   ($50)  word  page-$00 offset of next shell TCB
-;                                       (0 = not in ring; self = lone shell)
+;                                       (0 = lone shell / not in ring;
+;                                        non-zero = next shell's offset)
 ;       TCB_BACKBUF_CRSR ($52)  word  packed cursor: hi=row, lo=col
 ;
 ;     TCB_FLAGS bit 3:  TF_HAS_BACKBUF ($0008)  task registered as shell
@@ -108,9 +133,10 @@
 ;
 ; Shell ring (singly-linked, circular):
 ;     Each registered shell's TCB_SHELL_NEXT points at the next shell's
-;     TCB low-word offset (page implicit $00). The first shell to register
-;     forms a self-loop. When a second shell registers it splices itself
-;     in after the current foreground.
+;     TCB low-word offset (page implicit $00). A lone shell carries next = 0
+;     (not a self-loop). When a second shell registers it splices itself in
+;     after the current foreground, and _SpliceAfterForeground closes the ring
+;     back to the (formerly lone) foreground so both nodes have valid links.
 ;
 ; Note: included from kos_boot.asm AFTER kos_kmalloc.asm (we need _kmalloc
 ;       and _kfree) and AFTER kos_spawn.asm (we need _TidToTcb).
@@ -134,8 +160,8 @@
 ;   - caller's TCB_BACKBUF_OFFS / TCB_BACKBUF_PAGE point at a zeroed buffer
 ;   - caller's TCB_FLAGS gains TF_HAS_BACKBUF
 ;   - caller's TCB_BACKBUF_CRSR = 0 (row 0, col 0)
-;   - caller's TCB_SHELL_NEXT links to next shell in the ring (or to self
-;     if singleton)
+;   - caller's TCB_SHELL_NEXT links to next shell in the ring (or stays 0
+;     if this is the lone shell)
 ;   - if FOREGROUND_TCB was 0, it now holds caller's TID
 ;   - if other shells exist, the foreground shell's TCB_SHELL_NEXT is
 ;     updated to point at us
@@ -172,7 +198,7 @@ sys_register_shell:
                 ; _kmalloc(D0=size) -> XY0 = payload, C=0
                 ;                      D0 = ERR_NOMEM, C=1 on failure.
                 ; _kmalloc clobbers XY1 — reload from MY_TCB_PTR after.
-                LOADI   D0, #BACKBUF_SIZE
+                LOADI   D0, #SURFACE_SIZE
                 CALL24  _kmalloc
                 BCS     .err_nomem
 
@@ -193,11 +219,10 @@ sys_register_shell:
                 ; data at the start of that page — e.g. another shell's
                 ; back-buffer if it happens to live near offset 0.
                 LEA     XY0, XY2
-                LOADI   D0, #0
-                LOADI   D3, #3200               ; BACKBUF_SIZE / 2 (word count)
+                LOADI   D0, #CELL_BLANK         ; blank = space + default attr
+                LOADI   D3, #SURFACE_WORDS      ; 8000 word-cells
 .zero_loop:
-                STORED  D0, [XY0]
-                INC     XY0, #2                 ; 24-bit step (handles page carry)
+                STORED  D0, [XY0]+              ; word stride 2, 24-bit (handles page carry)
                 SUB     D3, #1
                 BNE     .zero_loop
 
@@ -226,49 +251,104 @@ sys_register_shell:
                 LOADI   D1, #TCB_BACKBUF_CRSR
                 STORED  D0, [XY1+D1]
 
+                ; --- Init surface control block (Step 1) -----------------
+                LOADI   D0, #1
+                LOADI   D1, #TCB_CURSOR_VIS
+                STORED  D0, [XY1+D1]
+                LOADI   D0, #ATTR_DEFAULT
+                LOADI   D1, #TCB_CUR_ATTR
+                STORED  D0, [XY1+D1]
+                LOADI   D0, #0
+                LOADI   D1, #TCB_TOP_ROW
+                STORED  D0, [XY1+D1]
+                ; VIS_ROWS := live terminal rows (EMU MMIO) or default.
+                LOADZ   D0, [#KOS_HOST]
+                CMP     D0, #HOST_EMU
+                BNE.S   .rs_vdef
+                LOADI   Y0, #TERM_SIZE_PAGE
+                LOADP   D0, Y0, [#$0000]
+                LOW     D0                      ; rows = low byte
+                CMP     D0, #0
+                BNE.S   .rs_vset
+.rs_vdef:
+                LOADI   D0, #KOS_TERM_ROWS      ; default visible rows
+.rs_vset:
+                LOADI   D1, #TCB_VIS_ROWS
+                STORED  D0, [XY1+D1]
+
                 ; --- Splice into shell ring ------------------------------
                 ; If FOREGROUND_TCB == 0 we are the first shell:
-                ;   self-loop and become foreground.
-                ; Else insert after current foreground:
-                ;   new.next = fg.next; fg.next = new.
+                ;   leave next = 0 (lone) and become foreground.
+                ; Else splice in via _SpliceAfterForeground (which closes the
+                ;   ring back to a lone foreground; see Part 50).
                 LOADZ   D0, [#FOREGROUND_TCB]
                 CMP     D0, #0
                 BEQ     .first_shell
 
                 ; --- Insert after current foreground --------------------
-                ; D0 = foreground TID. _TidToTcb returns XY1 = its TCB,
-                ; clobbering X1; save our offset in D2 first.
-                MOVE    D2, X1                  ; D2 = our TCB offset
-                CALL24  _TidToTcb               ; D0 → XY1, C=1 if not found
+                ; Shared with sys_setvidmode's graphics acquire. The helper
+                ; preserves D2 (= our offset) and XY2 (= our back-buffer ptr),
+                ; which .err_perm_unwind below relies on. On return XY1 is back
+                ; at our own TCB.
+                CALL24  _SpliceAfterForeground  ; C=1 if foreground vanished
                 BCS     .err_perm_unwind        ; foreground vanished (defensive)
-
-                ; XY1 = foreground's TCB. Splice in:
-                ;   new.next = fg.next; fg.next = new
-                ; "new" = our TCB at offset D2 in page $00.
-                ; TCB_SHELL_NEXT at $50 — mode-01 [XY+D].
-                LOADI   D3, #TCB_SHELL_NEXT     ; D3 = field offset (constant)
-                LOADD   D0, [XY1+D3]            ; D0 = fg's current next
-                STORED  D2, [XY1+D3]            ; fg.next = us (= D2 = our offset)
-                ; Now point XY1 back at our own TCB and write new.next.
-                MOVE    X1, D2
-                LOADI   Y1, #$00
-                STORED  D0, [XY1+D3]            ; new.next = saved fg.next
                 BRA     .commit
 
 .first_shell:
-                ; new.next = self (singleton ring), FOREGROUND_TCB = our TID,
-                ; FIRST_SHELL_TID = our TID (anchor for Ctrl-digit switch).
-                ; X1 still holds our TCB offset.
-                ; TCB_SHELL_NEXT at $50 — mode-01.
-                MOVE    D0, X1
-                LOADI   D1, #TCB_SHELL_NEXT
-                STORED  D0, [XY1+D1]
+                ; Lone shell: TCB_SHELL_NEXT stays 0 — the lone-shell convention
+                ; _SwitchForegroundNext/_Prev and the Part 50 splice/reap all
+                ; honour (0 = lone/first shell; non-zero = next-in-ring).
+                ; _BuildTask zero-fills $20..$7F, so SHELL_NEXT is already 0
+                ; here; no self-loop write is needed (and a self-loop would not
+                ; match what the readers expect — see Part 50 notes).
                 ; FOREGROUND_TCB = our TID;  FIRST_SHELL_TID = our TID
                 LOADD   D0, [XY1+#TCB_ID]
                 STOREZ  D0, [#FOREGROUND_TCB]
                 STOREZ  D0, [#FIRST_SHELL_TID]
 
 .commit:
+                ; Part 51: auto-foreground a shell launched without '&'.
+                ; TF_AUTOFG (set by sys_exec) means "switch to me on register".
+                ; First-shell/kosh never carries it, so this is a no-op there.
+                ; XY1 = our TCB on both arrival paths (first-shell fall-through
+                ; and _SpliceAfterForeground return).
+                LOADD   D0, [XY1+#TCB_FLAGS]
+                AND     D0, #TF_AUTOFG
+                BEQ     .commit_x
+                ; Clear the one-shot flag.
+                LOADD   D0, [XY1+#TCB_FLAGS]
+                AND     D0, #$FFDF              ; ~TF_AUTOFG
+                STORED  D0, [XY1+#TCB_FLAGS]
+                ; Wake the launcher early: it is blocked in sys_wait on our
+                ; TID. Deliver ERR_DETACHED (C=1) so it returns to its REPL as
+                ; a live background shell instead of waiting for our exit.
+                LOADD   D0, [XY1+#TCB_ID]       ; our TID
+                CALL24  _FindWaiterFor          ; XY1 := waiter, C=1 if none
+                BCC.S   .commit_wake            ; found it -> deliver now
+
+                ; Race lost: the launcher has not reached sys_wait yet, so
+                ; there is nobody to poke. Leave the note on OUR OWN TCB and
+                ; let sys_wait consume it on arrival (Part 26). Previously
+                ; this arm just fell through to .commit_fg and the launcher
+                ; blocked forever on a child that never exits.
+                ;
+                ; _FindWaiterFor clobbered XY1 -- reload ourselves.
+                LOADP   X1, Y3, [#MY_TCB_PTR]
+                LOADI   Y1, #$00
+                LOADD   D0, [XY1+#TCB_FLAGS]
+                OR      D0, #TF_DETACH_PENDING
+                STORED  D0, [XY1+#TCB_FLAGS]
+                BRA.S   .commit_fg
+
+.commit_wake:
+                CALL24  _DeliverWaitDetached    ; poke ERR_DETACHED + C=1
+                LOADI   D0, #TS_READY
+                STORED  D0, [XY1+#TCB_STATE]    ; unblock the launcher
+.commit_fg:
+                LOADP   X1, Y3, [#MY_TCB_PTR]   ; reload XY1 = us
+                LOADI   Y1, #$00
+                CALL24  _CommitForeground       ; we take the foreground
+.commit_x:
                 CLC
                 BRA     .done
 
@@ -363,23 +443,23 @@ sys_register_shell:
 ; Preserves: XY1, XY3
 ; ----------------------------------------------------------------------------
 _RepaintFromBackbuf:
-                ; --- 1. Clear/home terminal -------------------------------
+                ; Step 1 (grid-is-master): re-render the VISIBLE rows of the
+                ; ring surface as a CLEAN escape stream. Cells are word
+                ; (attr<<8)|char; no stored byte is replayed to the VT100 --
+                ; this is what retires the escape-corruption bug.
+                ; Renderer seam: the ring-walk + per-cell emit below is the
+                ; shared shape a framebuffer (kanvas) back-end clones, swapping
+                ; the per-cell action (emit char -> blit glyph). Per-cell
+                ; attr->SGR is deferred with SetAttr (#20); step 1 emits one
+                ; default reset and paints the char (low) byte only.
+                ; In: XY1 = shell TCB. Clobbers D0..D3, XY0, XY2. Preserves XY1, XY3.
                 LOADI   Y0, #TERMINAL_PAGE
                 LOADI   X0, #$0000
-
                 LOADZ   D0, [#KOS_HOST]
                 CMP     D0, #HOST_DIGITAL
                 BEQ     .rb_clear_digital
-
-                ; EMU path: emit ESC[3J then ESC[2J then ESC[H.
-                ;   ESC[3J — clear scrollback (xterm extension). Prevents
-                ;           old scrollback content from re-entering the
-                ;           visible region when our paint exceeds the
-                ;           terminal's row count (which causes scrolls).
-                ;   ESC[2J — clear visible region. Per spec, leaves cursor
-                ;           in place.
-                ;   ESC[H  — home cursor to (1,1).
-                LOADI   D0, #$1B                ; ESC
+                ; EMU: ESC[3J ESC[2J ESC[H
+                LOADI   D0, #$1B
                 STOREB  D0, [XY0]
                 LOADI   D0, #'['
                 STOREB  D0, [XY0]
@@ -387,7 +467,6 @@ _RepaintFromBackbuf:
                 STOREB  D0, [XY0]
                 LOADI   D0, #'J'
                 STOREB  D0, [XY0]
-
                 LOADI   D0, #$1B
                 STOREB  D0, [XY0]
                 LOADI   D0, #'['
@@ -396,192 +475,224 @@ _RepaintFromBackbuf:
                 STOREB  D0, [XY0]
                 LOADI   D0, #'J'
                 STOREB  D0, [XY0]
-
                 LOADI   D0, #$1B
                 STOREB  D0, [XY0]
                 LOADI   D0, #'['
                 STOREB  D0, [XY0]
                 LOADI   D0, #'H'
                 STOREB  D0, [XY0]
+                ; default attribute reset (ESC[0m)
+                LOADI   D0, #$1B
+                STOREB  D0, [XY0]
+                LOADI   D0, #'['
+                STOREB  D0, [XY0]
+                LOADI   D0, #'0'
+                STOREB  D0, [XY0]
+                LOADI   D0, #'m'
+                STOREB  D0, [XY0]
                 BRA     .rb_paint
-
 .rb_clear_digital:
-                ; Digital path: Form Feed clears and homes in one byte.
                 LOADI   D0, #$0C
                 STOREB  D0, [XY0]
-
 .rb_paint:
-                ; --- 2. Paint back-buffer -------------------------------
-                ; XY2 = walking back-buffer pointer. Resolve from TCB.
-                LOADI   D0, #TCB_BACKBUF_OFFS
+                ; init run-length SGR tracker = default (matches ESC[0m above)
+                LOADI   D0, #TCB_RENDER_ATTR
+                LOADI   D1, #ATTR_DEFAULT
+                STORED  D1, [XY1+D0]
+                ; XY2 = surface base + TOP_ROW*160
+                LOADI   D0, #TCB_TOP_ROW
+                LOADD   D2, [XY1+D0]            ; D2 = TOP_ROW
+                MOVE    D0, D2
+                SHL4    D0
+                SHL     D0                      ; TOP*32 = t
+                MOVE    D1, D0
+                SHL     D0
+                SHL     D0                      ; t*4
+                ADD     D0, D1                  ; t*5 = TOP*160 (row byte offset)
+                LOADI   D1, #TCB_BACKBUF_OFFS
+                LOADD   D1, [XY1+D1]
+                ADD     D1, D0
+                MOVE    X2, D1
+                LOADI   D1, #TCB_BACKBUF_PAGE
+                LOADD   D1, [XY1+D1]
+                MOVE    Y2, D1
+                ; rows_left_total = VIS (D2, zero-guarded)
+                LOADI   D0, #TCB_VIS_ROWS
+                LOADD   D2, [XY1+D0]
+                CMP     D2, #0
+                BNE.S   .rb_vok
+                LOADI   D2, #KOS_TERM_ROWS
+.rb_vok:
+                ; Digital dumb-TTY has no cursor addressing: trailing blank rows
+                ; below the cursor would flood the terminal. Cap the repaint at
+                ; the cursor row (content ends at the prompt).
+                LOADZ   D0, [#KOS_HOST]
+                CMP     D0, #HOST_DIGITAL
+                BNE.S   .rb_rows_ready
+                LOADI   D0, #TCB_BACKBUF_CRSR
                 LOADD   D0, [XY1+D0]
-                MOVE    X2, D0
-                LOADI   D0, #TCB_BACKBUF_PAGE
-                LOADD   D0, [XY1+D0]
-                MOVE    Y2, D0
-
-                ; --- 2a. Pre-scan: find row count to paint --------------
-                ; Walk the entire 6400-byte back-buffer once, tracking the
-                ; highest byte index where a non-zero cell sits. Then
-                ; compute its row (offset / KOS_TERM_COLS) and paint that
-                ; many rows + 1.
-                ;
-                ; This avoids painting trailing blank rows. With a 63-row
-                ; terminal and an 80-row back-buffer, painting 80 rows
-                ; would scroll the top 17 rows off the visible window
-                ; (banner included). By painting only what's actually
-                ; written, content stays on-screen.
-                ;
-                ; Cost: ~6400 byte reads (~30K cycles), trivial vs the
-                ; paint itself.
-                ;
-                ; Registers used here:
-                ;   XY0 = terminal MMIO ptr (preserved)
-                ;   XY1 = caller TCB ptr (preserved — needed to re-resolve XY2)
-                ;   XY2 = scan pointer (walks through buffer)
-                ;   D1  = byte index 0..6399
-                ;   D3  = highest non-blank byte index, or $FFFF if none
-                ;   D0  = scratch
-                ;
-                ; XY2 is re-resolved from TCB after the scan, so we don't
-                ; need to save it here.
-                LOADI   D1, #0                  ; byte index
-                LOADI   D3, #$FFFF              ; max_byte_idx = none
-
-.rb_scan_loop:
-                LOADB   D0, [XY2]
-                INC     XY2, #1
-                CMP     D0, #0
-                BEQ.S   .rb_scan_step
-                MOVE    D3, D1                  ; remember highest
-.rb_scan_step:
-                ADD     D1, #1
-                CMP     D1, #6400               ; BACKBUF_SIZE
-                BLO     .rb_scan_loop
-
-                ; Re-resolve XY2 = back-buffer base from TCB. (The scan
-                ; walked XY2 forward 6400 bytes via INC XY2, which carries
-                ; into Y2 if X2 wraps — defensively re-load both.)
-                LOADI   D0, #TCB_BACKBUF_OFFS
-                LOADD   D0, [XY1+D0]
-                MOVE    X2, D0
-                LOADI   D0, #TCB_BACKBUF_PAGE
-                LOADD   D0, [XY1+D0]
-                MOVE    Y2, D0
-
-                ; Compute row count from D3.
-                ;   If D3 == $FFFF, no content → paint zero rows (just
-                ;   the clear screen leaves a blank).
-                ;   Else: row_count = (D3 / 80) + 1
-                CMP     D3, #$FFFF
-                BEQ     .rb_paint_done
-
-                ; Division by 80 via repeated subtraction. Max 80 iters.
-                ; D3 = remaining byte index, D2 = row quotient.
-                LOADI   D2, #0
-.rb_div_loop:
-                CMP     D3, #80
-                BLO.S   .rb_div_done
-                SUB     D3, #80
-                ADD     D2, #1
-                BRA     .rb_div_loop
-.rb_div_done:
-                ADD     D2, #1                  ; rows are 1-based (saw row R → paint R+1 rows)
-
-                ; D2 now = number of rows to paint (1..KOS_TERM_ROWS).
-                ; Move to D1 so we don't lose it inside the row loop.
-                MOVE    D1, D2
-
-                ; D2 = current row index (0..D1-1).
-                LOADI   D2, #0
-
-.rb_row_loop:
-                ; D3 = column counter (0..79).
+                HIGH    D0                      ; cursor row (0-based)
+                ADD     D0, #1                  ; rows = cursorRow + 1
+                CMP     D0, D2                  ; cursorRow+1 >= VIS ?
+                BHS.S   .rb_rows_ready          ; yes -> keep VIS
+                MOVE    D2, D0                  ; no  -> use cursorRow+1
+.rb_rows_ready:
+                LOADZ   D0, [#KOS_HOST]
+                CMP     D0, #HOST_DIGITAL
+                BEQ     .rb_paint_dig
+.rb_row:
                 LOADI   D3, #0
-
-.rb_col_loop:
-                LOADB   D0, [XY2]
-                INC     XY2, #1
-                ; Substitute space for zero (unwritten cell).
-                CMP     D0, #0
-                BNE.S   .rb_emit
-                LOADI   D0, #$20                ; ' '
-.rb_emit:
+.rb_cell:
+                LOADD   D0, [XY2]+              ; cell word (attr<<8)|char; walk +2
+                PUSH    D0, XY3                 ; save cell
+                HIGH    D0                      ; D0 = attr
+                MOVE    D1, D0                  ; keep attr in D1
+                LOADI   D0, #TCB_RENDER_ATTR
+                LOADD   D0, [XY1+D0]            ; D0 = last attr
+                CMP     D1, D0
+                BEQ.S   .rb_emit_char           ; unchanged -> no SGR
+                LOADI   D0, #TCB_RENDER_ATTR
+                STORED  D1, [XY1+D0]            ; last := attr
+                LOADZ   D0, [#KOS_HOST]
+                CMP     D0, #HOST_DIGITAL
+                BEQ.S   .rb_emit_char           ; Digital dumb-TTY: no SGR
+                PUSH    D2, XY3                 ; save rows_left across _AttrToSGR
+                PUSH    D3, XY3                 ; save col
+                MOVE    D0, D1                  ; attr -> arg
+                CALL24  _AttrToSGR
+                POP     D3, XY3
+                POP     D2, XY3
+.rb_emit_char:
+                POP     D0, XY3                 ; cell
+                LOW     D0                      ; char
                 STOREB  D0, [XY0]
                 ADD     D3, #1
                 CMP     D3, #KOS_TERM_COLS
-                BLO     .rb_col_loop
-
-                ; End of row.
-                ;
-                ; Digital: rely on dumb-TTY auto-wrap to advance row.
-                ;   Emitting 80 chars puts the cursor at col 80, which
-                ;   wraps to col 0 of the next row. Explicit CR/LF here
-                ;   would advance a SECOND time and double-space.
-                ;
-                ; EMU: VT100 does NOT auto-wrap reliably in this build —
-                ;   the 80th char sits at col 79 and subsequent chars
-                ;   stream onto the same row. Need explicit CR/LF.
-                ;
-                ; If we just painted the last row, skip the terminator.
-                ADD     D2, #1
-                CMP     D2, D1
-                BHS.S   .rb_paint_done
-
+                BLO     .rb_cell
+                SUB     D2, #1                  ; rows_left_total--
+                CMP     D2, #0
+                BEQ     .rb_paint_done          ; last row: no trailing CR/LF
+                ; ring wrap: if walk reached surface end, reset to base
+                MOVE    D0, X2                  ; current low-word offset
+                LOADI   D1, #TCB_BACKBUF_OFFS
+                LOADD   D1, [XY1+D1]            ; base offset
+                LOADI   D3, #SURFACE_SIZE
+                ADD     D1, D3                  ; end offset = base + 16000
+                CMP     D0, D1                  ; X2 >= end ?
+                BLO.S   .rb_noreset
+                LOADI   D0, #TCB_BACKBUF_OFFS
+                LOADD   D0, [XY1+D0]
+                MOVE    X2, D0                  ; reset to base (Y2 same page)
+.rb_noreset:
+                ; row terminator: Digital none (auto-wrap), EMU CR LF
                 LOADZ   D0, [#KOS_HOST]
                 CMP     D0, #HOST_DIGITAL
-                BEQ     .rb_row_loop            ; Digital: no CR/LF; loop
-
-                ; EMU: explicit CR + LF.
+                BEQ     .rb_row
                 LOADI   D0, #$0D
                 STOREB  D0, [XY0]
                 LOADI   D0, #$0A
                 STOREB  D0, [XY0]
-                BRA     .rb_row_loop
-
+                BRA     .rb_row
+; ---- Digital dumb-TTY paint: trim trailing spaces; LF-advance short rows; ----
+; ---- last row stops at its final char so the cursor lands after the prompt. --
+.rb_paint_dig:
+.rbd_row:
+                LOADI   D3, #0                  ; col
+                LOADI   D1, #0                  ; pending (deferred) spaces
+.rbd_cell:
+                LOADD   D0, [XY2]+              ; cell word; walk +2
+                LOW     D0                      ; char (attr ignored on Digital)
+                CMP     D0, #$20
+                BNE.S   .rbd_nonspace
+                ADD     D1, #1                  ; space -> defer
+                BRA     .rbd_next
+.rbd_nonspace:
+                PUSH    D0, XY3                 ; save char
+.rbd_flush:
+                CMP     D1, #0
+                BEQ.S   .rbd_flushed
+                LOADI   D0, #$20
+                STOREB  D0, [XY0]               ; flush one held space
+                SUB     D1, #1
+                BRA     .rbd_flush
+.rbd_flushed:
+                POP     D0, XY3
+                STOREB  D0, [XY0]               ; emit the non-space char
+.rbd_next:
+                ADD     D3, #1
+                CMP     D3, #KOS_TERM_COLS
+                BLO     .rbd_cell
+                ; row done; D1 = trailing spaces (dropped).
+                SUB     D2, #1
+                CMP     D2, #0
+                BEQ     .rb_paint_done          ; last row: cursor stays after last char
+                ; LF unless the row filled col 80 (pending==0 -> auto-wrap advanced)
+                CMP     D1, #0
+                BEQ.S   .rbd_wrap
+                LOADI   D0, #CH_LF
+                STOREB  D0, [XY0]
+.rbd_wrap:
+                ; ring wrap: reset walk to base at surface end
+                MOVE    D0, X2
+                LOADI   D1, #TCB_BACKBUF_OFFS
+                LOADD   D1, [XY1+D1]
+                LOADI   D3, #SURFACE_SIZE
+                ADD     D1, D3                  ; end = base + 16000
+                CMP     D0, D1
+                BHS.S   .rbd_reset
+                BRA     .rbd_row
+.rbd_reset:
+                LOADI   D0, #TCB_BACKBUF_OFFS
+                LOADD   D0, [XY1+D0]
+                MOVE    X2, D0                  ; reset to base (Y2 same page)
+                BRA     .rbd_row
 .rb_paint_done:
-                ; --- 3. Position terminal cursor (EMU only) -------------
+                ; --- Position terminal cursor (EMU only) ---
                 LOADZ   D0, [#KOS_HOST]
                 CMP     D0, #HOST_DIGITAL
                 BEQ     .rb_return
-
-                ; Emit ESC [ <row+1> ; <col+1> H.  Stored cursor is
-                ; 0-based; VT100 is 1-based.
                 LOADI   D2, #TCB_BACKBUF_CRSR
-                LOADD   D3, [XY1+D2]            ; D3 = (row<<8) | col
-
+                LOADD   D3, [XY1+D2]            ; D3 = (row<<8)|col
                 MOVE    D2, D3
-                HIGH    D2                      ; D2 = row (0-based)
-                ADD     D2, #1                  ; → 1-based
+                HIGH    D2
+                ADD     D2, #1                  ; 1-based row
                 MOVE    D0, D3
-                LOW     D0                      ; D0 = col (0-based)
-                ADD     D0, #1                  ; → 1-based
-
-                ; Save D0 (col 1-based) for after the row emit.
-                PUSH    D0, XY3
-
-                ; Emit ESC [
+                LOW     D0
+                ADD     D0, #1                  ; 1-based col
+                PUSH    D0, XY3                 ; save col
                 LOADI   D1, #$1B
                 STOREB  D1, [XY0]
                 LOADI   D1, #'['
                 STOREB  D1, [XY0]
-
-                ; Emit row digits.  D0 = row for _PutDecSmall.
                 MOVE    D0, D2
-                CALL24  _PutDecSmall            ; clobbers D0, D2, D3
-
-                ; Emit ';'
+                CALL24  _PutDecSmall
                 LOADI   D1, #';'
                 STOREB  D1, [XY0]
-
-                ; Emit col digits.
                 POP     D0, XY3
                 CALL24  _PutDecSmall
-
-                ; Emit 'H'
                 LOADI   D1, #'H'
                 STOREB  D1, [XY0]
-
+                ; --- Cursor visibility from header flag ---
+                LOADI   D1, #TCB_CURSOR_VIS
+                LOADD   D0, [XY1+D1]
+                LOADI   D1, #$1B
+                STOREB  D1, [XY0]
+                LOADI   D1, #'['
+                STOREB  D1, [XY0]
+                LOADI   D1, #'?'
+                STOREB  D1, [XY0]
+                LOADI   D1, #'2'
+                STOREB  D1, [XY0]
+                LOADI   D1, #'5'
+                STOREB  D1, [XY0]
+                CMP     D0, #0
+                BEQ.S   .rb_curhide
+                LOADI   D1, #'h'
+                BRA.S   .rb_curemit
+.rb_curhide:
+                LOADI   D1, #'l'
+.rb_curemit:
+                STOREB  D1, [XY0]
 .rb_return:
                 RET
 
@@ -621,22 +732,17 @@ _SwitchForegroundNext:
                 MOVE    X1, D0
                 LOADI   Y1, #$00
 
-                ; Defensive: confirm successor still has TF_HAS_BACKBUF.
-                ; A killed shell should be unlinked by Step 10's death
-                ; cleanup, but if we ever land here mid-cleanup, don't
-                ; install a non-shell as foreground.
+                ; Defensive: confirm successor is still focusable (a shell or a
+                ; graphics task). A killed member should be unlinked by reap,
+                ; but if we ever land here mid-cleanup, don't install a plain
+                ; task as foreground.
                 LOADD   D1, [XY1+#TCB_FLAGS]
-                AND     D1, #TF_HAS_BACKBUF
+                AND     D1, #TF_FOCUSABLE
                 CMP     D1, #0
-                BEQ     .none                   ; not a shell anymore → no-op
+                BEQ     .none                   ; not focusable anymore → no-op
 
-                ; Commit: FOREGROUND_TCB := new.TCB_ID
-                LOADD   D0, [XY1+#TCB_ID]
-                STOREZ  D0, [#FOREGROUND_TCB]
-
-                ; Repaint screen from new foreground's back-buffer.
-                ; XY1 already points at the new TCB.
-                CALL24  _RepaintFromBackbuf
+                ; Commit foreground + drive screen/keyboard. XY1 = new fg TCB.
+                CALL24  _CommitForeground
 .none:
                 RET
 
@@ -669,10 +775,10 @@ _SwitchForegroundPrev:
                 MOVE    D3, D0                  ; D3 = target TID (current fg)
 
                 ; Resolve current foreground to a TCB — that's our walk
-                ; starting point. The predecessor in a singleton ring is
-                ; the foreground itself (self-loop): the very first
-                ; iteration sees fg.next.TID == fg.TID and accepts fg as
-                ; its own predecessor.
+                ; starting point. A lone shell has fg.next == 0, so the walk
+                ; bails immediately (.none below) — there is no predecessor to
+                ; step back to. With two or more shells the walk finds the node
+                ; whose .next points back at the foreground.
                 CALL24  _TidToTcb               ; D0 → XY1, C=1 if not found
                 BCS     .none
 
@@ -710,20 +816,16 @@ _SwitchForegroundPrev:
                 BRA     .walk
 
 .found:
-                ; XY1 is the predecessor TCB. Defensive: confirm it
-                ; still has TF_HAS_BACKBUF (paranoia, per the same
-                ; reasoning as _SwitchForegroundNext).
+                ; XY1 is the predecessor TCB. Defensive: confirm it is still
+                ; focusable (shell or graphics task), per the same reasoning
+                ; as _SwitchForegroundNext.
                 LOADD   D1, [XY1+#TCB_FLAGS]
-                AND     D1, #TF_HAS_BACKBUF
+                AND     D1, #TF_FOCUSABLE
                 CMP     D1, #0
                 BEQ     .none
 
-                ; Commit: FOREGROUND_TCB := predecessor.TCB_ID
-                LOADD   D0, [XY1+#TCB_ID]
-                STOREZ  D0, [#FOREGROUND_TCB]
-
-                ; Repaint from the new foreground's back-buffer.
-                CALL24  _RepaintFromBackbuf
+                ; Commit foreground + drive screen/keyboard. XY1 = new fg TCB.
+                CALL24  _CommitForeground
 .none:
                 RET
 
@@ -739,7 +841,8 @@ _SwitchForegroundPrev:
 ; Output:   C=0   success, foreground switched
 ;           C=1   D0 = ERR_PERM     — caller lacks TF_PRIV
 ;                 D0 = ERR_NOTFOUND — TID doesn't exist or slot is TS_UNUSED
-;                 D0 = ERR_INVALID  — target lacks TF_HAS_BACKBUF
+;                 D0 = ERR_INVALID  — target lacks TF_FOCUSABLE
+;                                     (not a shell and not a graphics task)
 ;
 ; Leaf: returns to the same caller. The repaint walks 2400 chars
 ; synchronously (when Step 5 lands) but doesn't yield.
@@ -773,18 +876,14 @@ sys_setforeground:
                 CALL24  _TidToTcb               ; D0 → XY1, C=1 if not found
                 BCS     .err_notfound
 
-                ; --- Validate target has TF_HAS_BACKBUF ---
+                ; --- Validate target is focusable (shell or graphics task) ---
                 LOADD   D1, [XY1+#TCB_FLAGS]
-                AND     D1, #TF_HAS_BACKBUF
+                AND     D1, #TF_FOCUSABLE
                 CMP     D1, #0
                 BEQ     .err_invalid
 
-                ; --- Commit: FOREGROUND_TCB := target.TCB_ID ---
-                LOADD   D0, [XY1+#TCB_ID]
-                STOREZ  D0, [#FOREGROUND_TCB]
-
-                ; Repaint screen from target's back-buffer. XY1 = target TCB.
-                CALL24  _RepaintFromBackbuf
+                ; --- Commit foreground + drive screen/keyboard. XY1 = target.
+                CALL24  _CommitForeground
 
                 CLC
                 BRA     .sf_done
@@ -901,18 +1000,14 @@ _SwitchForegroundByIndex:
                 BRA     .sfi_walk
 
 .sfi_arrived:
-                ; XY1 = target TCB. Defensive: still a shell?
+                ; XY1 = target TCB. Defensive: still focusable (shell or gfx)?
                 LOADD   D0, [XY1+#TCB_FLAGS]
-                AND     D0, #TF_HAS_BACKBUF
+                AND     D0, #TF_FOCUSABLE
                 CMP     D0, #0
                 BEQ     .sfi_none
 
-                ; Commit: FOREGROUND_TCB := target.TCB_ID
-                LOADD   D0, [XY1+#TCB_ID]
-                STOREZ  D0, [#FOREGROUND_TCB]
-
-                ; Repaint screen from target's back-buffer.
-                CALL24  _RepaintFromBackbuf
+                ; Commit foreground + drive screen/keyboard. XY1 = target TCB.
+                CALL24  _CommitForeground
 .sfi_none:
                 RET
 
@@ -990,123 +1085,117 @@ _SwitchForegroundByIndex:
 _BackbufPutChar:
                 PUSH    XY1, XY3                ; preserve caller's TCB ptr
                 LOW     D0                      ; byte in low byte only
-
-                ; Load cursor word into D3 (high byte = row, low byte = col).
-                ; D1 holds the field offset throughout — reused at the
-                ; single commit point at the end.
                 LOADI   D1, #TCB_BACKBUF_CRSR
-                LOADD   D3, [XY1+D1]
-
-                ; Dispatch.
-                CMP     D0, #$0D                ; CR
+                LOADD   D3, [XY1+D1]            ; D3 = (row<<8)|col
+                CMP     D0, #$0D
                 BEQ     .do_cr
-                CMP     D0, #$0A                ; LF
+                CMP     D0, #$0A
                 BEQ     .do_lf
-                CMP     D0, #$08                ; BS
+                CMP     D0, #$08
                 BEQ     .do_bs
-                CMP     D0, #$07                ; BEL — no-op
+                CMP     D0, #$07
                 BEQ     .bbpc_done
-
-                ; -------- plain visible character --------
-                ; D3 = (row<<8) | col. Compute cell address and STOREB.
-                ; Stash byte on stack; D-regs become free scratch.
-                PUSH    D0, XY3
-
-                ; Extract row → D2, col → D0.
+                ; -------- plain visible character (word cell + attr) -----
+                ; Ring: pr = (TOP_ROW + row) mod 100; off = pr*160 + col*2.
+                ; Stamp (CUR_ATTR<<8)|char. D3 (cursor) preserved for advance.
+                PUSH    D0, XY3                 ; save char
                 MOVE    D2, D3
-                HIGH    D2                      ; D2 = row
-                MOVE    D0, D3
-                LOW     D0                      ; D0 = col (preserved for ADD below)
-
-                ; D2 = row*80 = (row<<6) + (row<<4).
-                SHL4    D2                      ; D2 = row << 4
-                MOVE    D1, D2                  ; D1 = row << 4 (save copy)
-                SHL     D2                      ; D2 = row << 5
-                SHL     D2                      ; D2 = row << 6
-                ADD     D2, D1                  ; D2 = row<<6 + row<<4 = row*80
-
-                ; D2 += col → linear cell offset within back-buffer.
-                ADD     D2, D0                  ; D2 = row*80 + col
-
-                ; XY2 := back-buffer base + cell offset.
+                HIGH    D2                      ; D2 = visible row
+                MOVE    D1, D3
+                LOW     D1                      ; D1 = col
+                LOADI   D0, #TCB_TOP_ROW
+                LOADD   D0, [XY1+D0]            ; TOP_ROW
+                ADD     D2, D0                  ; pr = TOP + row
+                CMP     D2, #KOS_GRID_ROWS
+                BLO.S   .pc_nowrap
+                SUB     D2, #KOS_GRID_ROWS      ; mod 100
+.pc_nowrap:
+                MOVE    D0, D2
+                SHL4    D0
+                SHL     D0                      ; pr*32 = t
+                MOVE    D2, D0                  ; t
+                SHL     D0
+                SHL     D0                      ; t*4
+                ADD     D0, D2                  ; t*5 = pr*160
+                ADD     D0, D1                  ; + col
+                ADD     D0, D1                  ; + col (= col*2)
                 LOADI   D1, #TCB_BACKBUF_OFFS
                 LOADD   D1, [XY1+D1]
-                ADD     D1, D2
+                ADD     D1, D0
                 MOVE    X2, D1
                 LOADI   D1, #TCB_BACKBUF_PAGE
                 LOADD   D1, [XY1+D1]
                 MOVE    Y2, D1
-
-                ; Retrieve byte and write to cell.
-                POP     D0, XY3
-                STOREB  D0, [XY2]
-
-                ; --- Advance cursor in D3 ---
-                ; col += 1. If col wraps to KOS_TERM_COLS, reset col, bump row.
+                ; word = (CUR_ATTR<<8)|char
+                LOADI   D1, #TCB_CUR_ATTR
+                LOADD   D1, [XY1+D1]
+                LOW     D1
+                SHL4    D1
+                SHL4    D1                      ; attr<<8
+                POP     D0, XY3                 ; char back
+                LOW     D0
+                OR      D0, D1
+                STORED  D0, [XY2]               ; write word cell
+                ; --- advance cursor (D3) ---
                 MOVE    D0, D3
                 LOW     D0
-                ADD     D0, #1                  ; D0 = candidate new col
+                ADD     D0, #1                  ; candidate col
                 CMP     D0, #KOS_TERM_COLS
                 BLO     .pack_col_only
-
-                ; col wrapped → col = 0; row += 1; maybe scroll.
-                LOADI   D0, #0                  ; new col
+                ; col wrapped -> col=0, row+=1, maybe scroll
+                LOADI   D0, #0
                 MOVE    D2, D3
-                HIGH    D2                      ; D2 = old row
-                ADD     D2, #1                  ; row += 1
-                CMP     D2, #KOS_TERM_ROWS
+                HIGH    D2
+                ADD     D2, #1                  ; row+1
+                LOADI   D1, #TCB_VIS_ROWS
+                LOADD   D1, [XY1+D1]
+                CMP     D2, D1                  ; row+1 < VIS ?
                 BLO.S   .pack_row_col
-
-                ; Row overflow → scroll, row := ROWS-1.
+                ; past visible bottom -> ring scroll; row := VIS-1; col := 0
                 CALL24  _BackbufScroll
-                LOADI   D2, #79                 ; ROWS - 1 (literal — no arith in imm)
+                LOADI   D1, #TCB_VIS_ROWS
+                LOADD   D1, [XY1+D1]
+                SUB     D1, #1
+                MOVE    D2, D1
+                LOADI   D0, #0                  ; col re-established (scroll clobbers D0)
 .pack_row_col:
-                ; D3 = (D2 << 8) | D0.
                 MOVE    D3, D2
                 SHL4    D3
-                SHL4    D3                      ; D3 = row << 8
-                OR      D3, D0                  ; D3 |= col
+                SHL4    D3                      ; row<<8
+                OR      D3, D0
                 BRA     .bbpc_done
-
 .pack_col_only:
-                ; D3 high byte unchanged; replace low byte with new col (D0).
                 AND     D3, #$FF00
                 OR      D3, D0
                 BRA     .bbpc_done
-
 .do_cr:
-                ; col := 0; row unchanged.
-                AND     D3, #$FF00
+                AND     D3, #$FF00              ; col := 0
                 BRA     .bbpc_done
-
 .do_lf:
-                ; row += 1, col := 0  (Unix newline semantics — most callers
-                ; emit bare '\n' expecting it to do both CR and LF, matching
-                ; how the terminal itself interprets LF in NL mode).
                 MOVE    D2, D3
                 HIGH    D2
-                ADD     D2, #1
-                CMP     D2, #KOS_TERM_ROWS
+                ADD     D2, #1                  ; row+1
+                LOADI   D1, #TCB_VIS_ROWS
+                LOADD   D1, [XY1+D1]
+                CMP     D2, D1
                 BLO.S   .lf_pack
                 CALL24  _BackbufScroll
-                LOADI   D2, #79
+                LOADI   D1, #TCB_VIS_ROWS
+                LOADD   D1, [XY1+D1]
+                SUB     D1, #1
+                MOVE    D2, D1
 .lf_pack:
-                ; Drop both old row and old col; D3 := (D2 << 8) | 0.
                 MOVE    D3, D2
                 SHL4    D3
-                SHL4    D3
+                SHL4    D3                      ; row<<8, col:=0
                 BRA     .bbpc_done
-
 .do_bs:
-                ; if col > 0: col -= 1.  Row unaffected because col >= 1 here.
                 MOVE    D0, D3
                 LOW     D0
                 CMP     D0, #0
                 BEQ.S   .bbpc_done
-                SUB     D3, #1
-
+                SUB     D3, #1                  ; col--
 .bbpc_done:
-                ; Single commit: write D3 back to TCB_BACKBUF_CRSR.
                 LOADI   D1, #TCB_BACKBUF_CRSR
                 STORED  D3, [XY1+D1]
                 POP     XY1, XY3
@@ -1114,61 +1203,193 @@ _BackbufPutChar:
 
 
 ; ----------------------------------------------------------------------------
-; _BackbufScroll — shift rows 1..ROWS-1 up by one; blank new bottom row
+; _BackbufScroll - ring-scroll (Step 1): O(1) TOP_ROW bump + blank new bottom
 ;
-; Used internally by _BackbufPutChar when an LF or wrap pushes the cursor
-; past the last row. Cost is ~7K cycles (2320-byte memmove + 80-byte blank).
+; Replaces the physical memmove. Bumps TCB_TOP_ROW (mod 100) and blanks the
+; row scrolling in at visible bottom = (TOP_ROW + VIS_ROWS - 1) mod 100.
+; Assumes VIS_ROWS >= 1 (guaranteed by register-time init + repaint guard).
 ;
 ; In:        XY1 = caller's TCB pointer
-; Out:       back-buffer rows shifted up; bottom row blanked
-; Clobbers:  D0, D1, D2, D3, XY0, XY2
-; Preserves: XY1, XY3
+; Clobbers:  D0, D1, D2, D3, XY0, XY2   Preserves: XY1, XY3
 ; ----------------------------------------------------------------------------
 _BackbufScroll:
-                ; Resolve back-buffer base into XY2 (Y2:X2).
-                ; LOADD targets a D register; build X2 via D->X MOVE.
-                LOADI   D1, #TCB_BACKBUF_OFFS
-                LOADD   D0, [XY1+D1]
-                MOVE    X2, D0
-                LOADI   D1, #TCB_BACKBUF_PAGE
-                LOADD   D0, [XY1+D1]
-                MOVE    Y2, D0
-
-                ; XY0 = dest (row 0), XY2 = source (row 1). Walk forward
-                ; (ROWS-1)*COLS = 79*80 = 6320 bytes.
-                LEA     XY0, XY2            ; XY0 = base (row 0)
-                ; Bump XY2 by 80 bytes using 24-bit INC (handles page carry
-                ; if the back-buffer base sits near end-of-page).
-                ; INC XY only accepts #imm5 (0..31), so split into 3 INCs.
-                INC     XY2, #31
-                INC     XY2, #31
-                INC     XY2, #18            ; total = 80
-
-                LOADI   D3, #6320           ; (KOS_TERM_ROWS-1) * KOS_TERM_COLS
-                                            ; = 79 * 80; literal because the
-                                            ; assembler doesn't evaluate
-                                            ; arithmetic in immediates.
-.scroll_loop:
-                LOADB   D0, [XY2]
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-                INC     XY2, #1
-                SUB     D3, #1
-                BNE     .scroll_loop
-
-                ; XY0 now points at start of the new bottom row.
-                ; Blank 80 bytes.
+                LOADI   D1, #TCB_TOP_ROW
+                LOADD   D0, [XY1+D1]            ; TOP_ROW
+                ADD     D0, #1
+                CMP     D0, #KOS_GRID_ROWS
+                BLO.S   .bs_notop
                 LOADI   D0, #0
-                LOADI   D3, #KOS_TERM_COLS  ; 80
-.blank_loop:
-                STOREB  D0, [XY0]
-                INC     XY0, #1
+.bs_notop:
+                STORED  D0, [XY1+D1]            ; TOP_ROW := new
+                ; pr = (TOP_ROW + VIS - 1) mod 100
+                LOADI   D1, #TCB_VIS_ROWS
+                LOADD   D1, [XY1+D1]
+                ADD     D0, D1
+                SUB     D0, #1
+                CMP     D0, #KOS_GRID_ROWS
+                BLO.S   .bs_norow
+                SUB     D0, #KOS_GRID_ROWS
+.bs_norow:
+                ; byte offset = pr*160 -> D2
+                MOVE    D2, D0
+                SHL4    D2
+                SHL     D2                      ; pr*32 = t
+                MOVE    D1, D2
+                SHL     D2
+                SHL     D2                      ; t*4
+                ADD     D2, D1                  ; t*5 = pr*160
+                LOADI   D1, #TCB_BACKBUF_OFFS
+                LOADD   D1, [XY1+D1]
+                ADD     D1, D2
+                MOVE    X2, D1
+                LOADI   D1, #TCB_BACKBUF_PAGE
+                LOADD   D1, [XY1+D1]
+                MOVE    Y2, D1
+                ; blank 80 word-cells with CELL_BLANK
+                LOADI   D0, #CELL_BLANK
+                LOADI   D3, #KOS_TERM_COLS
+.bs_blank:
+                STORED  D0, [XY2]+
                 SUB     D3, #1
-                BNE     .blank_loop
-
+                BNE     .bs_blank
                 RET
 
 
 ; ============================================================================
-; End of kos_switcher.asm (r6)
+; Part 49 — graphics-task foreground helpers (28 June 2026)
+; ============================================================================
+; These let a graphics task (TF_GRAPHICS, no back-buffer) live in the same
+; foreground ring as the shells. _CommitForeground is the single commit tail
+; for ALL foreground switches; it is what writes VID_MODE on every switch, so
+; the WebEMU host follows the foreground to the graphics / terminal tab.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; _CommitForeground — install XY1's task as the foreground; drive the screen
+;                     and keyboard accordingly.
+;
+; In:        XY1 = new foreground TCB (page $00)
+; Out:       FOREGROUND_TCB = new TID; VID_MODE set for the target; keyboard
+;            handed off; a shell target additionally repainted.
+; Clobbers:  D0, D1, D2, D3, XY0, XY2  (preserves XY1, XY3)
+;
+; Branch:
+;   graphics target (TF_GRAPHICS) → VID_MODE := TCB_GFX_MODE (host shows the
+;       graphics tab; the live framebuffer is already current — the task kept
+;       drawing while backgrounded). No repaint (no back-buffer).
+;   shell target → VID_MODE := 0 (host shows the terminal tab) + repaint the
+;       shell's back-buffer.
+; ----------------------------------------------------------------------------
+_CommitForeground:
+                LOADD   D0, [XY1+#TCB_ID]
+                STOREZ  D0, [#FOREGROUND_TCB]
+                CALL24  _KbdReleaseWaiter           ; hand off the keyboard
+                LOADD   D0, [XY1+#TCB_FLAGS]
+                AND     D0, #TF_GRAPHICS
+                BNE.S   .cf_gfx
+                ; --- shell target ---
+                LOADI   D0, #0
+                CALL24  _VideoSetModeRaw            ; VID_MODE := 0 (host → terminal)
+                CALL24  _RepaintFromBackbuf         ; XY1 = shell TCB
+                RET
+.cf_gfx:
+                ; --- graphics target ---
+                LOADI   D1, #TCB_GFX_MODE
+                LOADD   D0, [XY1+D1]                ; D0 = saved mode
+                CALL24  _VideoSetModeRaw            ; VID_MODE := mode (host → graphics)
+                RET
+
+
+; ----------------------------------------------------------------------------
+; _SpliceAfterForeground — insert XY1's task into the ring immediately after
+;                          the current foreground.
+;
+; In:        XY1 = TCB to insert (page $00)
+; Out:       C=0 spliced OK; C=1 the foreground TID was stale (nothing linked).
+;            XY1 is restored to the inserted task either way.
+; Clobbers:  D0, D2, D3, XY1  (preserves D1, XY0, XY2, XY3)
+;
+; Factored from sys_register_shell's insert-after block and reused by
+; sys_setvidmode's graphics acquire. Preserves D2 (= our offset) and XY2 so
+; register_shell's unwind path still has what it needs on the C=1 return.
+; ----------------------------------------------------------------------------
+_SpliceAfterForeground:
+                MOVE    D2, X1                      ; D2 = our TCB offset
+                LOADZ   D0, [#FOREGROUND_TCB]
+                CALL24  _TidToTcb                   ; XY1 := fg TCB, C=1 if not found
+                BCS     .saf_fail
+                LOADI   D3, #TCB_SHELL_NEXT
+                LOADD   D0, [XY1+D3]                ; D0 = fg.next (0 = fg is lone)
+                ; Part 50 fix: a lone foreground carries SHELL_NEXT = 0 — the
+                ; "lone shell" convention _SwitchForegroundNext already honours.
+                ; Copying that 0 into our.next would leave us dangling and send
+                ; the reap ring-walk into the page-$00 vectors (DATA FAULT).
+                ; Close the ring back to the foreground instead, forming a
+                ; valid 2-ring fg <-> us.
+                CMP     D0, #0
+                BNE.S   .saf_link
+                MOVE    D0, X1                      ; lone fg: our.next := fg offset
+.saf_link:
+                STORED  D2, [XY1+D3]                ; fg.next := us
+                MOVE    X1, D2                      ; XY1 := our TCB
+                LOADI   Y1, #$00
+                STORED  D0, [XY1+D3]                ; our.next := fg.next (or fg if lone)
+                CLC
+                RET
+.saf_fail:
+                MOVE    X1, D2                      ; restore XY1 := our TCB
+                LOADI   Y1, #$00
+                SEC
+                RET
+
+
+; ----------------------------------------------------------------------------
+; _UnspliceFromRing — remove XY1's task from the ring.
+;
+; Walks forward (bounded by MAX_SHELL_RING_LEN) to the predecessor P whose
+; TCB_SHELL_NEXT points at us, sets P.next := our.next, then clears our.next.
+; Used by sys_setvidmode's release path (a live task leaving the ring). Reap
+; has its own equivalent unlink inline; this is the alive-task counterpart.
+;
+; In:        XY1 = victim TCB (page $00)
+; Out:       victim removed; victim.TCB_SHELL_NEXT = 0
+; Clobbers:  D0, D2, D3, XY2  (preserves D1, XY0, XY1, XY3)
+; ----------------------------------------------------------------------------
+_UnspliceFromRing:
+                LOADI   D3, #TCB_SHELL_NEXT
+                LOADD   D0, [XY1+D3]                ; D0 = our.next
+                CMP     D0, #0
+                BEQ     .ufr_done                   ; not in ring → nothing to do
+                CMP     D0, X1
+                BNE.S   .ufr_multi
+                ; Lone self-loop (defensive — a graphics task is never the lone
+                ; member while kosh exists). Clear the global anchors.
+                LOADI   D0, #0
+                STOREZ  D0, [#FOREGROUND_TCB]
+                STOREZ  D0, [#FIRST_SHELL_TID]
+                BRA     .ufr_clear
+.ufr_multi:
+                MOVE    X2, D0
+                LOADI   Y2, #$00
+                LOADI   D2, #MAX_SHELL_RING_LEN
+.ufr_find:
+                LOADD   D0, [XY2+D3]                ; walker.next
+                CMP     D0, X1
+                BEQ.S   .ufr_found
+                MOVE    X2, D0
+                SUB     D2, #1
+                BNE     .ufr_find
+                BRA     .ufr_clear                  ; corrupt ring → skip the splice
+.ufr_found:
+                LOADD   D0, [XY1+D3]                ; our.next
+                STORED  D0, [XY2+D3]                ; pred.next := our.next
+.ufr_clear:
+                LOADI   D0, #0
+                STORED  D0, [XY1+D3]                ; our.next := 0
+.ufr_done:
+                RET
+
+
+; ============================================================================
+; End of kos_switcher.asm (r8)
 ; ============================================================================

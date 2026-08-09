@@ -167,6 +167,11 @@
         <IsPartOfProject Value="True"/>
         <UnitName Value="K16_Encoder_TrapRet"/>
       </Unit>
+      <Unit>
+        <Filename Value="k16_encoder_stream.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="K16_Encoder_Stream"/>
+      </Unit>
     </Units>
   </ProjectOptions>
   <CompilerOptions>

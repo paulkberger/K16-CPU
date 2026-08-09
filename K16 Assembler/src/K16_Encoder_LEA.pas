@@ -256,21 +256,17 @@ begin
     // PC after this instruction (2-word instruction = 4 bytes)
     PCAfter := Instr.Address + 4;
 
-    // Calculate relative offset
+    // Page-local displacement: the offset is added to PCL modulo 65536 at
+    // runtime and Yn is taken from the LEA's PCH. Any target in the SAME page
+    // is therefore reachable regardless of distance, so the old +/-32767
+    // "PC-relative range" check does NOT apply and has been removed — it
+    // wrongly rejected valid far same-page references (and, being ordered
+    // before the page check, masked the cross-page warning below). The only
+    // failure mode is a CROSS-page reference, which lands in the LEA's page
+    // rather than the label's; warn on that and still encode the page-local
+    // result (Yn = LEA's PCH).
     RelOffset := Integer(LabelAddr) - Integer(PCAfter);
 
-    // Validate range (16-bit signed: -32768 to +32767)
-    if (RelOffset < -32768) or (RelOffset > 32767) then
-    begin
-      ErrorReporter(Format('LEA PC-relative offset out of range: %d (label %s at $%6.6X, PC after = $%6.6X)',
-        [RelOffset, AddrExpr.OffsetSymbol, LabelAddr, PCAfter]), Instr.LineNumber);
-      Exit;
-    end;
-
-    // Page-locality check: warn if LEA and label are in different
-    // assembly-time pages (compare bits 23..16). Runtime Yn will be
-    // PCH (LEA's page) regardless of what the displacement points at,
-    // so a cross-page LEA produces a wrong-page address silently.
     if (LabelAddr shr 16) <> (Instr.Address shr 16) then
     begin
       if Assigned(WarningReporter) then

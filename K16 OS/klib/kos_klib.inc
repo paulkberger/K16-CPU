@@ -89,8 +89,13 @@
 ;-----------------------------------------------------------------------------
 ; Library base addresses (Page $00 RAM)
 ;-----------------------------------------------------------------------------
-KLIB_BASE       .EQU    $A000               ; KLIB jump table base
-GLIB_BASE       .EQU    $A100               ; GLIB jump table base (RESERVED — Phase 10 does not init)
+; --- Address space (.SPACE): this file's regions are 'kernel'-owned ---
+.SPACE kernel
+
+KLIBTABLE       .REGION $A000
+  KLIB_BASE       .RS $100            ; $A000  64 slots x 4 B = 256 B jump table
+                .ENDREGION  ; KLIBTABLE_END=$A100  KLIBTABLE_SIZE=$100
+GLIB_BASE       .EQU    $A100               ; GLIB jump table base (RESERVED - Phase 10 does not init)
 
 KLIB_VERSION_VALUE .EQU $0101               ; v1.1 (high byte = major, low byte = minor)
                                             ; v1.1 (Part 39): slots 06 (TRY_MOUNT) and 07
@@ -99,7 +104,9 @@ KLIB_VERSION_VALUE .EQU $0101               ; v1.1 (high byte = major, low byte 
 ;-----------------------------------------------------------------------------
 ; KLIB internal state (Page $00 RAM, just below jump table)
 ;-----------------------------------------------------------------------------
-KLIB_SEED       .EQU    $9FFE               ; word — xorshift16 state for RAND16/SRAND
+KLIBSTATE       .REGION $9FFE
+  KLIB_SEED       .RS 1w              ; $9FFE  xorshift16 RNG state for RAND16/SRAND
+                .ENDREGION  ; KLIBSTATE_END=$A000  KLIBSTATE_SIZE=$02
 
 ;-----------------------------------------------------------------------------
 ; Integer math (slots 00-07)

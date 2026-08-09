@@ -89,10 +89,8 @@ _InitKLib:
                 ; (64 entries × 4 bytes each)
                 LOADI   D1, #128
 .copy:
-                LOADD   D0, [XY1]
-                STORED  D0, [XY0]
-                INC     XY1, #1w            ; word step (+2)
-                INC     XY0, #1w            ; word step (+2)
+                LOADD   D0, [XY1]+
+                STORED  D0, [XY0]+
                 DEC     D1, #1
                 BNE     .copy
 

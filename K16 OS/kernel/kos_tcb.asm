@@ -1,8 +1,30 @@
 ; ============================================================================
 ; kos_tcb.asm — k/OS TCB management (Phase 3, TCB v2.4, idle-task model)
 ; ============================================================================
-; Date:    17 May 2026
-; Status:  Part 31 r22 — _ReapDeadTask now reaps owned heap blocks.
+; Date:    28 June 2026
+; Status:  Part 50 — _InitTCBPool zeroes foreground/shell anchors at boot.
+; Revision: r25 — 28 June 2026 — Part 50: _InitTCBPool now also zeroes
+;               FOREGROUND_TCB and FIRST_SHELL_TID. These globals live outside
+;               the TCB pool, so the TS_UNUSED sweep never cleared them; on a
+;               reset that leaves RAM intact (hardware reset line / b-reset /
+;               warm WebEMU boot) a stale FOREGROUND_TCB from a prior foreground
+;               task (esp. a Part 49 graphics task) pointed sys_register_shell
+;               at a now-dead TID, so the freshly-spawned kosh spliced against a
+;               ghost and hung at "Loading k/OS shell ...". Two STOREZ in the
+;               scheduler-globals clear block. Boot is now correct regardless of
+;               prior RAM contents.
+; Revision: r24 — 28 June 2026 — Part 50: reap unlink treats next = 0 as a lone
+;               shell (clear globals) and refuses to walk any sub-pool link
+;               (< USER_TCB_BASE), closing the DATA FAULT $00014F path.
+; Revision: r23 — 28 June 2026 — Part 49: graphics-task reap. _ReapDeadTask's
+;             ring-unlink entry guard broadened TF_HAS_BACKBUF -> TF_FOCUSABLE,
+;             so a dying graphics task (TF_GRAPHICS, no back-buffer) is unlinked
+;             from the foreground ring and hands the foreground back exactly as
+;             a shell does. The back-buffer free is already guarded by a
+;             zero-offset skip, so a graphics task frees nothing. The victim
+;             flag-clear mask widened $FFF7 -> $FFE7 (clears TF_GRAPHICS too)
+;             and now also zeroes TCB_GFX_MODE. (Also corrected a stale comment:
+;             TCB_FLAGS is at $12, not $1C.) Requires kos_defs.inc r45+.
 ; Revision: r22 — 17 May 2026 — Phase 14 Part 3b: heap reap hook.
 ;             • _ReapDeadTask calls _ReapByTid(victim.TID) at the
 ;               .rdt_not_shell convergence point, AFTER the shell
@@ -197,6 +219,19 @@ _InitTCBPool:
                 STOREZ  D0, [#TASK_COUNT]
                 STOREZ  D0, [#BT_PARENT_ID]
 
+                ;-- Clear foreground/shell-ring anchors (r25) ----------------
+                ; sys_register_shell tests FOREGROUND_TCB == 0 to decide the
+                ; first-shell path. These two globals are NOT in the TCB pool,
+                ; so the TS_UNUSED sweep above does not touch them; without an
+                ; explicit clear they survive a reset that leaves RAM intact
+                ; (real-hardware reset line, the b-reset button, or a warm
+                ; WebEMU boot). A stale FOREGROUND_TCB pointing at a now-dead
+                ; TID makes the freshly-spawned kosh splice against a ghost and
+                ; hang at shell bring-up. Zero here so boot is correct
+                ; regardless of prior RAM contents.
+                STOREZ  D0, [#FOREGROUND_TCB]
+                STOREZ  D0, [#FIRST_SHELL_TID]
+
                 ;-- Construct idle TCB at slot 0 -----------------------------
                 LOADI   Y1, #$00
                 LOADI   X1, #IDLE_TCB
@@ -305,7 +340,7 @@ _AllocTCB:
                 RET
 
 ; ============================================================================
-; _PageInUse — is a given page byte currently owned by some live TCB?
+; _PageInUse - is a given page byte currently owned by some live TCB?
 ;
 ;   Input:    D0 = candidate page byte ($01..$20)
 ;   Output:   C=0 if page is FREE (no in-use TCB owns it)
@@ -313,15 +348,42 @@ _AllocTCB:
 ;   Clobbers: flags only (D0 preserved)
 ;
 ;   "In use" = TCB_STATE != TS_UNUSED. Note that TS_DEAD slots still
-;   own their page (until _ReapDeadTask runs); we treat them as owned.
-;   This means an unreaped dead task's page is unavailable for reuse,
+;   own their pages (until _ReapDeadTask runs); we treat them as owned.
+;   This means an unreaped dead task's pages are unavailable for reuse,
 ;   which is correct.
 ;
-;   Cost: 32 TCB inspections, ~5 cycles each ⇒ ~160 cycles worst case.
+;   Part 60 - RANGE test, not an equality test.  A task owns a RUN of
+;   TCB_PAGE_COUNT contiguous pages starting at its own page:
+;
+;       owned(p) := p >= TCB_SAVED_Y  and  p < TCB_SAVED_Y + TCB_PAGE_COUNT
+;
+;   e.g. base $04 with count 2 owns $04 and $05; $06 is free.
+;
+;   Contiguity, and the run starting at the task's OWN page, are what let a
+;   single TCB field describe the whole set.  That is what keeps release
+;   free: there is no _FreePage and no ownership bitmap, so reaping the TCB
+;   to TS_UNUSED makes the ENTIRE run vanish from this scan at once.  The
+;   kill / exit / reap path needs no edit for multi-page tasks.
+;
+;   A count of 0 yields an empty range.  The idle TCB is built directly by
+;   _InitTCBPool with SAVED_Y=$00 / PAGE_COUNT=0, so it now claims nothing
+;   where the old equality test reported page $00 owned.  No effect - the
+;   allocator's scan starts at USER_PAGE_BASE ($02) - but it is a real
+;   behaviour delta, recorded here rather than discovered later.
+;
+;   CARRY SENSE.  K16 is 6502-style: after CMP A,B, C=1 means NO borrow,
+;   i.e. A >= B unsigned; C=0 means borrow, A < B.  BLO = C=0 = A < B.
+;   The x86 autopilot is backwards.  Both tests below branch on BLO, to
+;   opposite targets.
+;
+;   Cost: 32 TCB inspections, ~10 cycles each => ~320 cycles worst case
+;   (was ~160).  Spawn-time only.
 ; ============================================================================
 _PageInUse:
-                PUSH    D1, XY3
-                PUSH    D2, XY3
+                ; Part 60: was PUSH D1 / PUSH D2 separately.  PUSH D123 costs
+                ; about the same and hands us D3 - which is exactly the extra
+                ; scratch the range test needs.
+                PUSH    D123, XY3
                 PUSH    XY1, XY3
 
                 MOVE    D2, D0                  ; D2 = candidate page byte
@@ -333,22 +395,34 @@ _PageInUse:
                 ; Skip TS_UNUSED slots
                 LOADD   D0, [XY1+#TCB_STATE]
                 CMP     D0, #TS_UNUSED
-                BEQ.S     .skip
+                BEQ.S   .skip
 
-                ; Compare TCB_SAVED_Y (low byte = page) with candidate
-                LOADD   D0, [XY1+#TCB_SAVED_Y]
-                CMP     D0, D2
-                BEQ.S     .owned
+                ; -- Is the candidate inside this task's page run? ---------
+                ; Carry is 6502-style: after CMP A,B, C=1 = no borrow = A >= B
+                ; unsigned.  BLO = C=0 = A < B.  State it before writing the
+                ; branch; the x86 reading is backwards.
+                LOADD   D3, [XY1+#TCB_SAVED_Y]  ; D3 = run base page
+                CMP     D2, D3
+                BLO.S   .skip                   ; candidate below the run
+
+                LOADD   D0, [XY1+#TCB_PAGE_COUNT]
+                ADD     D0, D3                  ; D0 = first page PAST the run
+                                                ; (ADD takes no carry in, RM
+                                                ;  6.3 mode 00, so no CLC)
+                CMP     D2, D0
+                BLO.S   .owned                  ; candidate inside the run
+                                                ; count 0 => D0 = base, so this
+                                                ; fails: the range is empty
 
 .skip:
                 ADD     X1, #TCB_SIZE
                 SUB     D1, #1
                 BNE     .scan
 
-                ; Walked entire pool without finding owner ⇒ free
+                ; Walked entire pool without finding owner => free
                 MOVE    D0, D2                  ; restore D0
                 CLC
-                BRA.S     .done
+                BRA.S   .done
 
 .owned:
                 MOVE    D0, D2                  ; restore D0
@@ -356,68 +430,127 @@ _PageInUse:
 
 .done:
                 POP     XY1, XY3
-                POP     D2, XY3
-                POP     D1, XY3
+                POP     D123, XY3
                 RET
 
 ; ============================================================================
-; _AllocPage — find lowest free user page in [USER_PAGE_BASE..KOS_USER_PAGE_END]
+; _AllocPageRun - lowest run of N consecutive free user pages     [Part 60]
+;                 in [USER_PAGE_BASE .. KOS_USER_PAGE_END]
+;
+;   Input:    D0 = N, pages wanted (>= 1)
+;   Output:   D0 = base page byte of the run, C=0    on success
+;             D0 = $0000,                     C=1    if no such run exists
+;   Clobbers: flags only (D0 is the result; D1/D2/D3 preserved)
+;
+;   The ceiling is host-dependent: Digital -> $1F (30 pages), EMU -> $3F (62
+;   pages). It's set at boot by _InitMemConfig into KOS_USER_PAGE_END.
+;
+;   ALGORITHM.  One _PageInUse probe per CANDIDATE, carrying a
+;   consecutive-free run length in D3; an owned probe resets the run to
+;   zero.  O(candidates), NOT O(N x candidates) - worst case is the same
+;   ~62 probes as the old single-page scan, so N costs nothing extra.
+;
+;   N is parked on the stack at [XY3+#6]: D1 = candidate, D2 = ceiling+1 and
+;   D3 = run length use every register _PageInUse leaves free, and D0 is its
+;   argument.  (PUSH D0 = 2 bytes, PUSH D123 = 6 bytes, so N sits 6 above
+;   the stack pointer.)
+;
+;   Returns the LOWEST qualifying run.  Deterministic across boots.
+;
+;   WHY CONTIGUOUS.  Not a convenience: it is what lets one TCB_PAGE_COUNT
+;   describe the whole run, which is what makes release free - reap the TCB
+;   to TS_UNUSED and the entire range vanishes from _PageInUse.  There is
+;   deliberately no _FreePage and no ownership bitmap; "the TCB pool is the
+;   truth" survives intact.
+;
+;   TWO DELIBERATE LIMITATIONS, recorded so they read as choices:
+;     - No dynamic growth.  A task cannot ask for more later.
+;     - Fragmentation is possible: a run of 2 can fail with 5 pages free
+;       but scattered.  With allocation only at spawn, release only at
+;       reap, and few concurrent tasks this is unlikely; N=1 is unaffected
+;       either way.
+;
+;   FAIL-FAST IS THE POINT.  A task that cannot get its pages is dead.
+;   Failing here means the PARENT handles ERR_NOMEM - kosh prints a message
+;   and returns to the prompt.  Failing mid-initialisation would leave a
+;   half-built task with pages already consumed.
+;
+;   NOTE: allocation does NOT clear the pages.  A multi-page task sees the
+;   previous tenant's bytes in its extra pages, exactly as it already does
+;   below $0200 in its own page - which is why sys_exec must stamp
+;   ARGV_BASE rather than trust a zero there.
+; ============================================================================
+_AllocPageRun:
+                PUSH    D0, XY3                 ; N - read back as [XY3+#6]
+                PUSH    D123, XY3
+
+                CMP     D0, #0
+                BEQ     .apr_fail               ; N=0 is a caller bug
+
+                ; D2 = runtime user-page ceiling (set by _InitMemConfig)
+                ; Digital: $1F (30 pages)  EMU: $3F (62 pages)
+                LOADZ   D2, [#KOS_USER_PAGE_END]
+                LOW     D2
+                ADD     D2, #1                  ; one past last valid
+
+                LOADI   D1, #USER_PAGE_BASE     ; D1 = candidate, start at $02
+                LOADI   D3, #0                  ; D3 = consecutive free so far
+
+.apr_scan:
+                MOVE    D0, D1                  ; candidate page in D0
+                CALL24  _PageInUse
+                BCS.S   .apr_break              ; C=1 => owned, run is broken
+
+                ADD     D3, #1
+                LOADD   D0, [XY3+#6]            ; D0 = N
+                CMP     D3, D0
+                BLO.S   .apr_next               ; C=0 => run not long enough yet
+
+                ; Run complete.  Base = candidate - (N-1) = D1 - D3 + 1.
+                MOVE    D0, D1
+                SUB     D0, D3
+                ADD     D0, #1
+                BRA.S   .apr_ok
+
+.apr_break:
+                LOADI   D3, #0                  ; owned page - restart the run
+
+.apr_next:
+                ADD     D1, #1
+                CMP     D1, D2                  ; vs runtime ceiling+1
+                BLO     .apr_scan               ; C=0 => still below ceiling
+
+                ; Fell off the ceiling without completing a run.
+                ; Two self-contained tails, no shared epilogue.  POP leaves
+                ; flags alone but ADD X3 does NOT (ADD Xn sets flags; ADD XYn
+                ; does not - RM 6.4), so the carry must be set LAST.
+.apr_fail:
+                POP     D123, XY3
+                ADD     X3, #2                  ; discard saved N - CLOBBERS FLAGS
+                LOADI   D0, #0
+                SEC
+                RET
+
+.apr_ok:
+                POP     D123, XY3
+                ADD     X3, #2                  ; discard saved N - CLOBBERS FLAGS
+                CLC
+                RET
+
+; ============================================================================
+; _AllocPage - lowest free single user page          [Part 60: thin wrapper]
 ;
 ;   Output:
 ;     D0 = page byte ($02..ceiling), C=0    on success
 ;     D0 = $0000,                    C=1    if all pages exhausted (ERR_NOMEM)
 ;
-;   The ceiling is host-dependent: Digital → $1F (30 pages), EMU → $3F (62
-;   pages). It's set at boot by _InitMemConfig into KOS_USER_PAGE_END.
-;
-;   Algorithm: walk candidates from USER_PAGE_BASE upward; for each, call
-;   _PageInUse which scans the TCB pool with EARLY EXIT on first owner
-;   match. First candidate that comes back free is the answer.
-;
-;   Cost analysis (with N live tasks, _PageInUse averages ~128 cycles
-;   for owned/early-exit, ~256 cycles for free/full-walk):
-;     N=10  → ~10*128 + 256  ≈ 1500 cycles
-;     N=30  → ~30*128 + 256  ≈ 4100 cycles
-;     N=62  → ~62*128 + 256  ≈ 8200 cycles
-;   At 10 MHz, sub-millisecond in all realistic cases. Spawn is rare.
-;
-;   Returns FIRST FREE PAGE (lowest byte). Deterministic across boots.
+;   Contract unchanged, so sys_spawn, _SpawnShell and sys_exec's existing
+;   call sites need no edit.  Tail call: _AllocPageRun's RET returns to OUR
+;   caller.
 ; ============================================================================
 _AllocPage:
-                PUSH    D1, XY3
-                PUSH    D2, XY3
-
-                ; D2 = runtime user-page ceiling (set by _InitMemConfig)
-                ; Digital: $1F (30 pages)  EMU: $41 (64 pages)
-                LOADZ   D2, [#KOS_USER_PAGE_END]
-                LOW     D2
-                ADD     D2, #1                  ; one past last valid
-
-                LOADI   D1, #USER_PAGE_BASE     ; start at $02
-
-.try_next:
-                MOVE    D0, D1                  ; candidate page in D0
-                CALL24  _PageInUse
-                BCC.S     .found                  ; C=0 ⇒ free
-
-                ; Owned; try next page
-                ADD     D1, #1
-                CMP     D1, D2                  ; vs runtime ceiling+1
-                BLO     .try_next
-
-                ; Exhausted
-                LOADI   D0, #0
-                SEC
-                BRA.S     .done
-
-.found:
-                MOVE    D0, D1                  ; D0 = free page byte
-                CLC
-
-.done:
-                POP     D2, XY3
-                POP     D1, XY3
-                RET
+                LOADI   D0, #1
+                JMP24   _AllocPageRun
 
 ; ============================================================================
 ; _AddToRunQueue — insert TCB into round-robin ready queue
@@ -555,9 +688,13 @@ _ReapDeadTask:
                 ;   3. Else walk forward to find predecessor; splice out;
                 ;      retarget FOREGROUND_TCB / FIRST_SHELL_TID if needed.
                 ;   4. _kfree the back-buffer (~2400 bytes/shell).
-                ;   5. Clear TF_HAS_BACKBUF and TCB_SHELL_NEXT on victim.
+                ;   5. Clear TF_HAS_BACKBUF / TF_GRAPHICS and TCB_SHELL_NEXT.
+                ; Part 49: a graphics task (TF_GRAPHICS, no back-buffer) is also
+                ; a ring member, so the unlink must fire for it too. The
+                ; back-buffer free below is guarded by a zero-offset skip, so a
+                ; graphics task (TCB_BACKBUF_OFFS = 0) frees nothing.
                 LOADD   D0, [XY1+#TCB_FLAGS]
-                AND     D0, #TF_HAS_BACKBUF
+                AND     D0, #TF_FOCUSABLE
                 BEQ     .rdt_not_shell
 
                 ; -- D1 := victim TID (referenced repeatedly below) -----------
@@ -570,15 +707,28 @@ _ReapDeadTask:
                 ; through the shell-unlink block.
                 LOADI   D3, #TCB_SHELL_NEXT
 
-                ; -- Special case: lone shell (next == self)? ----------------
+                ; -- Lone shell vs multi-shell vs corrupt link ---------------
                 LOADD   D0, [XY1+D3]
+                ; Part 50: a lone shell carries next = 0 (the live convention
+                ; _SwitchForegroundNext honours) or next = self. Both mean
+                ; "last shell out" -> clear globals, skip the walk. Any other
+                ; sub-pool value (< USER_TCB_BASE, e.g. a stray $00FF) is a
+                ; corrupt link: never walk it or it faults on the page-$00
+                ; vector table. CMP: C=1 when D0 >= base; BLO = C=0 = below.
+                CMP     D0, #0
+                BEQ     .rdt_lone
+                CMP     D0, #USER_TCB_BASE
+                BLO     .rdt_free_backbuf
                 CMP     D0, X1
                 BNE     .rdt_multi_shell
 
+.rdt_lone:
                 ; Lone shell — last one out. Clear global anchors.
                 LOADI   D0, #0
                 STOREZ  D0, [#FOREGROUND_TCB]
                 STOREZ  D0, [#FIRST_SHELL_TID]
+                ; Drop any keyboard-waiter registration (Part 48).
+                CALL24  _KbdReleaseWaiter
                 BRA     .rdt_free_backbuf
 
 .rdt_multi_shell:
@@ -625,6 +775,10 @@ _ReapDeadTask:
                 LOADD   D0, [XY0+#TCB_ID]
                 STOREZ  D0, [#FOREGROUND_TCB]
 
+                ; Hand off the keyboard to the successor foreground; clears
+                ; the exiting shell's stale registration (Part 48).
+                CALL24  _KbdReleaseWaiter
+
                 ; Repaint terminal from new foreground's back-buffer.
                 ; _RepaintFromBackbuf wants XY1 = new fg TCB. Save victim's
                 ; X1 across the call (the downstream code -- back-buffer
@@ -669,7 +823,7 @@ _ReapDeadTask:
                 CALL24  _kfree                      ; clobbers D0 only
 .rdt_skip_kfree:
 
-                ; -- Clear shell-related TCB fields on victim ----------------
+                ; -- Clear shell/graphics TCB fields on victim ---------------
                 LOADI   D0, #0
                 LOADI   D3, #TCB_SHELL_NEXT
                 STORED  D0, [XY1+D3]
@@ -677,10 +831,12 @@ _ReapDeadTask:
                 STORED  D0, [XY1+D3]
                 LOADI   D3, #TCB_BACKBUF_PAGE
                 STORED  D0, [XY1+D3]
-                ; Clear TF_HAS_BACKBUF bit (~$0008 & $FFFF = $FFF7).
-                ; TCB_FLAGS at $1C IS within imm5 — use mode-11 directly.
+                LOADI   D3, #TCB_GFX_MODE           ; Part 49 — graphics task mode
+                STORED  D0, [XY1+D3]
+                ; Clear TF_HAS_BACKBUF + TF_GRAPHICS bits (~$0018 & $FFFF = $FFE7).
+                ; TCB_FLAGS at $12 IS within imm5 — use mode-11 directly.
                 LOADD   D0, [XY1+#TCB_FLAGS]
-                AND     D0, #$FFF7
+                AND     D0, #$FFE7
                 STORED  D0, [XY1+#TCB_FLAGS]
 
 .rdt_not_shell:
@@ -830,12 +986,25 @@ _BuildTask:
                 LOADZ   D0, [#BT_PRIMARY]
                 STORED  D0, [XY1+#TCB_SAVED_Y]
 
-                ; Page count
+                ; Page count.  Part 60: BT_PCOUNT is page-$00 scratch that
+                ; survives between spawns.  Before multi-page runs, a path
+                ; that forgot to stage it inherited "1" and was harmless.
+                ; Now it would inherit the PREVIOUS task's count and claim
+                ; pages this task does not own - two tasks writing one page,
+                ; with nothing to fault.  So clamp 0 to 1, then CONSUME the
+                ; slot, making the guarantee structural rather than a rule
+                ; every future spawn path has to remember.
                 LOADZ   D0, [#BT_PCOUNT]
+                CMP     D0, #0                  ; LOADZ is flag-transparent
+                BNE.S   .bt_pc_ok
+                LOADI   D0, #1                  ; unstaged => single page
+.bt_pc_ok:
                 STORED  D0, [XY1+#TCB_PAGE_COUNT]
 
-                ; Priority, quantum, flags = 0
+                ; Priority, quantum, flags = 0 - and consume BT_PCOUNT with
+                ; the same zero, so the next spawn cannot inherit this one.
                 LOADI   D0, #0
+                STOREZ  D0, [#BT_PCOUNT]
                 STORED  D0, [XY1+#TCB_PRIORITY]
                 STORED  D0, [XY1+#TCB_QUANTUM]
                 STORED  D0, [XY1+#TCB_FLAGS]
@@ -865,8 +1034,7 @@ _BuildTask:
                 LOADI   Y2, #$00
                 LOADI   D2, #48                 ; word count ($60 bytes / 2)
 .zero_rsvd:
-                STORED  D0, [XY2]
-                ADD     X2, #2
+                STORED  D0, [XY2]+
                 SUB     D2, #1
                 BNE     .zero_rsvd
 
@@ -955,8 +1123,7 @@ _BuildTask:
                 LOADI   D0, #0
                 LOADI   X2, #$FFDC
 .zero:
-                STORED  D0, [XY2]
-                ADD     X2, #2
+                STORED  D0, [XY2]+
                 CMP     X2, #$FFF0
                 BLO     .zero
 

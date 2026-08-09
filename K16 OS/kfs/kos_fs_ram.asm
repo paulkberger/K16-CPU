@@ -130,10 +130,8 @@ _BlockReadRAM:
                 LOADI   D2, #256                ; word counter
 
 .read_loop:
-                LOADD   D0, [XY1]               ; 2 cyc
-                STORED  D0, [XY0]               ; 2 cyc
-                ADD     X1, #2                  ; 3 cyc — never crosses page
-                ADD     X0, #2                  ; 3 cyc
+                LOADD   D0, [XY1]+              ; 2 cyc
+                STORED  D0, [XY0]+              ; 2 cyc
                 SUB     D2, #1                  ; 3 cyc — sets Z for branch
                 BNE     .read_loop              ; 3 cyc taken / 4 fall-through
 
@@ -160,10 +158,8 @@ _BlockWriteRAM:
                 LOADI   D2, #256
 
 .write_loop:
-                LOADD   D0, [XY0]
-                STORED  D0, [XY1]
-                ADD     X0, #2
-                ADD     X1, #2
+                LOADD   D0, [XY0]+
+                STORED  D0, [XY1]+
                 SUB     D2, #1
                 BNE     .write_loop
 

@@ -6,7 +6,7 @@ interface
 
 uses
   SysUtils, StrUtils,
-  K16_Parser, K16_Encoder_Base;
+  K16_Parser, K16_Encoder_Base, K16_Encoder_Stream;
 
 type
   TK16StoreEncoder = class(TK16EncoderBase, IK16Encoder)
@@ -270,6 +270,22 @@ begin
   Result.HasImmediate := False;
   Result.Immediate := 0;
   Result.CanonicalMnemonic := ResolvedMnemonic;
+
+  // =========================================================================
+  // POST-INCREMENT STREAM FORM -> opcode $02 (delegate to stateless encoder)
+  //   STORED Dn,[XYn]+ [, #stride]  /  STOREB Dn,[XYn]+ [, #stride]
+  // =========================================================================
+  if (SameText(ResolvedMnemonic, 'STORED') or SameText(ResolvedMnemonic, 'STOREB'))
+     and (Length(Instr.Operands) >= 2) then
+  begin
+    TempMemRef := TMemoryRef.Parse(Instr.Operands[1]);
+    if TempMemRef.PostIncrement then
+    begin
+      Result := EncodeStream(Instr, False, SameText(ResolvedMnemonic, 'STOREB'),
+                             SymbolResolver, ErrorReporter, WarningReporter);
+      Exit;
+    end;
+  end;
 
   // =========================================================================
   // STOREXY HANDLING - Mode 10: Store XY pair to [XY]

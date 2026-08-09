@@ -125,6 +125,11 @@
 FS_BYTES_PER_SECTOR     .EQU    512             ; one block / one sector
 FS_DIR_ENTRY_SIZE       .EQU    32              ; bytes per FAT16 dir entry
 FS_DIR_ENTRIES_PER_SECTOR .EQU  16              ; 512 / 32
+; DIRENT_INFO is the sanitised struct sys_dirent returns — DISTINCT from the
+; raw FAT entry above. Part 45 grows it 32 -> 64 (8.3 fields frozen at $00..$1F,
+; long name appended at $20). Forward-declared here; the zeroing loop in
+; _FatEntryToInfo and the kosh ls buffer flip to this in lockstep (Phase 45.2).
+DIRENT_INFO_SIZE        .EQU    64              ; bytes in the sys_dirent struct
 FS_FAT_BYTES_PER_ENTRY  .EQU    2               ; FAT16: 16 bits per cluster
 FS_FAT_ENTRIES_PER_SECTOR .EQU  256             ; 512 / 2
 
@@ -204,7 +209,15 @@ DIR_ATTR_SYSTEM         .EQU    $04
 DIR_ATTR_VOLUME_LABEL   .EQU    $08
 DIR_ATTR_DIRECTORY      .EQU    $10
 DIR_ATTR_ARCHIVE        .EQU    $20
-DIR_ATTR_LFN            .EQU    $0F             ; long-filename sentinel; skip in P16
+DIR_ATTR_LFN            .EQU    $0F             ; long-filename sentinel (= RO|HID|SYS|VOL)
+
+; --- VFAT long-filename support (Part 45) -----------------------------------
+; LFN fragments are attr-$0F entries chained physically ahead of the short
+; entry, highest sequence first. See kOS_LFN_Spec for the wire format.
+LFN_LAST_FLAG           .EQU    $40             ; sequence byte: last logical entry
+LFN_SEQ_MASK            .EQU    $1F             ; sequence byte: ordinal bits (1..N)
+LFN_MAX                 .EQU    31              ; max usable long-name chars (+ nul)
+LFN_CHARS_PER_ENT       .EQU    13              ; 5 + 6 + 2 UTF-16LE chars per fragment
 
 ; Composite mask: skip-in-iteration if any of these bits set
 DIR_ATTR_SKIP_MASK      .EQU    $08             ; volume label only (LFN tested via ==$0F)
@@ -235,17 +248,26 @@ FOPEN_EXCL              .EQU    $0020           ; bit 5 — reserved
 ; FAT cache follows at $03E0..$03EF.
 ; Sem pool follows at $0400..$047F (see kos_sem.asm).
 ;-----------------------------------------------------------------------------
-VOL_TABLE_BASE          .EQU    $0260           ; first byte of volume table
-VOL_SLOT_SIZE           .EQU    64              ; bytes per slot
+VOL_SLOT_SIZE           .EQU    64              ; bytes per slot (value)
 
-; Slot bases (VOL_TABLE_BASE + drive * VOL_SLOT_SIZE)
-VOL_SLOT_A              .EQU    $0260
-VOL_SLOT_B              .EQU    $02A0
-VOL_SLOT_C              .EQU    $02E0
-VOL_SLOT_D              .EQU    $0320
-VOL_SLOT_E              .EQU    $0360
-VOL_SLOT_F              .EQU    $03A0
-VOL_TABLE_END           .EQU    $03E0           ; one past last byte
+; Six 64-byte volume slots (base + drive * VOL_SLOT_SIZE). Slot bases are
+; region fields; the VS_* field offsets stay .EQU (0-based, used as
+; SLOT + offset). Region gives collision + overlap (incl. cross-file vs the
+; heap scratch that historically collided here - Gotcha 4.43).
+; --- Address space (.SPACE): this file's regions are 'kernel'-owned ---
+.SPACE kernel
+
+VOLTABLE                .REGION $0260
+  VOL_SLOT_A              .RS VOL_SLOT_SIZE   ; $0260  drive A
+  VOL_SLOT_B              .RS VOL_SLOT_SIZE   ; $02A0  drive B
+  VOL_SLOT_C              .RS VOL_SLOT_SIZE   ; $02E0  drive C
+  VOL_SLOT_D              .RS VOL_SLOT_SIZE   ; $0320  drive D
+  VOL_SLOT_E              .RS VOL_SLOT_SIZE   ; $0360  drive E
+  VOL_SLOT_F              .RS VOL_SLOT_SIZE   ; $03A0  drive F
+                .ENDREGION  ; VOLTABLE_END=$03E0  VOLTABLE_SIZE=$180
+
+VOL_TABLE_BASE          .EQU    VOLTABLE_START  ; $0260 (compat; == VOL_SLOT_A)
+VOL_TABLE_END           .EQU    VOLTABLE_END    ; $03E0 (compat; one past last)
 
 ; Volume-slot field offsets (relative to slot base)
 VOL_PRESENT             .EQU    $00             ; byte — 1 = mounted, 0 = empty
@@ -264,20 +286,29 @@ VOL_BLOCKREAD_PTR       .EQU    $1A             ; long — _BlockRead handler (2
 VOL_BLOCKWRITE_PTR      .EQU    $1E             ; long — _BlockWrite handler (0 if r/o)
 VOL_LABEL               .EQU    $22             ; 11 B — cached volume label
 VOL_RESERVED_2          .EQU    $2D             ; 3 B  (reserved)
-VOL_RESERVED_3          .EQU    $30             ; 16 B (reserved/scratch)
+VOL_FREE_CLUSTERS       .EQU    $30             ; word — cached free count (live only when VOL_FREE_VALID<>0)
+VOL_FREE_VALID          .EQU    $32             ; word — 0=stale/unknown, 1=cache live (low byte; word for mode-01 access)
+VOL_RESERVED_3          .EQU    $34             ; 12 B (reserved/scratch)
 
 ;-----------------------------------------------------------------------------
 ; Per-task file descriptor table — task page-zero
 ;-----------------------------------------------------------------------------
-; FD_TABLE lives at $000C..$006B in each task's page-zero. 8 fds × 12 bytes.
+; FD_TABLE lives at $000C..$007B in each task's page-zero. 8 fds × 14 bytes.
 ; Fields are private to each task.
+; Part 44 (16 June 2026): slot grew 12 -> 14 bytes. Added FD_DIR_CLUSTER so
+; close-time _FdFlushDirent can re-establish DIR_WALK_CLU and convert the
+; dirent cookie's sec_off -> absolute sector via _DirSecToAbs (the cookie is
+; directory-relative; the old VOL_ROOT_START+sec_off was root-only and wrote
+; a subdir file's size/first-cluster to the wrong sector). Task page is clear
+; from $006C upward (kosh task slots start $6000; the $006C-range VEC_* are
+; kernel-page, a different page), so the table may grow to $007C safely.
 ;-----------------------------------------------------------------------------
 FD_TABLE                .EQU    $000C           ; first byte of fd table (task pageZ)
 FD_COUNT                .EQU    8               ; max open files per task
-FD_ENTRY_SIZE           .EQU    12              ; bytes per fd entry
-FD_TABLE_END            .EQU    $006C           ; one past last byte
+FD_ENTRY_SIZE           .EQU    14              ; bytes per fd entry (Part 44: was 12)
+FD_TABLE_END            .EQU    $007C           ; one past last byte (Part 44: was $006C)
 
-; FD entry field offsets (relative to FD_TABLE + fd*12)
+; FD entry field offsets (relative to FD_TABLE + fd*FD_ENTRY_SIZE)
 FD_FLAGS                .EQU    $00             ; byte
 FD_DRIVE                .EQU    $01             ; byte (0..2)
 FD_FIRST_CLUSTER        .EQU    $02             ; word
@@ -285,7 +316,11 @@ FD_CURR_CLUSTER         .EQU    $04             ; word — cached for sequential
 FD_RESERVED             .EQU    $06             ; word
 FD_DIR_COOKIE           .EQU    $06             ; word (Piece 5 alias for FD_RESERVED;
                                                 ;       caches dirent cookie for close-time flush)
-FD_POSITION             .EQU    $08             ; long — current byte offset
+FD_POSITION             .EQU    $08             ; long — current byte offset (ends $0B)
+FD_DIR_CLUSTER          .EQU    $0C             ; word (Part 44) — cluster of the directory
+                                                ;       holding this file's dirent (0 = root).
+                                                ;       Restores DIR_WALK_CLU at flush time so
+                                                ;       the cookie resolves in the right dir.
 
 ; FD_FLAGS bits
 FD_FLAG_OPEN            .EQU    $01             ; entry is in use
@@ -367,10 +402,12 @@ SECTORS_PER_PAGE          .EQU 128
 ; The kernel stack region begins at $C000 and grows down from $FFFE, so
 ; these buffers are safely separated from stack growth.
 ;-----------------------------------------------------------------------------
-FS_BUF_SECTOR             .EQU $BC00
-FS_BUF_SECTOR_END         .EQU $BE00             ; one past last byte
-FS_BUF_FAT                .EQU $BE00
-FS_BUF_FAT_END            .EQU $C000
+FSBUFS                    .REGION $BC00
+  FS_BUF_SECTOR             .RS 256w  ; $BC00 512 B sector buffer
+  FS_BUF_FAT                .RS 256w  ; $BE00 512 B FAT sector cache
+                .ENDREGION  ; FSBUFS_END=$C000  FSBUFS_SIZE=$400
+FS_BUF_SECTOR_END         .EQU FS_BUF_FAT   ; $BE00 (compat; == FS_BUF_FAT)
+FS_BUF_FAT_END            .EQU FSBUFS_END   ; $C000 (compat; kernel stack base)
 
 ;-----------------------------------------------------------------------------
 ; FAT cache state — page $00
@@ -386,9 +423,10 @@ FS_BUF_FAT_END            .EQU $C000
 ;   FAT_CACHE_DRIVE  : byte — drive index (0..2) the cache holds.
 ;                             A different drive forces a flush + reload.
 ;-----------------------------------------------------------------------------
-FAT_CACHE_SECTOR          .EQU $03E0             ; word
-FAT_CACHE_DIRTY           .EQU $03E2             ; byte
-FAT_CACHE_DRIVE           .EQU $03E3             ; byte
+FSCACHE                   .REGION $03E0
+FAT_CACHE_SECTOR          .RS 1w                ; $03E0 word - cached sector # ($FFFF=none)
+FAT_CACHE_DIRTY           .RS 1                 ; $03E2 byte - flush needed
+FAT_CACHE_DRIVE           .RS 1                 ; $03E3 byte - drive index
 
 ; --- Dir cache (Part 22) ----------------------------------------------------
 ; Tracks what's currently in FS_BUF_SECTOR for root-directory reads. _DirNextRaw
@@ -405,18 +443,28 @@ FAT_CACHE_DRIVE           .EQU $03E3             ; byte
 ; writes through FS_BUF_SECTOR. Modifying writes (_DirInsert, _DirDelete) read
 ; the sector themselves and write back via _VolBlockWrite, then explicitly
 ; invalidate the cache.
-DIR_CACHE_SECTOR          .EQU $03E4             ; word — root sector # (or $FFFF)
-DIR_CACHE_DRIVE           .EQU $03E6             ; byte — drive index
-DIR_CACHE_PAD             .EQU $03E7             ; pad (1 byte)
+DIR_CACHE_SECTOR          .RS 1w                ; $03E4 word - root sector # (or $FFFF)
+DIR_CACHE_DRIVE           .RS 1                 ; $03E6 byte - drive index
+DIR_CACHE_PAD             .RS 1                 ; $03E7 pad (1 byte)
 
 ; --- Dirent iteration cache (Part 22) ---------------------------------------
 ; Used by sys_dirent. See kos_fs_fd.asm for full design notes.
 ;
 ; TODO Phase 4+: relocate to per-task TCB state when multi-task lands.
-DIRENT_LAST_COOKIE        .EQU $03E8             ; word — $FFFF = empty
-DIRENT_LAST_INDEX         .EQU $03EA             ; word
-DIRENT_LAST_DRIVE         .EQU $03EC             ; byte
-FAT_CACHE_RESERVED        .EQU $03ED             ; 3 B reserved (ends $03EF)
+DIRENT_LAST_COOKIE        .RS 1w                ; $03E8 word - $FFFF = empty
+DIRENT_LAST_INDEX         .RS 1w                ; $03EA word
+DIRENT_LAST_DRIVE         .RS 1                 ; $03EC byte
+
+; --- Subdir iteration start cluster (cluster-aware dir walk) ----------------
+; Set by the caller before _DirOpen/_DirNext/_DirNextRaw/_DirLookup; read once
+; per directory-sector resolve. 0 = root region (back-compat default — the
+; root-only callers never touch it, and _InitFS clears it to 0). Same
+; serialisation assumption as DIR_CACHE_* / DIRENT_LAST_* : kernel FS critical
+; section only. Carved from the former FAT_CACHE_RESERVED 3-byte tail; $03ED
+; is a 1-byte pad to keep the word at the even address $03EE.
+DIR_WALK_PAD              .RS 1                 ; $03ED pad (odd address)
+DIR_WALK_CLU              .RS 1w                ; $03EE word - dir start cluster; 0 = root
+                          .ENDREGION  ; FSCACHE_END=$03F0  FSCACHE_SIZE=$10
 
 ; Range $03F0..$03FF page-$00 allocation:
 ;   $03F0..$03F3   HEAP_TID_QUERY / HEAP_RBT_REGION   (kos_defs.inc, Part 33)
@@ -432,9 +480,11 @@ FAT_CACHE_RESERVED        .EQU $03ED             ; 3 B reserved (ends $03EF)
 ; clobbers D0/D1/D2/X0/X1) without losing its cluster# / running count.
 ; DISKFREE_LIMIT caches the loop's upper bound (first invalid cluster #)
 ; so we don't reload+ADD VOL_TOTAL_CLUSTERS every iteration.
-DISKFREE_CLUSTER          .EQU $03F4             ; word — current cluster #
-DISKFREE_COUNT            .EQU $03F6             ; word — running free count
-DISKFREE_LIMIT            .EQU $03F8             ; word — first invalid cluster # (cached)
+DISKFREE                  .REGION $03F4
+DISKFREE_CLUSTER          .RS 1w                ; $03F4 word - current cluster #
+DISKFREE_COUNT            .RS 1w                ; $03F6 word - running free count
+DISKFREE_LIMIT            .RS 1w                ; $03F8 word - first invalid cluster # (cached)
+                          .ENDREGION  ; DISKFREE_END=$03FA  DISKFREE_SIZE=$06
 
 ; ============================================================================
 ; FS Scratch slots — relocated from `.asm` source files into the defs file
@@ -457,23 +507,28 @@ DISKFREE_LIMIT            .EQU $03F8             ; word — first invalid cluste
 ; The new range $0480..$04D6 sits in the gap between the sem pool
 ; ($0400..$047F) and the start of the TCB pool ($0800). Part 25 added
 ; FD_NAMEBUF2 ($04CC..$04D6) — extended the upper bound from $04CB.
-FD_OPEN_FLAGS    .EQU $0480   ; word
-FD_DRIVE_TMP     .EQU $0482   ; byte
-FD_RESULT_TMP    .EQU $0483   ; byte (fd, cross-call)
-FD_COOKIE_TMP    .EQU $0484   ; word
-FD_DIR_FIRST_CL  .EQU $0486   ; word
-FD_DIR_SIZE_LO   .EQU $0488   ; word
-FD_DIR_SIZE_HI   .EQU $048A   ; word
-FD_COUNT_TMP     .EQU $048C   ; word
-FD_BYTES_DONE    .EQU $048E   ; word
-FD_USERBUF_X     .EQU $0490   ; word
-FD_USERBUF_Y     .EQU $0492   ; byte
-FD_CHUNK_TMP     .EQU $0494   ; word
-FD_INDEX_TMP     .EQU $0496   ; word
-FD_PD_ABS_SEC    .EQU $0498   ; word
+FDSCRATCH        .REGION $0480
+FD_OPEN_FLAGS    .RS 1w    ; $0480 word
+FD_DRIVE_TMP     .RS 1     ; $0482 byte (packed)
+FD_RESULT_TMP    .RS 1     ; $0483 byte (fd, cross-call)
+FD_COOKIE_TMP    .RS 1w    ; $0484 word
+FD_DIR_FIRST_CL  .RS 1w    ; $0486 word
+FD_DIR_SIZE_LO   .RS 1w    ; $0488 word
+FD_DIR_SIZE_HI   .RS 1w    ; $048A word
+FD_COUNT_TMP     .RS 1w    ; $048C word
+FD_BYTES_DONE    .RS 1w    ; $048E word
+FD_USERBUF_X     .RS 1w    ; $0490 word
+FD_USERBUF_Y     .RS 1w    ; $0492 word slot (low byte used)
+FD_CHUNK_TMP     .RS 1w    ; $0494 word
+FD_INDEX_TMP     .RS 1w    ; $0496 word
+FD_PD_ABS_SEC    .RS 1w    ; $0498 word
+FD_PARENT_CL     .RS 1w    ; $049A word (Part 44) - parent dir cluster from the
+                              ;   resolver, carried sys_open -> _PopulateFd ->
+                              ;   FD_DIR_CLUSTER. (was-free $049A..$049F gap.)
 
 ; 11-byte FAT-format name buffer (output of _ParsePath).
-FD_NAMEBUF       .EQU $04A0   ; 11 bytes; ends $04AA
+FD_PARENT_PAD    .RS 2w    ; $049C 4-byte was-free gap
+FD_NAMEBUF       .RS 6w    ; $04A0 12 bytes (11-char FAT name + align)
 
 ; Alignment pad: FD_NAMEBUF ends at odd $04AA; $04AB unused.
 ; FD_DIRENT_RAW must be even-aligned because _FatEntryToInfo reads
@@ -483,17 +538,18 @@ FD_NAMEBUF       .EQU $04A0   ; 11 bytes; ends $04AA
 ; return garbage on Digital — surfaced as "BIG" file sizes in `ls`.
 
 ; 32-byte raw FAT directory-entry scratch (target of _DirNext in sys_dirent).
-FD_DIRENT_RAW    .EQU $04AC   ; 32 bytes; ends $04CB
+FD_DIRENT_RAW    .RS 16w   ; $04AC 32 bytes
 
 ; Part 25 — second 11-byte FAT-format name buffer for sys_rename.
 ; Holds the new name while we still need FD_NAMEBUF for the old name's
 ; _DirLookup. Same buffer also serves as scratch for sys_unlink's
 ; first-cluster save (only 2 bytes used in that case).
-FD_NAMEBUF2      .EQU $04CC   ; 11 bytes; ends $04D6
+FD_NAMEBUF2      .RS 6w    ; $04CC 12 bytes (11-char FAT name + align)
                               ; (also: low word holds first_cluster
                               ;  during sys_unlink's chain-free step)
 
-FD_SCRATCH_END   .EQU $04D7   ; one past last byte (Part 36 marker)
+                 .ENDREGION  ; FDSCRATCH_END=$04D8  FDSCRATCH_SIZE=$58
+FD_SCRATCH_END   .EQU FDSCRATCH_END  ; $04D8 (compat marker; unused in code)
 
 ; --- FE_* scratch (Part 22 / relocated Part 36 — sys_exec) -------------------
 ; Page-$00 scratch used by Piece 6 sys_exec. Lives at $04D8..$04E3.
@@ -511,20 +567,158 @@ FD_SCRATCH_END   .EQU $04D7   ; one past last byte (Part 36 marker)
 ;
 ; The new range $04D8..$04E3 sits immediately after FD scratch ($04D7),
 ; well clear of the volume table. Even-aligned for word stores.
-FE_NEW_PAGE      .EQU $04D8   ; byte — allocated user page
+FESCRATCH        .REGION $04D8
+FE_NEW_PAGE      .RS 1w    ; $04D8 word slot (low byte = allocated user page)
                               ; $04D9 — pad (preserves even alignment of next word)
-FE_FLAGS         .EQU $04DA   ; word — sys_exec input flags
-FE_DEST_OFF      .EQU $04DC   ; word — current copy destination offset
-FE_BYTES_LEFT    .EQU $04DE   ; word — bytes still to copy
-FE_CURR_CL       .EQU $04E0   ; word — cluster currently being copied
-FE_CHUNK_TMP     .EQU $04E2   ; word — chunk size scratch
+FE_FLAGS         .RS 1w    ; $04DA word - sys_exec input flags
+FE_DEST_OFF      .RS 1w    ; $04DC word - current copy destination offset
+FE_BYTES_LEFT    .RS 1w    ; $04DE word - bytes still to copy
+FE_CURR_CL       .RS 1w    ; $04E0 word - cluster currently being copied
+FE_CHUNK_TMP     .RS 1w    ; $04E2 word - chunk size scratch
 
-FE_SCRATCH_END   .EQU $04E4   ; one past last byte (Part 36 marker)
+                 .ENDREGION  ; FESCRATCH_END=$04E4  FESCRATCH_SIZE=$0C
+FE_SCRATCH_END   .EQU FESCRATCH_END  ; $04E4 (compat marker)
+
+; --- Path resolver scratch (Phase 1 path resolution) ------------------------
+; Used by _Resolve / _ResolveParent / _BuildPath / _ScanForCluster and the
+; sys_resolve / sys_pwd / sys_mkdir(option-b) syscalls. Kernel page-$00,
+; sits above the FE block in the previously-free $04E4..$07FF region.
+; Not reentrant — resolver runs inside a single DINT'd syscall.
+RVSCRATCH        .REGION $04E4
+RV_PATH_X        .RS 1w    ; $04E4 word - user-page path pointer, X (offset)
+RV_PATH_Y        .RS 1     ; byte - user-page path pointer, Y (page)
+RV_DRIVE         .RS 1     ; byte - working drive index
+RV_CLU           .RS 1w    ; word - working directory cluster (0 = root)
+RV_ATTR          .RS 1w    ; word - attr of the current cluster's entry
+RV_MODE          .RS 1w    ; word - 0 = full, 1 = parent (leaf -> RV_FATNAME)
+RV_COMP          .RS 16w   ; 32 B - one extracted path component (ASCIIZ)   (ends $050D)
+RV_FATNAME       .RS 6w    ; 12 B - component as 11-byte FAT name (+pad)
+RV_SAVE_DRIVE    .RS 1     ; byte - caller drive saved across subcalls
+RV_SAVE_PAD      .RS 1     ; pad
+; pwd reconstruction:
+RV_CHAIN         .RS 16w   ; 32 B - up to 16 ancestor clusters (words)
+RV_CHAIN_DEPTH   .RS 1w    ; word - number of clusters collected
+RV_TARGET        .RS 1w    ; word - cluster being name-searched
+RV_PWD_X         .RS 1w    ; word - pwd dest pointer X
+RV_PWD_Y         .RS 1     ; byte - pwd dest pointer Y
+RV_PWD_PAD       .RS 1     ; pad
+RV_PWD_FIRST     .EQU RV_PWD_PAD  ; $0543 alias - byte - _BuildPath: 0 until a path component is emitted
+RV_NAMEBUF       .RS 7w    ; 14 B - a recovered 8.3 name (ASCIIZ, +pad)
+RV_DIRENT_RAW    .RS 16w   ; 32 B - _DirNextRaw dest for _ScanForCluster
+MKD_PARENT_CL    .RS 1w    ; word - sys_mkdir parent cluster (own slot)
+DIRENT_LAST_CLU  .RS 1w    ; word - dirent iteration cache: last start cluster
+                 .ENDREGION  ; RVSCRATCH_END=$0576  RVSCRATCH_SIZE=$92
+RV_SCRATCH_END   .EQU RVSCRATCH_END  ; $0576 (compat; unused in code)
+
+; --- sys_rename scratch (Part 44) -------------------------------------------
+; _RenameFile resolves BOTH path parents and must hold the shared CWD context
+; across the two _ResolveParent calls (which clobber D0/D1/D2), plus the
+; old-path's parent cluster to compare against the new-path's parent (rename
+; is an in-place name overwrite, so both must live in the same directory).
+RNMSCRATCH       .REGION $0576
+RNM_CWD_CLU      .RS 1w    ; $0576 word - CWD start cluster (both resolves)
+RNM_CWD_DRV      .RS 1w    ; $0578 word - CWD start drive index (both resolves)
+RNM_PARENT_CL    .RS 1w    ; $057A word - old-path parent cluster (compare vs new)
+                 .ENDREGION  ; RNMSCRATCH_END=$057C  RNMSCRATCH_SIZE=$06
+RNM_SCRATCH_END  .EQU RNMSCRATCH_END  ; $057C (compat)
+
+; --- VFAT long-filename scratch (Part 45) -----------------------------------
+; FS-critical-section serialised, same single-task assumption as DIR_CACHE_* /
+; DIRENT_LAST_*. Read side: LFN_ASM/LEN/EXP_* assemble + validate a long name
+; during a directory walk. Write side: LFN_SHORT stages the generated 8.3 name,
+; LFN_FRAG formats one on-disk fragment before the sector RMW.
+LFNSCRATCH       .REGION $057C
+LFN_ASM          .RS 16w   ; $057C 32 B - long-name assembly buffer
+LFN_ASM_LEN      .RS 1w    ; $059C word - assembled length; 0 = none this run
+LFN_EXP_SEQ      .RS 1w    ; $059E word - expected next sequence ordinal
+LFN_EXP_SUM      .RS 1w    ; $05A0 word - checksum captured from fragments
+LFN_SHORT        .RS 6w    ; $05A2 12 B slot - generated 8.3 short name (11 + align)
+;                  $059D pad  (odd-align filler)
+LFN_FRAG         .RS 16w   ; $05AE 32 B - one on-disk fragment formatted
+                 .ENDREGION  ; LFNSCRATCH_END=$05CE  LFNSCRATCH_SIZE=$52
+LFN_SCRATCH_END  .EQU LFNSCRATCH_END  ; $05CE (compat)
+
+; --- Short-name generator scratch (Phase 45.5) ------------------------------
+; _GenShortName / _GenShortDerive / _GenShortTilde overlay the fragment buffer:
+; the short name is fully generated (into LFN_SHORT) BEFORE _DirCreate formats
+; any on-disk fragment, so LFN_FRAG is free during generation. GENSN_SRC holds
+; the derived lossy 8.3 (base+ext) that the ~N loop re-tilde's each iteration;
+; GENSN_DRV stashes the drive across derive/tilde (both clobber D3).
+GENSN_SRC        .EQU LFN_FRAG+0   ; 11 B derived base+ext (FAT fmt)      ($05AE)
+GENSN_LOSSY      .EQU LFN_FRAG+11  ; byte  derive-local lossy flag        ($05B9)
+GENSN_LASTDOT    .EQU LFN_FRAG+12  ; word  ext-separator offset / $FFFF   ($05BA)
+GENSN_LEN        .EQU LFN_FRAG+14  ; word  stripped source length         ($05BC)
+TILDE_DIG        .EQU LFN_FRAG+16  ; 3 B   decimal digits of N            ($05BE)
+GENSN_DRV        .EQU LFN_FRAG+20  ; byte  drive stash across derive/tilde ($05C2)
+
+; --- Named-volume / assign table (named drives v2) --------------------------
+; Unified assign table: 32 entries x 16 B, kernel page-$00 ($05CE..$07CD).
+; A "named volume" (ROM:/RAM:) = entry with AS_ROOTCLU = 0 (aliases a backend
+; root). A "path-mount/assign" (FONTS:) = AS_ROOTCLU <> 0 (into a subdir).
+; Same struct, same resolution: an entry supplies (drive, start-cluster) to
+; _ResolveCore exactly as an "X:" prefix does — no sys_resolve ABI change.
+; Names >= 2 chars, UPPER; drive letters are exactly 1 char, so the two
+; namespaces never overlap. Cold path (scanned only on a NAME: prefix) ->
+; plain LOADZ/STOREZ, no LOADP plumbing.
+AS_MAX           .EQU 32      ; entries (2 locked seeds ROM:/RAM: + user assigns)
+AS_ENTRY_SIZE    .EQU 16      ; bytes per entry (AS_MAX*16 = 512 -> ends $07CE)
+ASSIGNTABLE      .REGION $05CE
+  AS_TABLE_BASE    .RS AS_MAX * AS_ENTRY_SIZE  ; $05CE  32 entries x 16 B = 512
+                 .ENDREGION  ; ASSIGNTABLE_END=$07CE  ASSIGNTABLE_SIZE=$200
+; entry fields (relative to entry base; base always even)
+AS_NAME          .EQU $00     ; 11 B ASCIIZ, UPPER (VOL_LABEL-width mirror)
+;                $0B  pad (name ends $0A)
+AS_DRVFLAGS      .EQU $0C     ; word — low byte = drive, high byte = flags
+AS_DRIVE         .EQU $0C     ; byte alias (low)  — backing drive index
+AS_FLAGS         .EQU $0D     ; byte alias (high) — see AS_FLAG_* bits
+AS_ROOTCLU       .EQU $0E     ; word — 0 = alias backend root; else mount cluster
+AS_TABLE_END     .EQU ASSIGNTABLE_END  ; $07CE (compat; one past last)
+
+; AS_FLAGS bits
+AS_FLAG_LOCKED   .EQU $01     ; system seed (ROM:/RAM:) — assign/relabel refuse
+AS_FLAG_READONLY .EQU $02     ; backing volume is read-only (cached)
+AS_FLAG_DIRTY    .EQU $04     ; backing dir was deleted/formatted -> resolve fails
+
+; assign-resolution scratch
+ASGNSCRATCH      .REGION $07CE
+AS_CAND          .RS 6w    ; $07CE 12 B - NAME: prefix candidate (ASCIIZ scan buf)
+
+; sys_assign argument stash (page-$00; survives _SlotForName's clobbers)
+ASGN_OP          .RS 1     ; $07DA byte (packed) - 0 = set, 1 = clear
+ASGN_DRV         .RS 1     ; $07DB byte (packed) - backing drive
+ASGN_FLAGS       .RS 1w    ; $07DC word slot (low byte = AS_FLAGS; $07DD pad)
+ASGN_CLU         .RS 1w    ; $07DE word - backing cluster (0 = volume alias)
+                 .ENDREGION  ; ASGNSCRATCH_END=$07E0  ASGNSCRATCH_SIZE=$12
+
+; --- sys_exec argv-tail offset (Part 15) ------------------------------------
+; One word carrying the caller-page offset of the command tail from sys_exec
+; entry (captured before helpers clobber XY1) to the post-_AllocPage stamp
+; into child:$0100. Placed at the old free-growth base $07E0 - zero drift, no
+; shift of RVSCRATCH or any prior region.
+EXARGSCRATCH     .REGION $07E0
+FE_ARGV_OFF      .RS 1w    ; $07E0 word - caller-page arg-tail offset (0 = none)
+FE_CWD_DRIVE     .RS 1w    ; $07E2 word - sys_exec inherited CWD drive (Part 16)
+FE_CWD_CLU       .RS 1w    ; $07E4 word - sys_exec inherited CWD cluster (Part 16)
+                 .ENDREGION  ; EXARGSCRATCH_END=$07E6  EXARGSCRATCH_SIZE=$06
+
+; --- .COM header staging (Part 60) ------------------------------------------
+; sys_exec must know the page count BEFORE it allocates, and allocation
+; precedes the copy - so it cannot read the header back from the loaded page.
+; It reads the image's first sector into FS_BUF_SECTOR and parses the header
+; up front (_ExecReadHeader); these two words carry the parsed values across
+; _AllocPageRun to the BT_* staging block.
+;
+; Placed at the old free-growth base $07E6 - zero drift, no shift of
+; EXARGSCRATCH or any prior region.
+COMHDRSCRATCH    .REGION $07E6
+FE_PAGES         .RS 1w    ; $07E6 word - total pages declared by the header
+FE_HEAPPG        .RS 1w    ; $07E8 word - heap pages (a partition of FE_PAGES)
+                 .ENDREGION  ; COMHDRSCRATCH_END=$07EA  COMHDRSCRATCH_SIZE=$04
 
 ; --- Next free byte in kernel page-$00 --------------------------------------
 ; Bump this when adding a new allocation block. Update the layout map in
 ; kos_defs.inc in the same commit.
-KERNEL_ZP_NEXT_FREE   .EQU $04E4
+KERNEL_ZP_NEXT_FREE   .EQU $07EA   ; assign table $05CE..$07CD, AS_CAND $07CE..$07D9, ASGN_* $07DA..$07DF, FE_ARGV_OFF $07E0..$07E1, FE_CWD_* $07E2..$07E5, FE_PAGES/FE_HEAPPG $07E6..$07E9
 KERNEL_ZP_RESERVED_END .EQU $0800  ; TCB pool starts here
 
 FAT_CACHE_INVALID         .EQU $FFFF             ; sentinel for "no sector"

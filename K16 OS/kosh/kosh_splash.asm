@@ -1,8 +1,12 @@
 ; ============================================================================
 ; kosh_splash.asm — k/OS sign-on splash, painted from kosh task context
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 40 - dynamic version/date from kernel identity slots.
+; Date:    28 June 2026
+; Status:  Part 49 - dynamic version/date from kernel identity slots.
+;
+; Revision: r9 - 28 June 2026 — Part 49: _OSSplashVer now zero-pads the minor
+;             version to two digits, so KOS_VERSION $0101 renders "v1.01"
+;             (was "1.1"). Accompanies kos_boot.asm r54 (v1.01 / Phase 49+).
 ;
 ; Revision: r8 - 29 May 2026 — Part 40: tightened the version/phase
 ;             separator from two spaces to one (splash_logo2b "  " → " ").
@@ -312,35 +316,11 @@ _OSSplash:
                 LOADI   X0, #splash_tasks_tail
                 TRAP    #TRAP_PUTS
 
-                ;-- Boot date — "Boot:     <day> <Mon> <year>" -------------
-                ; All three fields read live from page-$00 identity slots.
+                ;-- Build stamp - k/OS (kernel) build date+time -----------
                 MOVE    Y0, Y3
-                LOADI   X0, #splash_boot_lbl    ; "Boot:     "
+                LOADI   X0, #splash_built_lbl       ; "Built:    "
                 TRAP    #TRAP_PUTS
-
-                LOADZ   D0, [#KOS_BUILD_DAY]
-                LOW     D0
-                TRAP    #TRAP_PUTDEC            ; day (no leading zero)
-
-                LOADI   D0, #' '
-                TRAP    #TRAP_PUTCHAR
-
-                ; Month name: month_names + (KOS_BUILD_MONTH-1)*4 (4-byte stride).
-                LOADZ   D0, [#KOS_BUILD_MONTH]
-                LOW     D0
-                SUB     D0, #1
-                SHL     D0, #2                  ; *4
-                ADD     D0, #month_names
-                MOVE    X0, D0
-                MOVE    Y0, Y3                  ; table is in kosh page
-                TRAP    #TRAP_PUTS
-
-                LOADI   D0, #' '
-                TRAP    #TRAP_PUTCHAR
-
-                LOADZ   D0, [#KOS_BUILD_YEAR]
-                TRAP    #TRAP_PUTDEC            ; year (full value, e.g. 2026)
-
+                CALL16  _OSKernBuild                ; kernel ISO date+time (slots)
                 LOADI   D0, #$0A
                 TRAP    #TRAP_PUTCHAR
 
@@ -407,8 +387,9 @@ _OSSplashHexByte:
 ; _OSSplashVer — emit live k/OS version as "major.minor" decimal
 ;
 ; Reads KOS_VERSION ($XXYY, X=major Y=minor) from the page-$00 identity
-; slot. TRAP_PUTDEC emits the full unsigned value, so v1.10 / v10.0 etc.
-; render correctly without per-digit handling.
+; slot. Major via TRAP_PUTDEC; minor zero-padded to TWO digits (so $0101
+; renders "1.01", $0100 renders "1.00", $010A renders "1.10"). Major is
+; not padded, so v10.x / v1.x both render naturally.
 ;
 ; In:        none
 ; Out:       none (digits emitted via TRAP_PUTDEC / TRAP_PUTCHAR)
@@ -422,6 +403,13 @@ _OSSplashVer:
                 TRAP    #TRAP_PUTCHAR
                 LOADZ   D0, [#KOS_VERSION]
                 LOW     D0                      ; minor (bits 7:0)
+                CMP     D0, #10
+                BHS.S   .osv_minor              ; >= 10 → already two digits
+                PUSH    D0, XY3                 ; < 10 → emit leading zero
+                LOADI   D0, #'0'
+                TRAP    #TRAP_PUTCHAR
+                POP     D0, XY3
+.osv_minor:
                 TRAP    #TRAP_PUTDEC
                 RET
 
@@ -444,6 +432,15 @@ _OSSplashPhase:
                 LOADZ   D0, [#KOS_PHASE_TAG_PAGE] ; ROM page byte ($FF)
                 MOVE    Y0, D0
                 LOADZ   D0, [#KOS_PHASE_TAG_PTR]  ; 16-bit offset within page $FF
+                MOVE    X0, D0
+                TRAP    #TRAP_PUTS
+                RET
+
+; _OSKernBuild - emit the kernel build stamp (ISO date+time). String lives
+; in kernel ROM (page $FF); address published via KOS_BUILD_STR_PTR/PAGE.
+_OSKernBuild:   LOADZ   D0, [#KOS_BUILD_STR_PAGE] ; ROM page byte ($FF)
+                MOVE    Y0, D0
+                LOADZ   D0, [#KOS_BUILD_STR_PTR]  ; 16-bit offset within page $FF
                 MOVE    X0, D0
                 TRAP    #TRAP_PUTS
                 RET
@@ -481,8 +478,11 @@ splash_tasks_lbl:   .TEXT   "Tasks:    ", 0
 splash_tasks_mid:   .TEXT   " of ", 0
 splash_tasks_tail:  .TEXT   " user (+ 1 idle)", $0A, 0
 
-; Boot date rendered as label + live day / month-name / year (Part 40).
-splash_boot_lbl:    .TEXT   "Boot:     ", 0
+; Build stamps (ISO 8601). splash_built_lbl labels the splash "Built:" line
+; (k/OS / kernel stamp, emitted via _OSKernBuild). kosh_build_iso is kosh's
+; OWN stamp, emitted directly by the info command's Shell line.
+splash_built_lbl:      .TEXT   "Built:    ", 0
+kosh_build_iso:        .TEXT   __DATE__, " ", __TIME__, 0
 
 ; Month-name table — 12 entries at a fixed 4-byte stride ("Xxx" + NUL).
 ; Indexed by (KOS_BUILD_MONTH - 1) * 4. Each .TEXT entry is exactly 4

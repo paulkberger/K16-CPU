@@ -94,6 +94,7 @@ type
     HasRegisterOffset: Boolean;
     OffsetSymbol: string;
     HasSymbolOffset: Boolean;
+    PostIncrement: Boolean;     // True for [XYn]+  (post-increment stream form, opcode $02)
 
     class function Parse(const Token: string): TMemoryRef; static;
     function IsValid: Boolean;
@@ -599,6 +600,7 @@ begin
   Result.HasRegisterOffset := False;
   Result.OffsetSymbol := '';
   Result.HasSymbolOffset := False;
+  Result.PostIncrement := False;
 
   // Check for correct format
   if (Length(Token) < 2) or (Token[1] <> '[') then Exit;
@@ -606,6 +608,10 @@ begin
   // Find the closing bracket
   CloseBracket := Pos(']', Token);
   if CloseBracket = 0 then Exit;
+
+  // Post-increment marker: a '+' immediately after ']'  (e.g. [XY0]+)
+  Result.PostIncrement := (CloseBracket < Length(Token)) and
+                          (Token[CloseBracket + 1] = '+');
 
   // Extract content between brackets
   Inner := Trim(Copy(Token, 2, CloseBracket - 2));
@@ -947,11 +953,14 @@ begin
     Line := Trim(Copy(Line, ColonPos + 1, MaxInt));
 
     // Reserved-identifier check (pseudo-instruction spec §9):
-    // Identifiers starting with '__' (or '.__' for local labels) are
-    // reserved for assembler-generated synthetic labels.
-    if (Pos('__', Result) = 1) or (Pos('.__', Result) = 1) then
+    //   '.__...'   assembler-generated synthetic local labels (e.g. .__bhi_N)
+    //   '__NAME__' predefined build symbols (__DATE__, __YEAR__, ...)
+    // A plain global '__foo' (starts '__' but does NOT end '__') is NOT
+    // reserved: it is the Pascal RTL namespace (__copy, __puts, ...).
+    if (Pos('.__', Result) = 1) or
+       ((Pos('__', Result) = 1) and Result.EndsWith('__')) then
       AddError(Format(
-        'Identifier "%s" starts with reserved prefix "__" (reserved for the assembler)',
+        'Identifier "%s" uses a reserved form (".__" synthetic local or "__NAME__" build symbol)',
         [Result]));
   end;
 end;
@@ -1087,9 +1096,10 @@ end;
 
 function TK16Parser.IsDirective(const Token: string): Boolean;
 begin
-  Result := AnsiIndexText(Token, ['.EQU', '.ORG', '.BASE', '.WORD',
+  Result := AnsiIndexText(Token, ['.EQU', '.ORG', '.SPACE', '.BASE', '.WORD',
                                    '.BYTE', '.TEXT', '.ALIGN', '.DS',
-                                   '.INCLUDE', '.INCBIN']) >= 0;
+                                   '.INCLUDE', '.INCBIN',
+                                   '.RS', '.REGION', '.ENDREGION']) >= 0;
 end;
 
 // ---------------------------------------------------------------------
@@ -1397,6 +1407,33 @@ begin
           Result.Operands := SplitOperands(Trim(Copy(OperandPart, SecondSpacePos + 1, MaxInt)))
         else
           SetLength(Result.Operands, 0);
+        Exit;
+      end
+      // SYMBOL .RS count[w]  ->  Operands[0]=SYMBOL, Operands[1]=count
+      else if SameText(DirectivePart, '.RS') then
+      begin
+        Result.Mnemonic := '.RS';
+        SetLength(Result.Operands, 2);
+        Result.Operands[0] := InstrPart;
+        if SecondSpacePos > 0 then
+          Result.Operands[1] := Trim(Copy(OperandPart, SecondSpacePos + 1, MaxInt))
+        else
+          Result.Operands[1] := '';   // error: no count
+        Exit;
+      end
+      // NAME .REGION [start] [, cap]  ->  Operands[0]=NAME, then start/cap
+      else if SameText(DirectivePart, '.REGION') then
+      begin
+        Result.Mnemonic := '.REGION';
+        if SecondSpacePos > 0 then
+          Result.Operands := SplitOperands(Trim(Copy(OperandPart, SecondSpacePos + 1, MaxInt)))
+        else
+          SetLength(Result.Operands, 0);
+        // Prepend NAME as Operands[0].
+        SetLength(Result.Operands, Length(Result.Operands) + 1);
+        for i := High(Result.Operands) downto 1 do
+          Result.Operands[i] := Result.Operands[i - 1];
+        Result.Operands[0] := InstrPart;
         Exit;
       end;
     end;
@@ -1724,7 +1761,15 @@ begin
      SameText(Result.Mnemonic, 'LOADI') or
      SameText(Result.Mnemonic, 'LOAD') then    // Syntax sugar
   begin
-    if Length(Result.Operands) = 2 then
+    // Accept the normal 2-operand form, plus the 3-operand post-increment
+    // stream form LOADD/LOADB Dn, [XYn]+, #stride (the stride is operand[2];
+    // it is consumed by the encoder, not here). STORE has no such gate, so
+    // its 3-operand stream form already passes through.
+    if (Length(Result.Operands) = 2) or
+       ((Length(Result.Operands) = 3) and
+        (SameText(Result.Mnemonic, 'LOADD') or SameText(Result.Mnemonic, 'LOADB')) and
+        (Length(Result.Operands[1]) > 0) and (Result.Operands[1][1] = '[') and
+        TMemoryRef.Parse(Result.Operands[1]).PostIncrement) then
     begin
       Result.Destination := TRegister.Parse(Result.Operands[0]);
 

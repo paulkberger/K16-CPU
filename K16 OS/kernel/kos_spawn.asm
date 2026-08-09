@@ -369,6 +369,137 @@ _DeliverWaitResult:
                 RET
 
 ; ============================================================================
+; _DeliverWaitDetached — wake a waiter with ERR_DETACHED + C=1   (Part 51)
+;
+;   Input:    X1:Y1 = waiter's TCB ptr
+;   Output:   none (X1, Y1 preserved); clobbers X0, Y0, D0, D1, D2, D3, flags
+;
+;   Mirrors _DeliverWaitResult's saved-D0 / saved-SR poke, but stages
+;   ERR_DETACHED in the waiter's saved-D0 slot and sets the saved-SR carry
+;   (C=1), so the waiter's TRAP_WAIT returns as a soft failure. Used by
+;   sys_register_shell's auto-foreground path to tell the launching shell
+;   "your child went interactive — stop waiting, stay alive" instead of
+;   reporting an exit code.
+;
+;   Caller responsibility: waiter in TS_WAITING; DINT in effect; transition
+;   the waiter to TS_READY after this call.
+; ============================================================================
+_DeliverWaitDetached:
+                PUSH    D123, XY3
+                PUSH    XY0, XY3
+
+                LOADD   D1, [XY1+#TCB_SAVED_X]
+                LOADD   D2, [XY1+#TCB_SAVED_Y]
+
+                ; XY0 = (waiter_page : waiter_x + 18) = saved-D0 slot
+                MOVE    Y0, D2
+                MOVE    X0, D1
+                ADD     X0, #18
+                LOADI   D3, #ERR_DETACHED
+                STORED  D3, [XY0]               ; saved-D0 := ERR_DETACHED
+
+                ; saved-SR at +2: IE=1, C=1 (soft failure)
+                ADD     X0, #2
+                LOADI   D3, #$0081              ; IE=1, C=1
+                STORED  D3, [XY0]
+
+                POP     XY0, XY3
+                POP     D123, XY3
+                RET
+
+
+; ============================================================================
+; _ComHeaderCheck - validate a .COM image header                  [Part 60]
+;
+;   Input:
+;     Y0:X0 = 24-bit address of image byte 0 - the byte that lands at
+;             <page>:$0200.  Works on a file buffer or on a loaded page.
+;     D0    = image length in bytes
+;
+;   Output (C=0):
+;     D0 = pages      (total contiguous pages, incl. heap; >= 1)
+;     D1 = heapPages  (a partition of pages; <= pages-1)
+;
+;   Output (C=1):
+;     D0 = ERR_BADHEADER short image, bad magic, unknown version, or an
+;                        inconsistent page split. Deliberately NOT
+;                        ERR_NOTEXEC - that code already means four other
+;                        things, and "this is not a K16 .COM image" is the
+;                        one failure a caller most needs told plainly.
+;
+;   Clobbers: D0, D1, flags.  XY0 is restored, so a caller can go straight
+;             on to copy from it.  Preserves D2, D3, XY1, XY2, XY3.
+;
+;   One parser, three callers (_SpawnShell, sys_spawn, sys_exec) - the .COM
+;   layout is stated once rather than re-derived at each site.
+;
+;   The magic's job is REJECTION, not compatibility: every .COM carries a
+;   header, so `run readme.txt` gets a clean loader error instead of
+;   executing text at $0200.  There is no headerless fallback and no
+;   "assume one page" default.
+;
+;   heapPages is validated but not otherwise used - the far heap is a later
+;   part.  It is parsed and range-checked NOW so the field is nailed down
+;   before the first .COM is rebuilt; changing it later means rebuilding
+;   them all a second time.
+;
+;   NOTE: every field is a word, so the image base must be EVEN.  Every
+;   caller supplies one (FS_BUF_SECTOR, an .INCBIN'd image, an even src
+;   offset - sys_spawn validates that explicitly).
+; ============================================================================
+_ComHeaderCheck:
+                PUSH    XY0, XY3
+
+                ; --- Length must cover the header ------------------------
+                ; Carry is 6502-style: C=0 after CMP means borrow, i.e. below.
+                CMP     D0, #COM_HDR_SIZE
+                BLO     .chc_bad                ; C=0 => len < 12
+
+                ; --- Magic (word at +$04) --------------------------------
+                ; Stored little-endian, so COM_MAGIC $4252 lays down $52 ('R')
+                ; first and an ascending hex dump reads "RB".
+                ; Every field is a full word, so the walk is four word reads
+                ; at consecutive even offsets - STREAM post-increment
+                ; ([XYn]+, word stride 2) advances the cursor as part of each
+                ; load.  The advance is unconditional along the success path
+                ; and there is no delimiter to land on, which is exactly the
+                ; shape post-increment is for.
+                ;
+                ; LOADD is flag-transparent, so each CMP is doing the work;
+                ; never branch straight off a load.
+                ADD     X0, #COM_OFF_MAGIC      ; -> image+$04
+                LOADD   D0, [XY0]+              ; magic,   -> +$06
+                CMP     D0, #COM_MAGIC
+                BNE     .chc_bad
+
+                LOADD   D0, [XY0]+              ; version, -> +$08
+                CMP     D0, #COM_VERSION
+                BNE     .chc_bad
+
+                LOADD   D0, [XY0]+              ; pages,   -> +$0A
+                CMP     D0, #1
+                BLO     .chc_bad                ; C=0 => pages < 1
+
+                ; Require heapPages <= pages-1, i.e. heapPages < pages: the
+                ; primary page always holds code and stack.  After CMP D1,D0
+                ; the sense is C=0 <=> D1 < D0, so BHS (C=1) is the REJECT.
+                LOADD   D1, [XY0]               ; heapPages (last - no advance)
+                CMP     D1, D0
+                BHS     .chc_bad
+
+                ; D0 = pages, D1 = heapPages.  Two self-contained tails; POP
+                ; leaves flags alone, but the carry is set last regardless.
+                POP     XY0, XY3
+                CLC
+                RET
+
+.chc_bad:
+                POP     XY0, XY3
+                LOADI   D0, #ERR_BADHEADER
+                SEC
+                RET
+
+; ============================================================================
 ; _SpawnShell — kernel-context shell/task spawner   [Part 39]
 ;
 ;   Allocates a user page, copies a .com image into it at offset $0200,
@@ -394,6 +525,7 @@ _DeliverWaitResult:
 ;     D0 = ERR_TOOBIG   length 0 or > SPAWN_MAX_LEN
 ;     D0 = ERR_NOMEM    _AllocPage exhausted user pages
 ;     D0 = ERR_NOSLOTS  _BuildTask TCB-pool exhausted
+;     D0 = ERR_BADHEADER image has no valid .COM header (Part 60)
 ;
 ;   Side effects:
 ;     - Allocates one user page (never freed by this routine).
@@ -440,8 +572,21 @@ _SpawnShell:
                 CMP     D2, #SPAWN_MAX_LEN+1
                 BHS     .ss_toobig
 
-                ; -- Allocate destination page ----------------------------
-                CALL24  _AllocPage
+                ; -- Parse and validate the .COM header (Part 60) ---------
+                ; XY0 (source) and D2 (length) are still live in registers -
+                ; the PUSHes above copied them, they did not consume them.
+                ; _ComHeaderCheck preserves both.  A stale kosh.com built
+                ; before the header existed now fails LOUDLY at boot instead
+                ; of running headerless.
+                MOVE    D0, D2                  ; D0 = image length
+                CALLR   _ComHeaderCheck
+                BCS     .ss_badhdr
+                STOREZ  D0, [#FE_PAGES]         ; carry across _AllocPageRun
+                STOREZ  D1, [#FE_HEAPPG]
+
+                ; -- Allocate destination page run ------------------------
+                LOADZ   D0, [#FE_PAGES]
+                CALL24  _AllocPageRun
                 BCS     .ss_nomem
 
                 ; D0 = new page byte; stash in BT_PRIMARY for _BuildTask.
@@ -461,17 +606,15 @@ _SpawnShell:
                 ; constraint (.com files have even length), so D2 is even
                 ; and a 2-bytes-per-iteration loop terminates exactly.
 .ss_copy_loop:
-                LOADD   D0, [XY0]
-                STORED  D0, [XY2]
-                ADD     X0, #2
-                ADD     X2, #2
+                LOADD   D0, [XY0]+
+                STORED  D0, [XY2]+
                 SUB     D2, #2
                 BNE     .ss_copy_loop
 
                 ; -- Stage remaining BT_* slots ---------------------------
                 LOADI   D0, #SPAWN_ENTRY_OFFSET
                 STOREZ  D0, [#BT_ENTRY_LO]
-                LOADI   D0, #1
+                LOADZ   D0, [#FE_PAGES]        ; Part 60: header's page count
                 STOREZ  D0, [#BT_PCOUNT]
                 LOADI   D0, #0
                 STOREZ  D0, [#BT_PARENT_ID]     ; shells are parentless
@@ -520,6 +663,16 @@ _SpawnShell:
                 LOADI   D0, #ERR_TOOBIG
                 RETCS
 
+.ss_badhdr:
+                ; Part 60: bad/absent .COM header. Stack: D2, XY0.
+                ; At boot this is fatal - the caller falls into _BootFail -
+                ; which is the intended outcome for a kosh.com that was not
+                ; rebuilt with a header.
+                POP     D2, XY3
+                POP     XY0, XY3
+                LOADI   D0, #ERR_BADHEADER
+                RETCS
+
 .ss_nomem:
                 ; _AllocPage failed. Stack: D2, XY0
                 POP     D2, XY3
@@ -552,9 +705,12 @@ _SpawnShell:
 ;     D0 = new task's pid (1..32)
 ;
 ;   Output (C=1):
-;     D0 = ERR_BADARG    bad src page or zero length, or page-crossing source
+;     D0 = ERR_BADARG    bad src page or zero length, page-crossing source,
+;                        or an ODD src offset (Part 60 - the header word
+;                        read at image+$04 needs an even base)
 ;     D0 = ERR_TOOBIG    length > $FE00
-;     D0 = ERR_NOMEM     no free user pages
+;     D0 = ERR_BADHEADER source is not a valid .COM image (Part 60)
+;     D0 = ERR_NOMEM     no free run of the requested page count
 ;     D0 = ERR_NOSLOTS   TCB pool full
 ;
 ;   Notes:
@@ -611,8 +767,32 @@ sys_spawn:
                 ADD     D0, D1                  ; C=1 ⇒ wraps past $FFFF
                 BCS     .err_badarg
 
-                ; -- Allocate destination page ----------------------------
-                CALL24  _AllocPage
+                ; -- Validate src_offset is EVEN (Part 60) ----------------
+                ; _ComHeaderCheck reads a word at image+$04; an odd image
+                ; base would make that a DATA FAULT odd-addr word access.
+                LOADD   D0, [XY3+#16]           ; src_offset
+                AND     D0, #1
+                BNE     .err_badarg
+
+                ; -- Parse and validate the .COM header (Part 60) ---------
+                ; The source buffer must be a real .COM image: same magic,
+                ; same version, same page declaration as a file on disk.
+                LOADD   D0, [XY3+#18]           ; src_page
+                MOVE    Y0, D0
+                LOADD   D0, [XY3+#16]           ; src_offset
+                MOVE    X0, D0
+                LOADD   D0, [XY3+#14]           ; length
+                CALL24  _ComHeaderCheck
+                BCS     .err_badheader
+                STOREZ  D0, [#FE_PAGES]         ; carry across _AllocPageRun
+                STOREZ  D1, [#FE_HEAPPG]
+
+                ; -- Allocate destination page run ------------------------
+                ; NOTE: only the PRIMARY page receives the image. Extra pages
+                ; are blank workspace - SPAWN_MAX_LEN ($FE00) plus $0200 is
+                ; exactly $10000, so the copy can never cross a page anyway.
+                LOADZ   D0, [#FE_PAGES]
+                CALL24  _AllocPageRun
                 BCS     .err_nomem
 
                 ; D0 = new page byte; stash in BT_PRIMARY for _BuildTask.
@@ -630,17 +810,15 @@ sys_spawn:
                 LOADD   D1, [XY3+#14]           ; D1 = length
 
 .copy_loop:
-                LOADB   D0, [XY0]               ; D0 = byte from source
-                STOREB  D0, [XY1]               ; → destination
-                ADD     X0, #1
-                ADD     X1, #1
+                LOADB   D0, [XY0]+              ; D0 = byte from source
+                STOREB  D0, [XY1]+              ; → destination
                 SUB     D1, #1
                 BNE     .copy_loop
 
                 ; -- Stage remaining BT_* scratch slots -------------------
                 LOADI   D0, #SPAWN_ENTRY_OFFSET
                 STOREZ  D0, [#BT_ENTRY_LO]
-                LOADI   D0, #1
+                LOADZ   D0, [#FE_PAGES]         ; Part 60: header's page count
                 STOREZ  D0, [#BT_PCOUNT]
 
                 ; Parent ID = our TID (read from our TLS slot)
@@ -875,6 +1053,51 @@ sys_spawn:
 .idle_05:
                 JMP24   _RestoreIdle
 
+.err_badheader:
+                ; Part 60: source buffer is not a valid .COM image (bad
+                ; magic, unknown version, short, or an inconsistent page
+                ; split). Self-contained dead-end body per gotcha #32 - no
+                ; shared epilogue, ends in its own RTI.
+                LOADI   D0, #ERR_BADHEADER
+                STORED  D0, [XY3+#18]
+                LOADI   D0, #$0081              ; IE=1, C=1
+                STORED  D0, [XY3+#20]
+
+                LOADZ   D0, [#CURRENT_TCB]
+                MOVE    X1, D0
+                LOADI   Y1, #$00
+                MOVE    D0, X3
+                STORED  D0, [XY1+#TCB_SAVED_X]
+                MOVE    D0, Y3
+                STORED  D0, [XY1+#TCB_SAVED_Y]
+                LOADD   D0, [XY1+#TCB_YIELD_COUNT]
+                ADD     D0, #1
+                STORED  D0, [XY1+#TCB_YIELD_COUNT]
+                LOADI   Y3, #$00
+                LOADI   X3, #KERNEL_STACK_TOP
+                CALL24  _Schedule
+                LOADZ   D0, [#CURRENT_TCB]
+                CMP     D0, #IDLE_TCB
+                BEQ     .idle_06
+
+                MOVE    X1, D0
+                LOADI   Y1, #$00
+
+                LOADD   D0, [XY1+#TCB_SAVED_X]
+                MOVE    X3, D0
+                LOADD   D0, [XY1+#TCB_SAVED_Y]
+                MOVE    Y3, D0
+
+                POP     XY2, XY3
+                POP     XY1, XY3
+                POP     XY0, XY3
+                POP     D123, XY3
+                POP     D0, XY3
+                RTI                              ; ===== ERR_NOTEXEC ENDS =====
+
+.idle_06:
+                JMP24   _RestoreIdle
+
 ; ============================================================================
 ; sys_wait — TRAP #19   [NON-LEAF]
 ;
@@ -950,6 +1173,21 @@ sys_wait:
                 LOADP   D1, Y3, [#TASK_ID]
                 CMP     D0, D1
                 BNE     .err_notchild
+
+                ; -- Part 26: has the child already announced a detach? ---
+                ; A shell that registered before we got here left
+                ; TF_DETACH_PENDING on its own TCB because _FindWaiterFor
+                ; found nobody to poke. Consume it and return ERR_DETACHED
+                ; immediately rather than blocking on a child that will not
+                ; exit until the user quits it. XY2 = child TCB.
+                LOADD   D0, [XY2+#TCB_FLAGS]
+                AND     D0, #TF_DETACH_PENDING
+                BEQ.S   .no_detach_pending
+                LOADD   D0, [XY2+#TCB_FLAGS]
+                AND     D0, #$FFBF              ; ~TF_DETACH_PENDING (one-shot)
+                STORED  D0, [XY2+#TCB_FLAGS]
+                BRA     .err_detached
+.no_detach_pending:
 
                 ; -- Check for existing waiter (other than us) -----------
                 LOADD   D0, [XY3+#18]           ; D0 = child_tid (reload)
@@ -1086,11 +1324,22 @@ sys_wait:
 
 ; --- Error tails: each is a self-contained dead-end body ---
 
+.err_detached:
+                ; Part 26. Not an error: the child detached to the foreground
+                ; as a shell. Delivered exactly as sys_register_shell's live
+                ; poke delivers it, so kosh's REPL cannot tell the two apart.
+                LOADI   D0, #ERR_DETACHED
+                STORED  D0, [XY3+#18]
+                LOADI   D0, #$0081              ; IE=1, C=1
+                STORED  D0, [XY3+#20]
+                BRA     .wait_sched_ret
+
 .err_badarg:
                 LOADI   D0, #ERR_BADARG
                 STORED  D0, [XY3+#18]
                 LOADI   D0, #$0081              ; IE=1, C=1
                 STORED  D0, [XY3+#20]
+.wait_sched_ret:
 
                 LOADZ   D0, [#CURRENT_TCB]
                 MOVE    X1, D0

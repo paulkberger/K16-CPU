@@ -15,7 +15,7 @@ uses
   K16_Encoder_ConditionalSet, K16_Encoder_Control, K16_Encoder_IncDec,
   K16_Encoder_Interrupt, K16_Encoder_Jump, K16_Encoder_LEA, K16_Encoder_Load,
   K16_Encoder_Lookup, K16_Encoder_Move, K16_Encoder_PushPop, K16_Encoder_Store,
-  K16_Export, K16_Parser, K16_Encoder_TrapRet
+  K16_Export, K16_Parser, K16_Encoder_TrapRet, K16_Encoder_Stream
   { you can add units after this };
 
 {$R *.res}

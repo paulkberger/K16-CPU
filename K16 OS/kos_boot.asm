@@ -1,8 +1,34 @@
 ; ============================================================================
 ; kos_boot.asm — k/OS Phase 10 boot
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 40 — k/OS v1.0, kernel identity published to page $00.
+; Date:    8 August 2026
+; Status:  Part 61 — k/OS v1.02, host-populated RAM disk.
+; Revision: r56 — 8 August 2026 — Part 61: KOS_VERSION_VALUE $0101 -> $0102
+;             (v1.02) and phase tag "Phase 51+" -> "Phase 61+". Build date is
+;             auto-stamped (__YEAR__/__MONTH__/__DAY__) so it needs no edit.
+;             Marks the Part 61 work: kosh's HELLO.COM/NOTES.TXT boot seeder
+;             removed (kosh.asm r44), A:STARTUP.KSH bootstraps a host-side
+;             boot.ksh through the new `load ramdisk/<name>` folder prefix
+;             (kosh_cmds_fs.asm r26 + k16-host.js), brief (-b) script echo
+;             (kosh_script.asm), and drive-qualified bare execution
+;             (kosh.asm r45 / kosh_cmds_fs.asm r27). No code change in this
+;             file beyond the two identity constants; the splash and `info`
+;             read them from the page-$00 slots, so nothing else rebuilds.
+; Revision: r55 — 30 June 2026 — Part 51: phase tag "Phase 50+" -> "Phase 51+",
+;             build date -> 30 June 2026. Version held at v1.01 ($0101). The VC
+;             auto-switch-on-launch work lands in kos_switcher/kos_fs_exec/
+;             kos_spawn/kosh; this file only re-stamps the boot identity slots.
+; Revision: r54 — 28 June 2026 — Part 49: KOS_VERSION_VALUE $0100 -> $0101
+;             (v1.01), phase tag "Phase 47+" -> "Phase 49+", build date
+;             18 -> 28 June 2026. Identity slots feed the kosh splash, which
+;             now renders the minor as two digits (kosh_splash.asm r9), so the
+;             logo reads "v1.01 Phase 49+". Accompanies the graphics-task
+;             foreground integration (kos_video/switcher/console/tcb/task,
+;             kos_defs.inc r45).
+; Revision: r53 — 18 June 2026 — Part 47: phase tag bumped to "Phase 47+";
+;             build date set to 18 June 2026 (KOS_BUILD_MONTH 5->6, DAY 29->18).
+;             Splash + info read these via the kernel identity slots; no
+;             change needed in kosh_splash.asm / kosh_cmds_sys.asm.
 ; Revision: r52 — 29 May 2026 — Part 40: publish the phase-tag string's
 ;             ROM PAGE BYTE too. _InitKernel now stages KOS_PHASE_TAG_PAGE
 ;             (#>_KosPhaseTag = $FF) next to KOS_PHASE_TAG_PTR (the
@@ -400,15 +426,23 @@
 ; Nothing else needs to change — kosh's splash and `info` command both
 ; query the page-$00 slots, so they pick up the new version automatically.
 ;
-; KOS_VERSION_VALUE encoding: high byte = major, low byte = minor.
-;   $0100 = v1.0 (Part 39 release, 29 May 2026)
-;   $0101 = v1.1 (future)
-;   $0200 = v2.0 (future)
+; KOS_VERSION_VALUE encoding: high byte = major, low byte = minor. The
+; splash renders minor as TWO digits (zero-padded), so $0101 reads "1.01".
+;   $0100 = v1.00 (Part 39 release, 29 May 2026)
+;   $0101 = v1.01 (Part 49, 28 June 2026 — graphics-task foreground)
+;   $0101 retained through Part 51 (30 June 2026 — VC auto-switch on launch);
+;           phase tag bumped to "Phase 51+", version held at v1.01.
+;   $0102 = v1.02 (Part 61, 8 August 2026 — host-populated RAM disk: the
+;           kosh boot seeder is gone, A:STARTUP.KSH bootstraps a host-side
+;           boot.ksh via `load ramdisk/...`, plus brief (-b) scripts and
+;           drive-qualified bare execution)
+;   $010A = v1.10 (future)
+;   $0200 = v2.00 (future)
 ;-----------------------------------------------------------------------------
-KOS_VERSION_VALUE     .EQU $0100               ; v1.0
-KOS_BUILD_YEAR_VALUE  .EQU 2026
-KOS_BUILD_MONTH_VALUE .EQU 5
-KOS_BUILD_DAY_VALUE   .EQU 29
+KOS_VERSION_VALUE     .EQU $0102               ; v1.02
+KOS_BUILD_YEAR_VALUE  .EQU __YEAR__            ; auto-stamped at kernel assemble time
+KOS_BUILD_MONTH_VALUE .EQU __MONTH__
+KOS_BUILD_DAY_VALUE   .EQU __DAY__
 
                 .BASE   $F00000
                 .ORG    $FF0000
@@ -506,10 +540,10 @@ _InitVectors:
                 LOADI   D0, #<sys_puts
                 STORED  D0, [XY0+#2]
 
-                LOADI   X0, #VEC_PUTLN
-                LOADI   D0, #>sys_putln
+                LOADI   X0, #VEC_PUTLP
+                LOADI   D0, #>sys_putlp
                 STORED  D0, [XY0]
-                LOADI   D0, #<sys_putln
+                LOADI   D0, #<sys_putlp
                 STORED  D0, [XY0+#2]
 
                 LOADI   X0, #VEC_GETS
@@ -578,6 +612,42 @@ _InitVectors:
                 LOADI   D0, #>sys_setcursor
                 STORED  D0, [XY0]
                 LOADI   D0, #<sys_setcursor
+                STORED  D0, [XY0+#2]
+
+                ; Part 15 - terminal geometry syscall (TRAP #19)
+                LOADI   X0, #VEC_TERMSIZE
+                LOADI   D0, #>sys_termsize
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_termsize
+                STORED  D0, [XY0+#2]
+
+                ; Step 1 - console cursor-visibility (TRAP #22)
+                LOADI   X0, #VEC_CURSORVIS
+                LOADI   D0, #>sys_cursorvis
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_cursorvis
+                STORED  D0, [XY0+#2]
+
+                ; Step 2 - console attr / clear-region / query (TRAP #20,21,23,24)
+                LOADI   X0, #VEC_SETATTR
+                LOADI   D0, #>sys_setattr
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_setattr
+                STORED  D0, [XY0+#2]
+                LOADI   X0, #VEC_CLREOL
+                LOADI   D0, #>sys_clreol
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_clreol
+                STORED  D0, [XY0+#2]
+                LOADI   X0, #VEC_WHEREXY
+                LOADI   D0, #>sys_wherexy
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_wherexy
+                STORED  D0, [XY0+#2]
+                LOADI   X0, #VEC_CLREOS
+                LOADI   D0, #>sys_clreos
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_clreos
                 STORED  D0, [XY0+#2]
 
                 ; Phase 14 syscalls
@@ -717,6 +787,34 @@ _InitVectors:
                 LOADI   D0, #<sys_diskfree
                 STORED  D0, [XY0+#2]
 
+                ; Subdir support — sys_mkdir
+                LOADI   X0, #VEC_MKDIR
+                LOADI   D0, #>sys_mkdir
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_mkdir
+                STORED  D0, [XY0+#2]
+
+                ; Path resolver — sys_resolve
+                LOADI   X0, #VEC_RESOLVE
+                LOADI   D0, #>sys_resolve
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_resolve
+                STORED  D0, [XY0+#2]
+
+                ; Path resolver — sys_pwd
+                LOADI   X0, #VEC_PWD
+                LOADI   D0, #>sys_pwd
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_pwd
+                STORED  D0, [XY0+#2]
+
+                ; Subdir support — sys_rmdir
+                LOADI   X0, #VEC_RMDIR
+                LOADI   D0, #>sys_rmdir
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_rmdir
+                STORED  D0, [XY0+#2]
+
                 ; Phase B Step 2 — sys_setforeground
                 LOADI   X0, #VEC_SETFOREGROUND
                 LOADI   D0, #>sys_setforeground
@@ -729,6 +827,20 @@ _InitVectors:
                 LOADI   D0, #>sys_register_shell
                 STORED  D0, [XY0]
                 LOADI   D0, #<sys_register_shell
+                STORED  D0, [XY0+#2]
+
+                ; Named drives v2 — sys_assign
+                LOADI   X0, #VEC_ASSIGN
+                LOADI   D0, #>sys_assign
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_assign
+                STORED  D0, [XY0+#2]
+
+                ; sys_kbhit — non-blocking key poll (animated graphics)
+                LOADI   X0, #VEC_KBHIT
+                LOADI   D0, #>sys_kbhit
+                STORED  D0, [XY0]
+                LOADI   D0, #<sys_kbhit
                 STORED  D0, [XY0+#2]
 
                 POP     D2, XY3
@@ -767,6 +879,10 @@ _InitKernel:
                 STOREZ  D0, [#KOS_PHASE_TAG_PTR]
                 LOADI   D0, #>_KosPhaseTag      ; ROM page byte ($FF) — kernel ROM is
                 STOREZ  D0, [#KOS_PHASE_TAG_PAGE] ;   .ORG $FF0000, NOT page $00
+                LOADI   D0, #<_KosBuildStr      ; kernel build-stamp string (ISO)
+                STOREZ  D0, [#KOS_BUILD_STR_PTR]
+                LOADI   D0, #>_KosBuildStr      ; ROM page byte ($FF)
+                STOREZ  D0, [#KOS_BUILD_STR_PAGE]
 
                 ;-- Initialise TCB pool ------------------------------------
                 ; Marks all TCBs TS_UNUSED and constructs the idle TCB at
@@ -830,6 +946,12 @@ _InitKernel:
                 ; AFTER _InitSemPool, and AFTER _InitHostDisk.
                 CALL24  _InitFS
 
+                ;-- Named-volume assign table (named drives v2) -----------
+                ; Clears the 32-entry assign table, then seeds the locked
+                ; system volumes ROM: (A:) and RAM: (B:) — only for drives
+                ; that actually mounted. Must come AFTER _InitFS.
+                CALL24  _SeedAssigns
+
                 ;-- Video driver bring-up (Part 20) -----------------------
                 ; Forces VID_MODE = 0 (text mode) and clears
                 ; VIDEO_OWNER_TID. Independent of prior state — a soft
@@ -838,6 +960,86 @@ _InitKernel:
                 CALL24  _InitVideo
 
                 POP     D0, XY3
+                RET
+
+; ============================================================================
+; _SeedAssigns — clear the assign table and seed locked system volumes.
+;   ROM: -> A: (locked, read-only) ; RAM: -> B: (locked). Each seeded only
+;   if its backing drive mounted. Called from boot after _InitFS.
+;   Clobbers: D0, D1, D2, D3, X0, X1, Y0, Y1, XY2, flags
+; ============================================================================
+_SeedAssigns:
+                ; --- clear the 32-entry table (512 B) ---
+                LOADI   X0, #AS_TABLE_BASE
+                LOADI   Y0, #$00
+                LOADI   D0, #0
+                LOADI   D1, #AS_TABLE_END-AS_TABLE_BASE
+.ssa_clr:
+                STOREB  D0, [XY0]+
+                SUB     D1, #1
+                BNE     .ssa_clr
+                ; --- seed ROM: -> A: (locked, read-only) ---
+                LOADI   D0, #0
+                LOADI   D1, #AS_FLAG_LOCKED+AS_FLAG_READONLY
+                LOADI   Y0, #>str_vol_rom
+                LOADI   X0, #<str_vol_rom
+                CALL24  _SeedAssign
+                ; --- seed RAM: -> B: (locked) ---
+                LOADI   D0, #1
+                LOADI   D1, #AS_FLAG_LOCKED
+                LOADI   Y0, #>str_vol_ram
+                LOADI   X0, #<str_vol_ram
+                CALL24  _SeedAssign
+                RET
+
+; ============================================================================
+; _SeedAssign — seed one assign-table entry, iff its backing drive mounted.
+;   The table is pre-cleared by _SeedAssigns, so AS_ROOTCLU and the spare
+;   bytes are already 0 — only AS_NAME / AS_DRIVE / AS_FLAGS are written.
+;
+;   In:    D0  = drive index
+;          D1  = flags (AS_FLAGS)
+;          XY0 = ptr to name (UPPER ASCIIZ, <= 11 chars)  [Y0=page, X0=off]
+;   Out:   entry seeded, or silently skipped if drive unmounted / table full
+;   Clobbers: D0, D1, D2, D3, X0, X1, Y1, XY2, flags
+; ============================================================================
+_SeedAssign:
+                MOVE    D2, D0                  ; save drive (survives _SlotForDrive)
+                MOVE    D3, D1                  ; save flags
+                CALL24  _SlotForDrive           ; D0=drive -> XY2 ; C=1 if unmounted
+                BCS     .sda_skip               ; not mounted -> don't seed
+                ; find first free entry (AS_NAME[0] == 0)
+                LOADI   X1, #AS_TABLE_BASE
+                LOADI   Y1, #$00
+                LOADI   D0, #AS_MAX
+.sda_find:
+                LOADB   D1, [XY1]
+                AND     D1, #$FF
+                BEQ     .sda_free
+                ADD     X1, #AS_ENTRY_SIZE
+                SUB     D0, #1
+                BNE     .sda_find
+                RET                             ; table full -> skip
+.sda_free:
+                MOVE    D0, X1                  ; save entry base offset
+                ; copy name  [XY0] -> [XY1] (dest at AS_NAME = entry+0)
+.sda_copy:
+                LOADB   D1, [XY0]
+                AND     D1, #$FF
+                STOREB  D1, [XY1]+
+                CMP     D1, #0
+                BEQ     .sda_fields
+                INC     XY0, #1
+                BRA     .sda_copy
+.sda_fields:
+                MOVE    X1, D0                  ; restore entry base ptr
+                LOADI   Y1, #$00
+                MOVE    D1, D2                  ; drive
+                STOREB  D1, [XY1+#AS_DRIVE]
+                MOVE    D1, D3                  ; flags
+                STOREB  D1, [XY1+#AS_FLAGS]
+                ; AS_ROOTCLU stays 0 (table pre-cleared)
+.sda_skip:
                 RET
 
 ; ============================================================================
@@ -879,6 +1081,10 @@ _DetectHost:
 ; ============================================================================
 boot_msg:       .TEXT   "Booting k/OS", $0A, 0
 
+; Named-volume seed names (UPPER, ASCIIZ; .TEXT auto-pads to even)
+str_vol_rom:    .TEXT   "ROM", 0
+str_vol_ram:    .TEXT   "RAM", 0
+
 ; ============================================================================
 ; Kernel phase-tag string
 ;   Pointed at by the page-$00 slot KOS_PHASE_TAG_PTR (set by _InitKernel
@@ -890,7 +1096,12 @@ boot_msg:       .TEXT   "Booting k/OS", $0A, 0
 ;   rebuild the kernel. kosh picks up the change automatically without
 ;   needing kosh.com to be rebuilt.
 ; ============================================================================
-_KosPhaseTag:   .TEXT   "Phase 39+", 0
+_KosPhaseTag:   .TEXT   "Phase 61+", 0
+
+; k/OS build stamp - ISO 8601 date+time, auto-stamped at kernel assemble time.
+; Published to page-$00 via KOS_BUILD_STR_PTR/PAGE (same pattern as the phase
+; tag). Consumed by kosh splash + info.
+_KosBuildStr:   .TEXT   __DATE__, " ", __TIME__, 0
 
                 .INCLUDE "kernel/kos_bad_trap.asm"
                 .INCLUDE "kernel/kos_rawio.asm"
@@ -912,6 +1123,8 @@ _KosPhaseTag:   .TEXT   "Phase 39+", 0
                 .INCLUDE "kfs/kos_fs_host_mgr.asm"       ; Part 23 — host mgr
                 .INCLUDE "kfs/kos_fs.asm"                ; Phase 16
                 .INCLUDE "kfs/kos_fs_dir.asm"            ; Phase 16 Piece 4
+                .INCLUDE "kfs/kos_fs_dir_lfn.asm"        ; Part 47 — LFN family (split from kos_fs_dir)
+                .INCLUDE "kfs/kos_fs_dir_path.asm"       ; Part 47 — path resolver + pwd (split from kos_fs_dir)
                 .INCLUDE "kfs/kos_fs_fd.asm"             ; Phase 16 Piece 5
                 .INCLUDE "kfs/kos_fs_exec.asm"           ; Phase 16 Piece 6
                 .INCLUDE "klib/kos_klib_template.asm"             ; Phase 10

@@ -6,15 +6,16 @@ unit K16_Encoder_IncDec;
   K16 INC/DEC Instruction Encoder
   ================================
 
-  Opcode $02: INC/DEC XY pairs with 24-bit carry/borrow
+  Opcode $00: INC/DEC XY pairs with 24-bit carry/borrow
+  (Relocated from $02 to $00 m10/m11; $02 is now the STREAM family.)
 
   Encoding:
     Bit:  15-11 | 10-9 | 8-7 | 6-5 | 4-0
-          00010 | MODE | 00  | XYn | IMM5
+          00000 | MODE | 00  | XYn | IMM5
 
   Modes:
-    Mode 00: INC XYn, #imm5  - XYn += imm5 (5 cycles)
-    Mode 01: DEC XYn, #imm5  - XYn -= imm5 (6 cycles)
+    Mode 10: INC XYn, #imm5  - XYn += imm5 (3/5 cycles)
+    Mode 11: DEC XYn, #imm5  - XYn -= imm5 (4/6 cycles)
 
   Syntax for hardware INC/DEC (24-bit, opcode $02):
     INC XYn, #imm     ; XYn += imm (0-31) — step is mandatory
@@ -152,14 +153,15 @@ begin
     end;
 
     // Build opcode for XY pair INC/DEC
-    // Opcode $02 = 00010
-    OpCode := $02 shl 11;  // Bits 15-11: Opcode
+    // Relocated from $02 to $00 m10/m11 (frees $02 for the STREAM family).
+    // Opcode $00 = 00000
+    OpCode := $00 shl 11;  // Bits 15-11: Opcode
 
-    // Mode: 00 = INC, 01 = DEC
+    // Mode: 10 = INC, 11 = DEC
     if IsINC then
-      ModeCode := 0
+      ModeCode := 2   // Mode 10
     else
-      ModeCode := 1;
+      ModeCode := 3;  // Mode 11
 
     OpCode := OpCode or (Word(ModeCode) shl 9);  // Bits 10-9: Mode
 

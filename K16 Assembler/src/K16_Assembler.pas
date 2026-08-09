@@ -21,9 +21,10 @@ interface
 
 uses
   SysUtils, Classes, Generics.Collections, Generics.Defaults,
-  StrUtils, Math,
+  StrUtils, Math, DateUtils,
 
   K16_Parser,
+  K16_Regions,
   K16_Encoder_Base,
   K16_Encoder_Control,
   K16_Encoder_Lookup,
@@ -31,6 +32,7 @@ uses
   K16_Encoder_LEA,
   K16_Encoder_ConditionalSet,
   K16_Encoder_ALU,
+  K16_Encoder_Stream,
   K16_Encoder_Load,
   K16_Encoder_Store,
   K16_Encoder_Jump,
@@ -111,6 +113,7 @@ type
   private
     FParser: TK16Parser;
     FSymbols: TDictionary<string, TSymbol>;
+    FStringSymbols: TDictionary<string, string>;  // predefined string-valued build symbols (__DATE__ etc.)
     FForwardRefs: TList<TForwardRef>;
     FInstructions: TList<TInstructionRecord>;
     FInstrScope: TStringList;   // parallel to FInstructions: global scope at each instruction
@@ -166,8 +169,22 @@ type
     FSkipLevel: Integer;   // FIfDepth value at which skip started
     FIfDepth:   Integer;   // Current nesting depth
 
+    // Region reservation state machine (.REGION / .RS).  Non-emitting: it
+    // never touches FCurrentAddress.  See K16_Regions.pas.
+    FRegions: TK16RegionState;
+
+    // Address-space name pinned at .ORG (see .SPACE).  Emitted code is checked
+    // for region overlap only against regions of this space.
+    FCodeSpace: string;
+
     // Symbol resolver and error reporter functions
     function  SymbolResolver(const SymName: string; LineNumber: Integer): UInt32;
+    // Callbacks for FRegions: bind a constant symbol, and test membership.
+    procedure DefineRegionConst(const AName: string; AValue: UInt32; ALine: Integer);
+    procedure SeedBuildSymbols;   // predefined datetime build symbols (snapshot once, before pass 1)
+    function  RegionSymbolExists(const AName: string): Boolean;
+    // Post-assembly: flag emitted code/data that lands inside a region span.
+    procedure CheckCodeRegionOverlap;
     procedure ErrorReporter(const Msg: string; LineNumber: Integer);
     procedure WarningReporter(const Msg: string; LineNumber: Integer);
 
@@ -250,6 +267,11 @@ type
     procedure GenerateListing(const Filename: string);
     procedure GenerateSymbolTable(const Filename: string);
     function  GenerateListingText: string;
+
+    // Region memory map (spec v1.5). Text form for a SynEdit / memo; file form
+    // parallels GenerateListing. Both derive the title from SourceFileName.
+    function  GenerateRegionMapText: string;
+    procedure GenerateRegionMap(const Filename: string);
 
     // Exposed for listing generator — parses .BYTE/.TEXT operand bytes so the
     // listing can display exactly the bytes the user wrote (not word-padded).
@@ -402,8 +424,9 @@ begin
   Result := 0;
   StartPos := FPos;
 
-  // Symbol starts with letter or underscore
-  while CurrentChar in ['A'..'Z', 'a'..'z', '0'..'9', '_'] do
+  // Symbol starts with letter or underscore; '@' joins a region-qualified
+  // reference REGION@FIELD into a single token (spec v1.5 §4).
+  while CurrentChar in ['A'..'Z', 'a'..'z', '0'..'9', '_', '@'] do
     Advance;
 
   SymName := UpperCase(Copy(FExpression, StartPos, FPos - StartPos));
@@ -560,6 +583,7 @@ begin
   inherited;
   FParser := TK16Parser.Create;
   FSymbols := TDictionary<string, TSymbol>.Create;
+  FStringSymbols := TDictionary<string, string>.Create;
   FForwardRefs := TList<TForwardRef>.Create;
   FInstructions := TList<TInstructionRecord>.Create;
   FInstrScope := TStringList.Create;
@@ -571,6 +595,9 @@ begin
   FAdditionalWords := TList<TMachineCode>.Create;
   FPseudoCounter   := TPseudoLabelCounter.Create;
   FIncBinCache     := TDictionary<string, TBytes>.Create;
+  FRegions         := TK16RegionState.Create(DefineRegionConst,
+                                             RegionSymbolExists, ErrorReporter);
+  FCodeSpace       := 'default';
 
   // Create encoders
   FEncoders         := TList<IK16Encoder>.Create;
@@ -630,6 +657,8 @@ begin
   FInstructions.Free;
   FInstrScope.Free;
   FForwardRefs.Free;
+  FRegions.Free;
+  FStringSymbols.Free;
   FSymbols.Free;
   FParser.Free;
   inherited;
@@ -856,6 +885,116 @@ begin
   AddError(Msg, LineNumber);
 end;
 
+// Callback for TK16RegionState — bind an .RS field or an auto _START/_END/
+// _SIZE/_CAP symbol as a constant.  Same path as .EQU (see ProcessDirective).
+procedure TK16Assembler.DefineRegionConst(const AName: string; AValue: UInt32;
+  ALine: Integer);
+var
+  Sym: TSymbol;
+begin
+  Sym := TSymbol.CreateConstant(AName, AValue, ALine);
+  FSymbols.AddOrSetValue(UpperCase(AName), Sym);
+end;
+
+// Predefined build-time datetime symbols. Snapshot is read ONCE per
+// AssembleText (before pass 1) so both passes are byte-identical — a time
+// change between passes could shift string-symbol lengths and corrupt output.
+// Integer symbols ride the same FSymbols path as .REGION auto-consts
+// (DefineRegionConst); string symbols use FStringSymbols, consumed by
+// ParseTextString. If SOURCE_DATE_EPOCH (Unix seconds) is set, it pins the
+// snapshot for reproducible builds; otherwise the wall clock is used.
+procedure TK16Assembler.SeedBuildSymbols;
+var
+  BuildDT: TDateTime;
+  Y, Mo, D, H, Mi, S, Ms: Word;
+  Env: string;
+begin
+  Env := GetEnvironmentVariable('SOURCE_DATE_EPOCH');
+  if Env <> '' then
+    BuildDT := UnixToDateTime(StrToInt64(Env))
+  else
+    BuildDT := Now;
+
+  DecodeDate(BuildDT, Y, Mo, D);
+  DecodeTime(BuildDT, H, Mi, S, Ms);
+
+  // Integer symbols (expression context — .EQU, LOADI, .WORD, math, .IF)
+  DefineRegionConst('__YEAR__',      Y,  0);
+  DefineRegionConst('__MONTH__',     Mo, 0);
+  DefineRegionConst('__DAY__',       D,  0);
+  DefineRegionConst('__HOUR__',      H,  0);
+  DefineRegionConst('__MINUTE__',    Mi, 0);
+  DefineRegionConst('__SECOND__',    S,  0);
+  DefineRegionConst('__DATESTAMP__', UInt32(Y) * 10000 + UInt32(Mo) * 100 + UInt32(D), 0);
+  DefineRegionConst('__TIMESTAMP__', UInt32(H) * 10000 + UInt32(Mi) * 100 + UInt32(S), 0);
+
+  // String symbols (.TEXT / .BYTE operand context) — ISO 8601, ASCII-safe.
+  // Keys stored UpperCase to match case-insensitive symbol lookup.
+  FStringSymbols.AddOrSetValue('__DATE__',
+    FormatDateTime('yyyy"-"mm"-"dd', BuildDT));
+  FStringSymbols.AddOrSetValue('__TIME__',
+    FormatDateTime('hh":"nn":"ss', BuildDT));
+  FStringSymbols.AddOrSetValue('__DATETIME__',
+    FormatDateTime('yyyy"-"mm"-"dd" "hh":"nn":"ss', BuildDT));
+end;
+
+// Callback for TK16RegionState — strict collision test (spec v1.5).
+function TK16Assembler.RegionSymbolExists(const AName: string): Boolean;
+begin
+  Result := FSymbols.ContainsKey(UpperCase(AName));
+end;
+
+// Post-assembly: report the first emitted code/data word that lands inside a
+// region span. Every region is closed into FSpans during FirstPass, so by the
+// time code is emitted the full span list is known regardless of whether the
+// region was declared above or below the code (spec v1.6).
+procedure TK16Assembler.CheckCodeRegionOverlap;
+var
+  MC:    TMachineCode;
+  RName: string;
+  Bytes: UInt32;
+begin
+  for MC in FMachineCode do
+  begin
+    Bytes := UInt32(MC.GetTotalWords) * 2;
+    if Bytes = 0 then
+      Continue;
+    if FRegions.CodeInRegion(MC.Address, Bytes, FCodeSpace, RName) then
+    begin
+      AddError(Format('emitted code/data at $%.6X overlaps region ''%s'' - ' +
+        'code has grown into reserved space.', [MC.Address, RName]),
+        MC.SourceLine);
+      Exit;   // one clear error at the first (lowest-address) hit
+    end;
+  end;
+end;
+
+// Region memory map — text form (for a SynEdit / memo), mirrors
+// GenerateListingText.
+function TK16Assembler.GenerateRegionMapText: string;
+var
+  Title: string;
+begin
+  if FSourceFileName <> '' then
+    Title := ExtractFileName(FSourceFileName)
+  else
+    Title := 'assembly';
+  Result := FRegions.BuildMapText(Title, FCodeSpace);
+end;
+
+// Region memory map - file form, mirrors GenerateListing.
+procedure TK16Assembler.GenerateRegionMap(const Filename: string);
+var
+  Strm: TStringStream;
+begin
+  Strm := TStringStream.Create(GenerateRegionMapText);
+  try
+    Strm.SaveToFile(Filename);
+  finally
+    Strm.Free;
+  end;
+end;
+
 function TK16Assembler.AssembleFile(const Filename: string): Boolean;
 begin
   try
@@ -885,6 +1024,11 @@ begin
   FErrorList.Clear;
   FWarningList.Clear;
   FParser.ClearErrors;
+
+  // Predefined datetime build symbols — snapshot once, before EQUPrescan and
+  // both passes, so the whole build sees one consistent instant.
+  FStringSymbols.Clear;
+  SeedBuildSymbols;
 
   FSourceLines.Text := SourceText;
   FCurrentAddress := FStartAddress;
@@ -926,6 +1070,7 @@ begin
 
     if not HasErrors then
       ResolveForwardReferences;
+
     Result := not HasErrors;
 
   except
@@ -1119,6 +1264,11 @@ begin
       end;
     end;
   end;
+
+  // A .REGION/.STRUCT left open at EOF never emitted its _END/_SIZE symbols.
+  if FRegions.IsOpen then
+    AddError(Format('%s left open at end of file - missing .ENDREGION.',
+                    [FRegions.KindName]), 0);
 end;
 
 procedure TK16Assembler.ProcessLabel(const LabelName: string; Address: UInt32; LineNumber: Integer);
@@ -1167,7 +1317,22 @@ var
   IncBinData:   TBytes;
   IncBinFS:     TFileStream;
   IsEmptyArg:   Boolean;
+  RgStart:      UInt32;
+  RgCap:        UInt32;
+  RgCapped:     Boolean;
+  RgHasStart:   Boolean;
 begin
+
+  // Emitting directives may not appear inside an open region (spec v1.5) -
+  // they would emit into an image the region does not own.
+  if FRegions.IsOpen and
+     (SameText(Instr.Mnemonic, '.DS')   or SameText(Instr.Mnemonic, '.WORD') or
+      SameText(Instr.Mnemonic, '.BYTE') or SameText(Instr.Mnemonic, '.TEXT') or
+      SameText(Instr.Mnemonic, '.INCBIN')) then
+  begin
+    FRegions.RejectEmit(Instr.Mnemonic, Instr.LineNumber);
+    Exit;   // do not emit
+  end;
 
   if SameText(Instr.Mnemonic, '.EQU') then
   begin
@@ -1177,13 +1342,22 @@ begin
       SymbolName := Trim(Instr.Operands[0]);
       ValueStr := Trim(Instr.Operands[1]);
 
+      // Reserved predefined build symbols (__NAME__) may not be redefined.
+      if (Pos('__', SymbolName) = 1) and SymbolName.EndsWith('__') then
+      begin
+        AddError(Format('Cannot redefine reserved predefined symbol "%s"',
+                        [SymbolName]), Instr.LineNumber);
+        Exit;
+      end;
+
       // Check if value is an expression (contains operators) or 'w' suffix
       IsExpr := (Pos('+', ValueStr) > 0) or
                     (Pos('-', ValueStr) > 1) or  // > 1 to skip leading minus
                     (Pos('*', ValueStr) > 0) or
                     (Pos('/', ValueStr) > 0) or
                     (Pos('(', ValueStr) > 0) or
-                    ((Length(ValueStr) > 1) and (ValueStr[Length(ValueStr)] in ['w', 'W']));
+                    ((Length(ValueStr) > 1) and (ValueStr[Length(ValueStr)] in ['w', 'W'])) or
+                    ((Length(ValueStr) > 0) and (ValueStr[1] in ['A'..'Z', 'a'..'z', '_']));  // bare symbol RHS -> resolve via evaluator
 
       if IsExpr then
       begin
@@ -1223,6 +1397,56 @@ begin
     else
       AddError('.EQU directive requires exactly 2 operands: .EQU SYMBOL, value', Instr.LineNumber);
   end
+
+  // --- Region reservation (spec v1.5) ---------------------------------------
+  else if SameText(Instr.Mnemonic, '.RS') then
+  begin
+    // SYMBOL .RS count[w]  — reserve non-emitting space; bind SYMBOL, advance.
+    if Length(Instr.Operands) = 2 then
+      FRegions.Reserve(Trim(Instr.Operands[0]),
+                       UInt32(EvalDirectiveArg(Instr.Operands[1], Instr.LineNumber)),
+                       Instr.LineNumber)
+    else
+      AddError('.RS requires: SYMBOL .RS count[w]', Instr.LineNumber);
+  end
+
+  else if SameText(Instr.Mnemonic, '.REGION') then
+  begin
+    // NAME .REGION [start] [, cap]
+    //   Operands: [0]=NAME always; [1]=start (optional -> auto-chain);
+    //             [2]=cap (optional, requires an explicit start).
+    if Length(Instr.Operands) < 1 then
+      AddError('.REGION requires: NAME .REGION [start] [, cap]', Instr.LineNumber)
+    else
+    begin
+      RgHasStart := Length(Instr.Operands) >= 2;
+      if RgHasStart then
+        RgStart := UInt32(EvalDirectiveArg(Instr.Operands[1], Instr.LineNumber))
+      else
+        RgStart := 0;
+      RgCapped := Length(Instr.Operands) >= 3;
+      if RgCapped then
+        RgCap := UInt32(EvalDirectiveArg(Instr.Operands[2], Instr.LineNumber))
+      else
+        RgCap := 0;
+      FRegions.OpenRegion(Trim(Instr.Operands[0]), RgHasStart, RgStart,
+                          RgCapped, RgCap, Instr.LineNumber);
+    end;
+  end
+
+  else if SameText(Instr.Mnemonic, '.ENDREGION') then
+    FRegions.CloseRegion(Instr.LineNumber)
+
+  else if SameText(Instr.Mnemonic, '.SPACE') then
+  begin
+    // .SPACE name - tag subsequent regions (and this binary's code, pinned at
+    // .ORG) with an address-space name.  Single-operand form, like .ORG.
+    if Length(Instr.Operands) = 1 then
+      FRegions.SetSpace(Trim(Instr.Operands[0]), Instr.LineNumber)
+    else
+      AddError('.SPACE directive requires exactly 1 operand: .SPACE name', Instr.LineNumber);
+  end
+
   else if SameText(Instr.Mnemonic, '.ORG') then
   begin
     // .ORG address - set assembly origin (MUST be even for K16)
@@ -1270,6 +1494,11 @@ begin
       end;
 
       FCurrentAddress := NewAddress;
+
+      // Pin this binary's code space to whatever .SPACE is in effect at its
+      // origin; CheckCodeRegionOverlap tests emitted code only against regions
+      // of the same space.
+      FCodeSpace := FRegions.CurrentSpace;
     end
     else
       AddError('.ORG directive requires exactly 1 operand: .ORG address', Instr.LineNumber);
@@ -1751,8 +1980,8 @@ end;
 
 procedure TK16Assembler.MergeAdditionalWords;
 var
-  i, SortI, SortJ: Integer;
-  SortTemp: TMachineCode;
+  i, n, width, lo, mid, hi, iA, iB, k: Integer;
+  arr, buf: array of TMachineCode;
 begin
 
     for i := 0 to FAdditionalWords.Count - 1 do
@@ -1760,15 +1989,52 @@ begin
       FMachineCode.Add(FAdditionalWords[i]);
     end;
 
-    // Sort by address (FPC-compatible insertion sort)
-    for SortI := 0 to FMachineCode.Count - 2 do
-      for SortJ := SortI + 1 to FMachineCode.Count - 1 do
-        if FMachineCode[SortJ].Address < FMachineCode[SortI].Address then
+    // Sort by address - stable bottom-up merge sort, O(n log n). Replaces the
+    // previous O(n^2) selection sort, which copied two whole TMachineCode
+    // records per comparison (via the TList indexer) and made large .INCBIN
+    // blobs - one machine-code word per 2 bytes - extremely slow to assemble.
+    // Extract to a local array once, merge, write back: O(n log n) copies.
+    n := FMachineCode.Count;
+    if n > 1 then
+    begin
+      SetLength(arr, n);
+      SetLength(buf, n);
+      for i := 0 to n - 1 do
+        arr[i] := FMachineCode[i];
+
+      width := 1;
+      while width < n do
+      begin
+        lo := 0;
+        while lo < n do
         begin
-          SortTemp := FMachineCode[SortI];
-          FMachineCode[SortI] := FMachineCode[SortJ];
-          FMachineCode[SortJ] := SortTemp;
+          mid := lo + width;      if mid > n then mid := n;
+          hi  := lo + 2 * width;  if hi  > n then hi  := n;
+          iA := lo; iB := mid; k := lo;
+          while (iA < mid) and (iB < hi) do
+          begin
+            if arr[iB].Address < arr[iA].Address then
+            begin buf[k] := arr[iB]; Inc(iB); end
+            else
+            begin buf[k] := arr[iA]; Inc(iA); end;   // stable on equal keys
+            Inc(k);
+          end;
+          while iA < mid do begin buf[k] := arr[iA]; Inc(iA); Inc(k); end;
+          while iB < hi  do begin buf[k] := arr[iB]; Inc(iB); Inc(k); end;
+          lo := lo + 2 * width;
         end;
+        for k := 0 to n - 1 do
+          arr[k] := buf[k];
+        width := width * 2;
+      end;
+
+      for i := 0 to n - 1 do
+        FMachineCode[i] := arr[i];
+    end;
+
+  // All code + pseudo-expansion words are now placed and address-sorted;
+  // flag any that landed inside a region span (code grown into reserved RAM).
+  CheckCodeRegionOverlap;
 
 end;
 
@@ -2604,6 +2870,10 @@ SymFile.Add('------------------------ --------- -------- ----');
 
 for Symbol in FSymbols.Values do
 begin
+  // Skip reserved predefined build symbols (__DATE__ etc.) — build metadata,
+  // not program symbols; their values are not addresses.
+  if Symbol.Name.StartsWith('__') and Symbol.Name.EndsWith('__') then
+    Continue;
   case Symbol.SymType of
     stLabel:    SymFile.Add(Format('%-24s %-9s %06X   %4d', [Symbol.Name, 'Label',    Symbol.Value, Symbol.LineNumber]));
     stConstant: SymFile.Add(Format('%-24s %-9s %06X   %4d', [Symbol.Name, 'Constant', Symbol.Value, Symbol.LineNumber]));
@@ -2728,10 +2998,11 @@ end;
 
 function TK16Assembler.IsDirective(const Mnemonic: string): Boolean;
 begin
-  Result := AnsiIndexText(Mnemonic, ['.EQU', '=', '.ORG', '.BASE',
+  Result := AnsiIndexText(Mnemonic, ['.EQU', '=', '.ORG', '.SPACE', '.BASE',
                                       '.WORD', '.TEXT', '.BYTE',
                                       '.ALIGN', '.DS', '.INCLUDE',
                                       '.INCBIN',
+                                      '.RS', '.REGION', '.ENDREGION',
                                       '.IF', '.ENDIF']) >= 0;
 end;
 
@@ -2747,6 +3018,9 @@ var
   HexStr: string;
   HexValue: Integer;
   TempByte: Byte;
+  StrVal: string;   // scanned identifier (the lookup key)
+  StrResult: string; // resolved predefined string symbol value (__DATE__ etc.)
+  k: Integer;
 begin
 
   Result := False;
@@ -2911,6 +3185,33 @@ begin
       // Skip whitespace and commas
       else if Ch in [' ', ','] then
         Inc(i)
+      // Bare identifier — predefined string-valued build symbol (__DATE__ etc.)
+      else if Ch in ['A'..'Z', 'a'..'z', '_'] then
+      begin
+        StrVal := '';   // accumulate the identifier
+        while (i <= Length(Input)) and
+              (Input[i] in ['A'..'Z', 'a'..'z', '0'..'9', '_']) do
+        begin
+          StrVal := StrVal + Input[i];
+          Inc(i);
+        end;
+
+        if FStringSymbols.TryGetValue(UpperCase(StrVal), StrResult) then
+        begin
+          for k := 1 to Length(StrResult) do
+            ByteList.Add(Byte(Ord(StrResult[k]) and $FF));
+        end
+        else
+        begin
+          AddError(Format('Undefined symbol in .TEXT/.BYTE directive: %s',
+                          [StrVal]), LineNumber);
+          Exit;
+        end;
+
+        // Skip optional comma after symbol
+        while (i <= Length(Input)) and (Input[i] = ' ') do Inc(i);
+        if (i <= Length(Input)) and (Input[i] = ',') then Inc(i);
+      end
       else
       begin
         AddError(Format('Unexpected character in .TEXT directive: %s', [Ch]), LineNumber);

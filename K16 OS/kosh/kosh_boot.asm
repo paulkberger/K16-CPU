@@ -83,52 +83,11 @@ _P2Main:
                 LOADI   D0, #<_INTDispatch
                 STORED  D0, [XY0+#2]
 
-                ; -- Auto-format B: if not mounted --------------------------
-                ; r14: production kosh (no smoke harness). _InitFS has already
-                ; run from _InitKernel; if the RAM disk wasn't pre-formatted
-                ; by an earlier session (or a save/load round trip when that
-                ; lands), VOL_PRESENT[B:] will be 0 and the user has nothing
-                ; to operate on.
-                ;
-                ; Auto-format makes B: usable from first boot. Harmless when
-                ; B: is already mounted (we skip in that case).
-                LOADI   Y0, #$00
-                LOADI   X0, #VOL_SLOT_B
-                LOADB   D0, [XY0+#VOL_PRESENT]
-                CMP     D0, #0
-                BNE     .skip_format
-
-                LOADI   Y0, #>boot_format_msg
-                LOADI   X0, #<boot_format_msg
-                CALL24  _RawPuts
-
-                ; _FormatVolume(D0=drive, XY0=11-byte label).
-                LOADI   D0, #FS_DRIVE_B
-                LOADI   Y0, #>boot_ramdisk_label
-                LOADI   X0, #<boot_ramdisk_label
-                CALL24  _FormatVolume
-                BCS     .format_failed
-
-                LOADI   Y0, #>boot_format_ok
-                LOADI   X0, #<boot_format_ok
-                CALL24  _RawPuts
-                BRA     .skip_format
-
-                ; -- Disk population moved to kosh task body (r18) --------
-                ; Calling sys_* from boot context corrupts page-$00 vector
-                ; table because _AllocFd reads FD_TABLE at Y3:$000C - which
-                ; in kernel page is a vector slot. Populate now runs from
-                ; kosh_entry, where Y3 = task page and FD_TABLE is task-
-                ; local zeroed memory. See `_PopulateB` inside kosh_entry.
-
-
-.format_failed:
-                LOADI   Y0, #>boot_format_err
-                LOADI   X0, #<boot_format_err
-                CALL24  _RawPuts
-                ; Fall through - kosh still runs, B: just stays unmounted.
-
-.skip_format:
+                ; -- RAM disk (B:) auto-format moved to _InitFS -------------
+                ; Formatting an unmounted B: now happens inside _InitFS (part
+                ; of FS init), BEFORE _SeedAssigns, so RAM: seeds on a cold
+                ; boot. Was here in _P2Main, which ran too late (after the
+                ; seed). See kos_fs.asm _InitFS .initfs_b_ready.
 
                 ; -- Spawn kosh --------------------------------------------
                 ; _SpawnShell does the heavy lifting that used to be

@@ -72,8 +72,8 @@
 ;
 ; --- Scratch usage --------------------------------------------------------
 ; LIST_BUF (256 bytes in kosh's task page) holds HOST_CMD_LIST output.
-; DISK_DRIVE_TMP / DISK_SECTORS_TMP / DISK_WALK_TMP are page-$00 slots
-; (LOADZ/STOREZ access). DISK_WALK_TMP saves the LIST_BUF walk offset
+; DISK_DRIVE / DISK_SECTORS / DISK_WALK are page-$00 slots
+; (LOADZ/STOREZ access). DISK_WALK saves the LIST_BUF walk offset
 ; across TRAP_PUTS calls in .do_disks.
 ; ============================================================================
 
@@ -103,18 +103,18 @@
 
                 ; Initialise walk offset.
                 LOADI   D0, #LIST_BUF
-                STOREP  D0, Y3, [#DISK_WALK_TMP]
+                STOREP  D0, Y3, [#DISK_WALK]
 
 .disks_loop:
                 ; Re-load walk pointer (Y3 = task page; X = offset).
                 MOVE    Y0, Y3
-                LOADP   D0, Y3, [#DISK_WALK_TMP]
+                LOADP   D0, Y3, [#DISK_WALK]
                 MOVE    X0, D0
 
                 ; If first byte is nul, end-of-list.
                 LOADB   D0, [XY0]
                 CMP     D0, #0
-                BEQ     .repl_loop
+                BEQ     .disks_done
 
                 ; Build display row in ROW_BUF: 2-space indent, then
                 ; name padded to 16 cols, then optional "[on X:]".
@@ -132,21 +132,19 @@
                 LOADB   D0, [XY0]
                 CMP     D0, #0
                 BEQ     .disks_name_done
-                STOREB  D0, [XY1]
+                STOREB  D0, [XY1]+
                 INC     XY0, #1
-                INC     XY1, #1
                 ADD     D3, #1
                 BRA     .disks_copy_name
 .disks_name_done:
                 INC     XY0, #1                 ; past name's nul → bay byte
 
-                LOADB   D2, [XY0]               ; D2 = bay or $FF
-                INC     XY0, #1                 ; past bay
+                LOADB   D2, [XY0]+               ; D2 = bay or $FF
                 INC     XY0, #1                 ; past pair-separator nul
 
                 ; Save walk offset for next iteration.
                 MOVE    D0, X0
-                STOREP  D0, Y3, [#DISK_WALK_TMP]
+                STOREP  D0, Y3, [#DISK_WALK]
 
                 ; Pad emitted name out to 16 chars so "[on X:]" markers
                 ; line up regardless of name length. D3 = chars emitted.
@@ -191,6 +189,10 @@
 
                 BRA     .disks_loop
 
+.disks_done:
+                CALL16  _KoshBlankLine
+                BRA     .repl_loop
+
 .disks_no_host:
                 MOVE    Y0, Y3
                 LOADI   X0, #msg_disks_unavail
@@ -217,33 +219,10 @@
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-.mount_skip_ws1:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .mount_have_name
-                INC     XY0, #1
-                BRA     .mount_skip_ws1
-
-.mount_have_name:
-                CMP     D0, #0
-                BEQ     .mount_usage
-
-                LEA     XY1, XY0                ; XY1 = name start
-
-.mount_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ     .mount_no_drv
-                CMP     D0, #CH_SPACE
-                BEQ.S   .mount_term_name
-                INC     XY0, #1
-                BRA     .mount_find_end
-
-.mount_term_name:
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-
+                ; Name token (quote-aware -> spaced host filenames OK).
+                CALL16  _KoshNextToken
+                BCS     .mount_usage
+                ; XY1 = name (ASCIIZ); XY0 = cursor past name -> drive letter.
 .mount_skip_ws2:
                 LOADB   D0, [XY0]
                 CMP     D0, #CH_SPACE
@@ -268,17 +247,17 @@
                 BHS     .mount_baddrv
 
                 SUB     D0, #'A'                ; D0 = drive 2..5
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 
                 ; --- _HostMount(name=XY1, bay=D0) -------------------------
                 LEA     XY0, XY1
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV     ; bay 0..3
                 CALL24  EMULIB_HOST_MOUNT
                 BCS     .mount_host_err
 
                 ; --- _TryMount(drive) -------------------------------------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 CALL24  KLIB_TRY_MOUNT
                 BCS     .mount_tryerr
 
@@ -361,7 +340,7 @@
                 BHS     .unm_baddrv
 
                 SUB     D0, #'A'
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 
                 ; Clear VOL_PRESENT.
                 MOVE    D1, D0
@@ -372,7 +351,7 @@
                 LOADI   D2, #0
                 STOREB  D2, [XY0+#VOL_PRESENT]
 
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV
                 CALL24  EMULIB_HOST_UNMOUNT
                 BCS     .unm_err
@@ -411,33 +390,10 @@
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-.mk_skip_ws1:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .mk_have_name
-                INC     XY0, #1
-                BRA     .mk_skip_ws1
-
-.mk_have_name:
-                CMP     D0, #0
-                BEQ     .mk_usage
-
-                LEA     XY1, XY0
-
-.mk_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ     .mk_no_size
-                CMP     D0, #CH_SPACE
-                BEQ.S   .mk_term_name
-                INC     XY0, #1
-                BRA     .mk_find_end
-
-.mk_term_name:
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                INC     XY0, #1
-
+                ; Name token (quote-aware -> spaced host filenames OK).
+                CALL16  _KoshNextToken
+                BCS     .mk_usage
+                ; XY1 = name (ASCIIZ); XY0 = cursor past name -> size.
 .mk_skip_ws2:
                 LOADB   D0, [XY0]
                 CMP     D0, #CH_SPACE
@@ -455,10 +411,10 @@
                 CMP     D0, #64
                 BLO     .mk_toosmall
 
-                STOREP  D0, Y3, [#DISK_SECTORS_TMP]
+                STOREP  D0, Y3, [#DISK_SECTORS]
 
                 LEA     XY0, XY1
-                LOADP   D0, Y3, [#DISK_SECTORS_TMP]
+                LOADP   D0, Y3, [#DISK_SECTORS]
                 CALL24  EMULIB_HOST_CREATE
                 BCS     .mk_create_err
 
@@ -503,31 +459,10 @@
                 CALL24  KLIB_STRLEN
                 INC     XY0, #1
 
-.rm_skip_ws:
-                LOADB   D0, [XY0]
-                CMP     D0, #CH_SPACE
-                BNE.S   .rm_have_name
-                INC     XY0, #1
-                BRA     .rm_skip_ws
-
-.rm_have_name:
-                CMP     D0, #0
-                BEQ     .rm_usage
-
-                LEA     XY1, XY0
-
-.rm_find_end:
-                LOADB   D0, [XY0]
-                CMP     D0, #0
-                BEQ.S   .rm_terminated
-                CMP     D0, #CH_SPACE
-                BNE.S   .rm_advance
-                LOADI   D0, #0
-                STOREB  D0, [XY0]
-                BRA.S   .rm_terminated
-.rm_advance:
-                INC     XY0, #1
-                BRA     .rm_find_end
+                ; Name token (quote-aware -> spaced host filenames OK).
+                CALL16  _KoshNextToken
+                BCS     .rm_usage
+                ; XY1 = name (ASCIIZ).
 .rm_terminated:
 
                 LEA     XY0, XY1
@@ -623,7 +558,7 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 BHS     .rn_baddrv
 
                 SUB     D0, #'A'                ; D0 = drive 2..5
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 
                 ; Step past drive letter; allow optional ':'.
                 INC     XY0, #1
@@ -678,9 +613,8 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 CMP     D0, #$5B
                 BHS     .rn_badname
 .rn_char_ok:
-                STOREB  D0, [XY1]
+                STOREB  D0, [XY1]+
                 INC     XY0, #1
-                INC     XY1, #1
                 SUB     D1, #1
                 BRA     .rn_copy
 
@@ -700,7 +634,7 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 STOREB  D0, [XY1]
 
                 ; Call _HostRename(bay, kosh_rename_buf).
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV     ; bay 0..3
                 MOVE    Y0, Y3
                 LOADI   X0, #kosh_rename_buf
@@ -798,10 +732,10 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 BHS     .rem_baddrv
 
                 SUB     D0, #'A'                ; D0 = drive 2..5
-                STOREP  D0, Y3, [#DISK_DRIVE_TMP]
+                STOREP  D0, Y3, [#DISK_DRIVE]
 
                 ; --- Capture current bay basename via _HostBayName --------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV     ; bay 0..3
                 MOVE    Y0, Y3
                 LOADI   X0, #kosh_rename_buf
@@ -809,7 +743,7 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 BCS     .rem_failed                    ; bay empty / Digital
 
                 ; --- Clear VOL_PRESENT (mirror .do_unmount) ---------------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 MOVE    D1, D0
                 SHL     D1, #6                  ; D1 = drive << 6
                 ADD     D1, #VOL_TABLE_BASE
@@ -819,7 +753,7 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 STOREB  D2, [XY0+#VOL_PRESENT]
 
                 ; --- _HostUnmount(bay) ------------------------------------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV
                 CALL24  EMULIB_HOST_UNMOUNT
                 BCS     .rem_failed
@@ -827,13 +761,13 @@ msg_rmdisk_err:      .TEXT  "rmdisk: failed (still mounted, missing?)\n",0
                 ; --- _HostMount(&kosh_rename_buf, bay) --------------------
                 MOVE    Y0, Y3
                 LOADI   X0, #kosh_rename_buf
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 SUB     D0, #DSK_HOST_BAY_FIRST_DRV
                 CALL24  EMULIB_HOST_MOUNT
                 BCS     .rem_failed
 
                 ; --- _TryMount(drive) -------------------------------------
-                LOADP   D0, Y3, [#DISK_DRIVE_TMP]
+                LOADP   D0, Y3, [#DISK_DRIVE]
                 CALL24  KLIB_TRY_MOUNT
                 BCS     .rem_failed
 

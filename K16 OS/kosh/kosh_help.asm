@@ -1,8 +1,32 @@
 ; ============================================================================
 ; kosh_help.asm - kosh `help` command (text + handler)
 ; ============================================================================
-; Date:    29 May 2026
-; Status:  Part 39 - kosh.com migration.
+; Date:    17 June 2026
+; Status:  Part 44 - subdirectory-aware filesystem commands.
+;
+; Revision: r19 - 8 August 2026 - Part 61: script + run help refreshed.
+;             `run` now documents .ksh as well as .com (it always worked -
+;             _KoshExecFile routes a ".ksh" tail to _KoshRunScript - but the
+;             help only mentioned .com). Bare-name line notes the
+;             drive-qualified X:NAME form that Part 61 unblocked, and that a
+;             bare name may be a .ksh script as well as a .com. New lines
+;             for `NAME.ksh -b` and the in-script `echo -b / -v` directive,
+;             and the "';' comments / and blank lines are skipped" sentence
+;             is whole again - the first -b line had been inserted between
+;             its two halves.
+; Revision: r18 - 30 June 2026 - Part 51: run line reworded for the VC
+;             auto-switch model (a shell launch now switches to it; & launches
+;             in the background) and ".com" auto-append; new paths: note that a
+;             bare NAME runs NAME[.com] (implicit exec - "run" is optional).
+; Revision: r17 - 28 June 2026 - Part 50: added "fg TID - bring task TID to
+;             foreground" to the system: group, beneath kill.
+; Revision: r16 - 17 June 2026 - Part 44 (Phase 2b): added the directory
+;             commands that were never listed - rmdir, cd, pwd - to the
+;             files: group, and a new paths: note explaining that bare names
+;             are current-directory-relative, sub/name walks a subdirectory,
+;             an "X:" prefix selects a drive root, and cp/mv into a directory
+;             keep the source basename. Documents the CWD/subdir path handling
+;             added across kosh_cmds_fs.asm / kosh_helpers.asm in Part 44.
 ;
 ; Revision: r15 - 29 May 2026 - Part 39: kosh.com migration. The string
 ;             reference at .do_help changed from
@@ -110,6 +134,7 @@ msg_help:      .BYTE   "shell:    help           - this list\n"
                .BYTE   "          ps             - list active tasks\n"
                .BYTE   "          task TID       - show task details\n"
                .BYTE   "          kill TID       - terminate task by TID\n"
+               .BYTE   "          fg TID         - bring task TID to foreground\n"
                .BYTE   "\n"
                .BYTE   "memory:   peek A         - read byte at A=[$]pp:[$]oooo or A=oooo\n"
                .BYTE   "          dump A [N]     - hex+ASCII dump (N bytes, default 64)\n"
@@ -128,9 +153,25 @@ msg_help:      .BYTE   "shell:    help           - this list\n"
                .BYTE   "          cat path       - print file contents [*?]\n"
                .BYTE   "          cp SRC DST     - copy file (refuses if DST exists) [*? -> drive]\n"
                .BYTE   "          rm path        - delete file [*?]\n"
+               .BYTE   "          mkdir path     - create directory\n"
+               .BYTE   "          rmdir path     - remove empty directory\n"
+               .BYTE   "          cd [path]      - change current directory (no arg = root)\n"
+               .BYTE   "          pwd            - print current directory\n"
+               .BYTE   "          assign         - list, set (NM PATH), or clear (NM) a named volume\n"
                .BYTE   "          mv SRC DST     - rename or move file [*? -> drive]\n"
                .BYTE   "          format D [LBL] - format drive D (B..F) with optional label\n"
-               .BYTE   "          run path [&]   - run a .COM (& = background)\n"
+               .BYTE   "          run NAME [&]   - run NAME[.com] or a NAME.ksh script; a shell\n"
+               .BYTE   "                           launch switches to it, & launches in the\n"
+               .BYTE   "                           background (you stay in kosh)\n"
+               .BYTE   "\n"
+               .BYTE   "paths:    relative to current dir; sub/name = subdir; X: = drive root;\n"
+               .BYTE   "          cp/mv into a directory keeps the source name\n"
+               .BYTE   "          a bare NAME or X:NAME runs NAME[.com] or NAME.ksh - 'run' is optional\n"
+               .BYTE   "\n"
+               .BYTE   "scripts:  NAME.ksh runs as a script (one command per line); ';' comments\n"
+               .BYTE   "          and blank lines are skipped; STARTUP.KSH on A:/B:/C: runs at boot\n"
+               .BYTE   "          NAME.ksh -b    - brief: echo and command output share one line\n"
+               .BYTE   "          echo -b / -v   - set brief/normal from inside a script\n"
                .BYTE   0
                .ALIGN
 

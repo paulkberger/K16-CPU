@@ -2,9 +2,13 @@
 ; kos_fs_host_mgr.asm — k/OS Parts 23–24: host-disk management helpers
 ; ============================================================================
 ; Date:    11 May 2026
-; Status:  Part 25 r6 — host file load helpers added.
+; Status:  Part 26 — _HostFOpen returns a 32-bit file size.
 ;
-; Revision: r4 — 11 May 2026 — Part 25 r6: three new helpers wrapping
+; Revision: r5 — 2 August 2026 — Part 26: _HostFOpen returns the file
+;             size as 32-bit D1:D0 (was D0 alone, capping loads at 64 KB).
+;             Reads the new DSK_SIZE_HI register. D1 was already in the
+;             Clobbers list, so no caller breaks.
+;           r4 — 11 May 2026 — Part 25 r6: three new helpers wrapping
 ;             the file-load MMIO surface ($0008..$000A):
 ;               _HostFOpen   — open file in LoadFolder, returns size
 ;               _HostFRead   — read up to N bytes from current cursor
@@ -608,7 +612,7 @@ _HostBayName:
 ; _HostFOpen — open a host file from LoadFolder for reading (Part 25 r6)
 ;
 ;   In:    XY0 = ASCIIZ filename (in caller's task page; no path components)
-;   Out:   C=0 with D0 = file size in bytes (0..65535)
+;   Out:   C=0 with D0 = file size LOW word, D1 = file size HIGH word
 ;          C=1 with D0 = ERR_NOTFOUND (file doesn't exist in LoadFolder)
 ;          C=1 with D0 = ERR_INVALID  (bad name, or Digital target)
 ;          C=1 with D0 = ERR_IO       (already open / too large / other)
@@ -619,9 +623,23 @@ _HostBayName:
 ;   (singleton state in the EMU). Caller MUST call _HostFClose before
 ;   another _HostFOpen, or this returns ERR_IO.
 ;
-;   The 64 KB file-size cap is enforced EMU-side; files larger than that
-;   are rejected with ERR_IO at open time.
+;   The file-size cap is enforced EMU-side and is 16 MB, matching k/OS's
+;   24-bit FD_POSITION. It was 64 KB until Part 26, which is what made
+;   `load zork1.z3' fail with ERR_IO at open.
+;
+;   NOTE: DSK_SIZE_HI is .EQU'd immediately below only because this pass
+;   never saw the include that holds the rest of the DSK_* block (it is
+;   NOT kos_defs.inc - checked). MOVE IT THERE alongside DSK_SECCOUNT and
+;   DSK_RESULT and delete the line below, before something else defines
+;   the same symbol at a different value.
 ; ============================================================================
+DSK_SIZE_HI     .EQU    $0014       ; FOPEN file-size high word (Part 26).
+                                    ; PAGE-RELATIVE like every other DSK_*
+                                    ; symbol: these are offsets addressed as
+                                    ; Y1=DSK_PAGE, X1=offset. The absolute
+                                    ; MMIO address is $DA0014, which is what
+                                    ; k16-host.js uses.
+                                    ; -> relocate to kos_defs.inc DSK_* block
 _HostFOpen:
                 PUSH    D3, XY3
                 PUSH    XY0, XY3                ; preserve name pointer
@@ -655,22 +673,30 @@ _HostFOpen:
                 LOADI   X1, #DSK_HOST_CMD
                 STORED  D1, [XY1]
 
-                ; Read SECCOUNT (= file size) before RESULT, since result
+                ; Read both size words before RESULT, since result
                 ; translation may overwrite D2.
                 LOADI   X1, #DSK_SECCOUNT
-                LOADD   D1, [XY1]               ; D1 = file size
+                LOADD   D1, [XY1]               ; D1 = file size low
+                LOADI   X1, #DSK_SIZE_HI
+                LOADD   D0, [XY1]               ; D0 = file size high
 
                 ; Read DSK_RESULT.
                 LOADI   X1, #DSK_RESULT
                 LOADD   D2, [XY1]               ; D2 = result code
 
                 ; Release mutex; preserve size + result across the call.
-                PUSH    D1, XY3
-                PUSH    D2, XY3
+                ; The PUSH order is chosen so the POPs land size LOW in D0
+                ; and size HIGH in D1 -- the return registers -- with no
+                ; MOVEs afterwards. (There is no SWAP Dn,Dm form; SWAP is
+                ; D <-> X/Y only, Reference Manual 6.1.)
+                PUSH    D1, XY3                 ; size low
+                PUSH    D0, XY3                 ; size high
+                PUSH    D2, XY3                 ; result
                 LOADZ   D0, [#HOST_DISK_SEM]
                 CALLR   _SemGive
-                POP     D2, XY3
-                POP     D1, XY3
+                POP     D2, XY3                 ; D2 = result
+                POP     D1, XY3                 ; D1 = size high
+                POP     D0, XY3                 ; D0 = size low
 
                 ; Discard saved name pointer + restore caller's D3.
                 POP     XY0, XY3
@@ -679,8 +705,7 @@ _HostFOpen:
                 ; Translate result code.
                 CMP     D2, #RES_OK
                 BNE     .hfo_check_err
-                MOVE    D0, D1                  ; D0 = file size
-                RETCC
+                RETCC                           ; D0 = size low, D1 = size high
 
 .hfo_check_err:
                 CMP     D2, #RES_NOT_FOUND

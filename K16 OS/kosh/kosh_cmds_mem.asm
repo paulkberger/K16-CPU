@@ -130,6 +130,7 @@
                 MOVE    Y0, Y3
                 LOADI   X0, #ROW_BUF
                 TRAP    #TRAP_PUTS
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 .peek_bad:
@@ -226,10 +227,8 @@
                 LOADI   X1, #DUMP_ROW           ; XY1 = stash buffer
                 LOADI   D3, #16
 .dump_snap_loop:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                INC     XY0, #1
-                INC     XY1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D3, #1
                 BNE     .dump_snap_loop
 
@@ -315,6 +314,7 @@
                 BRA     .dump_row
 
 .dump_done:
+                CALL16  _KoshBlankLine
                 BRA     .repl_loop
 
 .dump_bad:

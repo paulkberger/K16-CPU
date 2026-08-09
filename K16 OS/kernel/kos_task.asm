@@ -1,10 +1,15 @@
 ; ============================================================================
 ; kos_task.asm — k/OS Phase 3 task control syscalls
 ; ============================================================================
-; Date:    14 May 2026
-; Status:  Part 31 r18 — refactored. _ReapDeadTask is single source of truth
-;          for shell death; sys_exit and _HandleDeadTCB no longer have their
-;          own hand-back hooks.
+; Date:    28 June 2026
+; Status:  Part 49 — sys_exit eager-reaps graphics tasks too.
+; Revision: r19 — 28 June 2026 — Part 49: sys_exit's no-waiter eager-reap
+;             decision broadened TF_HAS_BACKBUF -> TF_FOCUSABLE, so a graphics
+;             task that exits while in the foreground ring is unlinked and the
+;             foreground handed back immediately (via _ReapDeadTask), rather
+;             than lingering as a dead ring node. _VideoForceReset already runs
+;             earlier in sys_exit, so VID_MODE is reset before the reap.
+;             Requires kos_defs.inc r45+ and kos_tcb.asm r23+.
 ; Revision: r18 — 14 May 2026 — Part 31 refactor.
 ;             Companion to kos_tcb.asm r21. The earlier r17 fix used three
 ;             separate sites (sys_exit, _HandleDeadTCB, _ReapDeadTask) to
@@ -309,7 +314,9 @@ sys_yield:
 ;   Output:  none — does not return.
 ;
 ;   Behaviour (Part 31 — r18, refactored):
-;     1. Mark self TS_DEAD; store exit code in TCB_EXIT_CODE.
+;     1. Mark self TS_DEAD; store exit code in TCB_EXIT_CODE; zero
+;        TCB_PAGE_COUNT so the page run is released immediately while the
+;        exit status is retained for a future sys_wait (Part 60).
 ;     2. Auto-release VID_MODE if self owns it (_VideoForceReset).
 ;     3. _FindWaiterFor(self.TID).
 ;        If a waiter exists  (with-waiter path):
@@ -359,6 +366,29 @@ sys_exit:
                 LOADI   D0, #TS_DEAD
                 STORED  D0, [XY1+#TCB_STATE]
                 STORED  D2, [XY1+#TCB_EXIT_CODE]
+
+                ; -- Part 60: release the PAGE RUN now, keep the STATUS -----
+                ; The lazy-reap policy below leaves us TS_DEAD so a future
+                ; sys_wait can still collect TCB_EXIT_CODE. That is the Unix
+                ; zombie and it is right. But page ownership is DERIVED from
+                ; TCB_SAVED_Y + TCB_PAGE_COUNT, so without this a corpse also
+                ; held its whole run until somebody reaped it - and a
+                ; backgrounded task has no waiter, so "somebody" might be
+                ; never. Unix frees the address space at exit and the zombie
+                ; keeps only a status; this is that split, in the mechanism we
+                ; already have.
+                ;
+                ; Zeroing the count makes _PageInUse's range empty, so the run
+                ; is free from this instant. Nothing reads it back: the exit
+                ; code lives in the TCB in page $00, the shell back-buffer is
+                ; on the kernel heap, and TCB_SAVED_X/Y are only reloaded by
+                ; the scheduler restore, which never selects a TS_DEAD TCB.
+                ;
+                ; TCB_SAVED_Y is deliberately LEFT ALONE - ps still shows
+                ; where the task lived, and _PageInUse's first compare needs
+                ; a base even when the extent is zero.
+                LOADI   D0, #0
+                STORED  D0, [XY1+#TCB_PAGE_COUNT]
                 
                 ; -- Read self.TID into D3 --------------------------------
                 LOADD   D3, [XY1+#TCB_ID]
@@ -394,11 +424,16 @@ sys_exit:
                 ; _ReapDeadTask now preserves D0..D3/XY0..XY2 (PUSH/POP at
                 ; entry/exit) so D3 = self.TID survives across the call --
                 ; we don't need to reorder OrphanChildren or stash anything.
+                ; Part 49: focusable (shell OR graphics) tasks eager-reap so the
+                ; ring unlink + foreground hand-back happen now; plain tasks
+                ; lazy-reap as before. (A graphics task that exits without first
+                ; releasing the screen still gets unlinked here; VID_MODE was
+                ; already reset by _VideoForceReset above.)
                 LOADD   D0, [XY1+#TCB_FLAGS]
-                AND     D0, #TF_HAS_BACKBUF
-                BEQ     .exit_post_reap         ; non-shell: skip reap
+                AND     D0, #TF_FOCUSABLE
+                BEQ     .exit_post_reap         ; plain task: skip reap
 
-                ; Shell-eager: reap self. XY1 = self TCB.
+                ; Focusable-eager: reap self. XY1 = self TCB.
                 CALL24  _ReapDeadTask
                 ; CURRENT_TCB now points at a TS_UNUSED slot. Reset to IDLE
                 ; so _Schedule scans from READY_HEAD rather than the stale
@@ -823,6 +858,18 @@ sys_kill:
                 ; victim.TCB_EXIT_CODE := KILL_EXIT_CODE ($FFFF)
                 LOADI   D2, #KILL_EXIT_CODE
                 STORED  D2, [XY2+#TCB_EXIT_CODE]
+
+                ; victim.TCB_PAGE_COUNT := 0 (Part 60)
+                ; Same reasoning as sys_exit: the run is released at DEATH,
+                ; the status survives until reap. Redundant on the path that
+                ; falls straight into _HandleDeadTCB below - which reaps, and
+                ; reaping frees the run anyway - but a kill that is later
+                ; refused a reap, or any future path that marks TS_DEAD and
+                ; walks away, must not leave a corpse holding pages. The
+                ; guarantee belongs next to the store that makes it dead, not
+                ; in a helper that may or may not run.
+                LOADI   D2, #0
+                STORED  D2, [XY2+#TCB_PAGE_COUNT]
 
 .sk_finalize:
                 ; -- Finalise the victim via the shared helper ---------------

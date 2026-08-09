@@ -4,6 +4,56 @@
 ; Date:    6 May 2026
 ; Status:  Phase 16 Piece 4 — name conversion, iteration, lookup, create/delete
 ;
+; Revision: r5 — 17 June 2026 — Part 47: file split into three (same
+;             assembly unit, .INCLUDEd adjacently — layout-neutral, all
+;             inter-file calls are CALLR):
+;               kos_fs_dir.asm      — core 8.3 ops: name conversion,
+;                                     iteration (_DirNextRaw/_DirNext), 8.3
+;                                     lookup, _DirSecToAbs, create + 8.3
+;                                     delete, dir-cache, RTC stubs.
+;               kos_fs_dir_lfn.asm  — LFN family, 8.3 short-name generator,
+;                                     LFN-run lookup/create/delete.
+;               kos_fs_dir_path.asm — path resolver + pwd reconstruction.
+;             kos_boot.asm: the single kos_fs_dir.asm include is now three
+;             adjacent includes (dir, then _lfn, then _path).
+;
+; Revision: r4 — 17 June 2026 — Part 47: _ScanForCluster is LFN-aware
+;             (_DirNextRaw -> _DirNext). On a first-cluster match it recovers
+;             the long name (left in LFN_ASM by _DirNext, too big for the
+;             14-byte RV_NAMEBUF) and signals D0=1; 8.3 matches stay in
+;             RV_NAMEBUF (D0=0). _BuildPath selects the source by that flag,
+;             so sys_pwd / the prompt now show long directory names.
+;
+; Revision: r3 — 17 June 2026 — Part 46 (45.5.3a): _DirDeleteRun added —
+;             LFN-aware whole-run delete ($E5s the contiguous LFN fragment
+;             entries preceding the short entry, then the short entry).
+;             Single-sector RMW; backward walk gated on attr==$0F + matching
+;             short-name checksum, terminated by the $40 (last-logical) seq
+;             bit. 8.3 files behave byte-identically to _DirDelete, which is
+;             retained (still used by _RmDir; dirs remain 8.3-only until
+;             mkdir-LFN). _DeleteFile rewired: _DirLookup->_DirLookupLong and
+;             _DirDelete->_DirDeleteRun. (rename whole-run = 45.5.3b, pending.)
+;
+; Revision: r2 — 16 June 2026 — Cluster-aware directory traversal.
+;             • _DirNextRaw and _DirLookup now resolve sec_off → absolute
+;               sector via either the root region (DIR_WALK_CLU = 0, the
+;               original path, fall-through, unchanged) or a FAT chain walk
+;               (DIR_WALK_CLU >= 2). New ZP word DIR_WALK_CLU at $03EE
+;               (kos_fs_defs.inc); _InitFS clears it to 0. Chain walk reuses
+;               _FATGetEntry + _ClusterToSector. Assumes sec_per_cluster = 1
+;               (enforced by _ClusterToSector today). FAT_BAD mid-chain →
+;               ERR_IO; running off EOC → ERR_NOMORE (_DirNextRaw) /
+;               ERR_NOTFOUND (_DirLookup).
+;             • BUNDLED (separate concern, flagged for bisection): the
+;               32-byte entry copy in _DirNextRaw and the 11-byte name
+;               compare in _DirLookup converted to STREAM [XYn]+ post-
+;               increment (Ref Manual §6.1, flag-transparent, default
+;               stride 1 for byte). If a regression appears, the STREAM
+;               edits are independently revertible from the cluster logic.
+;             • _DirOpen / _DirNext gained contract notes only (inherit
+;               DIR_WALK_CLU via _DirNextRaw; no logic change).
+;             • _DirCreate / _DirDelete remain root-only (mkdir follow-up).
+;
 ; Revision: r1 — 6 May 2026 — initial. Provides:
 ;             • _DirNameToFat / _DirNameFromFat   — 8.3 ↔ 11-byte conversion
 ;             • _DirOpen / _DirRewind             — iteration setup
@@ -127,8 +177,7 @@ _DirNameToFat:
                 LOADI   D0, #' '
                 LOADI   D1, #11
 .dn2f_fill:
-                STOREB  D0, [XY1]
-                ADD     X1, #1
+                STOREB  D0, [XY1]+
                 SUB     D1, #1
                 BNE     .dn2f_fill
 
@@ -387,7 +436,13 @@ _DirNameFromFat:
 
 
 ; ============================================================================
-; _DirOpen — initialise an iteration cookie for the root directory
+; _DirOpen — initialise an iteration cookie for a directory
+;
+;   Cluster-aware: the directory walked by the subsequent _DirNext /
+;   _DirNextRaw calls is selected by the ZP word DIR_WALK_CLU (0 = root
+;   region, >=2 = subdir start cluster). _DirOpen itself only validates the
+;   mount and returns the initial cookie; the caller is responsible for
+;   setting DIR_WALK_CLU before the open and restoring it to 0 afterwards.
 ;
 ;   In:    XY2 = volume slot ptr
 ;   Out:   C=0 with D0 = initial cookie (0)
@@ -447,19 +502,62 @@ _DirNextRaw:
                 MOVE    D2, D0
                 AND     D2, #$0F                ; D2 = ent_idx
 
-                ; --- Bound check: sec_off < ceil(root_entries / 16) -------
+                ; --- Resolve sec_off -> absolute sector -------------------
+                ; DIR_WALK_CLU = 0 : root region (original path, fall-through).
+                ; DIR_WALK_CLU >=2 : subdir — walk the FAT chain sec_off links.
+                LOADZ   D0, [#DIR_WALK_CLU]
+                CMP     D0, #0
+                BNE     .dnr_subdir
+
+                ; ===== ROOT REGION (unchanged) ============================
+                ; Bound check: sec_off < ceil(root_entries / 16)
                 LOADD   D0, [XY2+#VOL_ROOT_ENTRIES]
                 ADD     D0, #15
                 SHR4    D0                      ; D0 = root_sectors
                 CMP     D1, D0
                 BHS     .dnr_nomore
 
-                ; --- Read the target root sector --------------------------
-                ; Check dir cache first — if FS_BUF_SECTOR already holds this
-                ; sector for this drive, skip the read. _DirCacheInvalidate
-                ; resets these on any non-_DirNextRaw write to FS_BUF_SECTOR.
                 LOADD   D0, [XY2+#VOL_ROOT_START]
                 ADD     D0, D1                  ; D0 = absolute sector
+                BRA     .dnr_have_sector
+
+                ; ===== SUBDIR (cluster chain) =============================
+                ; Walk sec_off (=D1) FAT links from DIR_WALK_CLU. _FATGetEntry
+                ; needs D3=drive (live) + XY2=slot (live); it clobbers
+                ; D0/D1/D2/X0/X1, so sec_off+ent_idx go on the stack and the
+                ; per-step counter is re-saved across the call.
+.dnr_subdir:
+                PUSH    D2, XY3                 ; [A] ent_idx  (for the tail)
+                PUSH    D1, XY3                 ; [B] orig sec_off (for cookie)
+                LOADZ   D2, [#DIR_WALK_CLU]      ; D2 = current cluster
+                ; D1 = remaining steps (= sec_off)
+.dnr_walk:
+                CMP     D1, #0
+                BEQ     .dnr_walk_done
+                PUSH    D1, XY3                 ; [C] counter across the call
+                MOVE    D0, D2                  ; D0 = current cluster (input)
+                CALLR   _FATGetEntry             ; D0 = next/EOC; clobbers D1,D2,X0,X1
+                POP     D1, XY3                 ; [C]
+                BCS     .dnr_walk_io             ; FAT read error
+                CMP     D0, #FAT_BAD
+                BEQ     .dnr_walk_io             ; corrupt link -> ERR_IO
+                CMP     D0, #FAT_EOC_MIN
+                BHS     .dnr_walk_nomore         ; chain ends before sec_off
+                MOVE    D2, D0                   ; advance current cluster
+                SUB     D1, #1
+                BRA     .dnr_walk
+.dnr_walk_done:
+                MOVE    D0, D2                   ; D2 = target cluster
+                CALLR   _ClusterToSector         ; D0 = abs sector; preserves D2,D3,XY*
+                BCS     .dnr_walk_io             ; defensive (cluster<2 == corrupt)
+                POP     D1, XY3                 ; [B] restore sec_off
+                POP     D2, XY3                 ; [A] restore ent_idx
+                ; fall through — D0 = abs sector, D1 = sec_off, D2 = ent_idx
+
+                ; ===== COMMON: read sector, copy entry, advance cookie ====
+                ; Dir cache: if FS_BUF_SECTOR already holds this sector for
+                ; this drive, skip the read.
+.dnr_have_sector:
                 PUSH    D1, XY3                 ; save sec_off
                 PUSH    D2, XY3                 ; save ent_idx
 
@@ -495,20 +593,20 @@ _DirNextRaw:
                 PUSH    XY1, XY3                ; re-push for clean unwind
 
                 LOADI   Y0, #$00
-                MOVE    X0, D0
+                MOVE    X0, D0                  ; XY0 = source
                 LOADI   D0, #32
 .dnr_copy:
-                LOADB   D2, [XY0]
-                STOREB  D2, [XY1]
-                ADD     X0, #1
-                ADD     X1, #1
+                ; STREAM post-increment (stride 1, byte) — flag-transparent;
+                ; replaces LOADB/STOREB + ADD X0/X1. SUB below sets the flags.
+                LOADB   D2, [XY0]+
+                STOREB  D2, [XY1]+
                 SUB     D0, #1
                 BNE     .dnr_copy
 
                 ; --- Advance cookie ---------------------------------------
                 ; D1 = sec_off (still valid). D2 was clobbered by the copy
                 ; loop; recompute ent_idx from X0:
-                ;   X0 = FS_BUF_SECTOR + (ent_idx+1)*32
+                ;   X0 = FS_BUF_SECTOR + (ent_idx+1)*32   (32 byte-steps)
                 ; so ((X0 - FS_BUF_SECTOR) >> 5) = ent_idx + 1.
                 MOVE    D2, X0
                 SUB     D2, #FS_BUF_SECTOR
@@ -546,6 +644,27 @@ _DirNextRaw:
                 LOADI   D0, #ERR_NOMORE
                 RETCS
 
+                ; --- subdir walk failures ---------------------------------
+                ; Stack top→bottom: sec_off [B], ent_idx [A], dest, D3.
+                ; ([C] counter is always popped before reaching here.)
+.dnr_walk_io:
+                POP     D1, XY3                 ; discard sec_off [B]
+                POP     D2, XY3                 ; discard ent_idx [A]
+                POP     XY1, XY3                ; discard dest
+                POP     D3, XY3
+                LOADI   D0, #ERR_IO
+                SEC
+                RET
+
+.dnr_walk_nomore:
+                POP     D1, XY3                 ; discard sec_off [B]
+                POP     D2, XY3                 ; discard ent_idx [A]
+                POP     XY1, XY3                ; discard dest
+                POP     D3, XY3
+                LOADI   D0, #ERR_NOMORE
+                SEC
+                RET
+
 
 ; ============================================================================
 ; _DirNext — advance, return next *visible* entry (filter applied)
@@ -555,6 +674,10 @@ _DirNextRaw:
 ;     • First byte $E5  → deleted, skip silently
 ;     • Attr == $0F     → LFN, skip silently
 ;     • Attr bit 3 set  → volume label, skip silently
+;
+;   Cluster-aware via DIR_WALK_CLU (read by _DirNextRaw): 0 = root region,
+;   >=2 = subdir start cluster. Caller sets it before the walk, restores 0
+;   after. No logic change here — inherited through _DirNextRaw.
 ;
 ;   In:    D0  = current cookie
 ;          XY1 = destination buffer (≥ 32 bytes)
@@ -567,6 +690,15 @@ _DirNextRaw:
 ;   Preserves: D3, XY2, XY3
 ; ============================================================================
 _DirNext:
+                ; Part 45: reset the per-call LFN run state. Each _DirNext call
+                ; consumes one visible short entry plus any LFN fragments that
+                ; physically precede it, so the long name (if valid) lands in
+                ; LFN_ASM and its length in LFN_ASM_LEN by the time we return.
+                ; D1 is used (clobberable) so the incoming cookie in D0 survives
+                ; into the first _DirNextRaw.
+                LOADI   D1, #0
+                STOREZ  D1, [#LFN_EXP_SEQ]       ; $0000 = idle (no run)
+                STOREZ  D1, [#LFN_ASM_LEN]       ; 0 = no long name yet
 .dn_loop:
                 CALLR   _DirNextRaw
                 BCS     .dn_err
@@ -576,19 +708,34 @@ _DirNext:
                 BEQ     .dn_eod                 ; $00 → end of dir
 
                 CMP     D1, #DIR_FREE_REUSABLE
-                BEQ     .dn_loop                ; deleted, retry
+                BEQ     .dn_break_run           ; deleted breaks any LFN run, retry
 
                 LOADI   D2, #DIR_ATTR
                 LOADB   D1, [XY1+D2]
                 AND     D1, #$FF
 
                 CMP     D1, #DIR_ATTR_LFN
-                BEQ     .dn_loop                ; LFN, skip
+                BEQ     .dn_lfn                 ; LFN fragment → accumulate, retry
 
                 AND     D1, #DIR_ATTR_VOLUME_LABEL
-                BNE     .dn_loop                ; volume label, skip
+                BNE     .dn_break_run           ; volume label breaks run, retry
 
-                RETCC
+                ; Visible short entry. Finalise the accumulated long name (if a
+                ; complete run with a matching checksum precedes it). _LfnFinal
+                ; preserves D0/XY1/XY2/D3 and sets carry internally, so force
+                ; C=0 for the success return.
+                CALLR   _LfnFinal
+                CLC
+                RET
+
+.dn_lfn:
+                CALLR   _LfnAccum               ; folds [XY1] into LFN_ASM
+                BRA     .dn_loop
+
+.dn_break_run:
+                LOADI   D2, #0
+                STOREZ  D2, [#LFN_EXP_SEQ]       ; chain broken → back to idle
+                BRA     .dn_loop
 
 .dn_eod:
                 LOADI   D0, #ERR_NOMORE
@@ -636,16 +783,55 @@ _DirLookup:
                 LOADI   D1, #0                  ; sec_off = 0
 
 .dl_sec_loop:
+                ; --- Resolve sec_off -> absolute sector -------------------
+                ; DIR_WALK_CLU = 0 : root region (original path, fall-through).
+                ; DIR_WALK_CLU >=2 : subdir — walk the FAT chain sec_off links.
+                LOADZ   D0, [#DIR_WALK_CLU]
+                CMP     D0, #0
+                BNE     .dl_subdir_sector
+
+                ; ===== ROOT REGION (unchanged) =====
                 ; Bound check.
                 LOADD   D0, [XY2+#VOL_ROOT_ENTRIES]
                 ADD     D0, #15
                 SHR4    D0
                 CMP     D1, D0
                 BHS     .dl_notfound
-
-                ; Read sector sec_off into FS_BUF_SECTOR — cache-aware.
                 LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1
+                ADD     D0, D1                  ; D0 = absolute sector
+                BRA     .dl_have_sector
+
+                ; ===== SUBDIR: walk chain sec_off (=D1) links =====
+                ; _FATGetEntry needs D3=drive + XY2=slot (both live); it
+                ; clobbers D0/D1/D2/X0/X1 — keep sec_off on the stack.
+.dl_subdir_sector:
+                PUSH    D1, XY3                 ; [W] save sec_off (loop-counter copy)
+                LOADZ   D2, [#DIR_WALK_CLU]      ; D2 = current cluster
+                ; D1 = remaining steps (= sec_off)
+.dl_walk:
+                CMP     D1, #0
+                BEQ     .dl_walk_done
+                PUSH    D1, XY3                 ; [V] counter across the call
+                MOVE    D0, D2
+                CALLR   _FATGetEntry             ; D0 = next/EOC; clobbers D1,D2,X0,X1
+                POP     D1, XY3                 ; [V]
+                BCS     .dl_walk_io              ; FAT read error
+                CMP     D0, #FAT_BAD
+                BEQ     .dl_walk_io              ; corrupt link -> ERR_IO
+                CMP     D0, #FAT_EOC_MIN
+                BHS     .dl_walk_eoc             ; chain ends before sec_off -> NOTFOUND
+                MOVE    D2, D0                   ; advance cluster
+                SUB     D1, #1
+                BRA     .dl_walk
+.dl_walk_done:
+                MOVE    D0, D2                   ; D2 = target cluster
+                CALLR   _ClusterToSector         ; D0 = abs sector; preserves D2,D3,XY*
+                BCS     .dl_walk_io              ; defensive (cluster<2 == corrupt)
+                POP     D1, XY3                 ; [W] restore sec_off
+                ; fall through — D0 = absolute sector, D1 = sec_off
+
+                ; --- Read that sector into FS_BUF_SECTOR — cache-aware ----
+.dl_have_sector:
                 PUSH    D1, XY3                 ; save sec_off across the I/O
                 ; Cache hit?
                 LOADZ   D2, [#DIR_CACHE_SECTOR]
@@ -712,14 +898,16 @@ _DirLookup:
 
                 LOADI   D1, #11                 ; counter
 .dl_cmp:
-                LOADB   D0, [XY0]
+                ; STREAM post-increment (stride 1, byte) — flag-transparent.
+                ; LOADB zero-extends, so the AND #$FF is belt-and-braces.
+                ; The CMP below provides the branch flags (never branch on a
+                ; post-increment load result — see Ref Manual B.13).
+                LOADB   D0, [XY0]+
                 AND     D0, #$FF
-                LOADB   D2, [XY1]
+                LOADB   D2, [XY1]+
                 AND     D2, #$FF
                 CMP     D0, D2
                 BNE     .dl_mismatch
-                ADD     X0, #1
-                ADD     X1, #1
                 SUB     D1, #1
                 BNE     .dl_cmp
 
@@ -756,7 +944,8 @@ _DirLookup:
                 POP     XY0, XY3                ; restore caller's name
                 POP     D3, XY3
                 LOADI   D0, #ERR_NOTFOUND
-                RETCS
+                SEC
+                RET
 
 .dl_io_err:
                 ; Read failed — mark dir cache invalid so future calls retry.
@@ -767,7 +956,422 @@ _DirLookup:
                 POP     XY0, XY3                ; restore name
                 POP     D3, XY3
                 LOADI   D0, #ERR_IO
-                RETCS
+                SEC
+                RET
+
+                ; --- subdir walk failures ---------------------------------
+                ; Stack top→down: sec_off [W], name_ptr, D3.
+                ; ([V] counter is always popped before reaching here.)
+.dl_walk_io:
+                POP     D1, XY3                 ; discard sec_off [W]
+                POP     XY0, XY3                ; restore name
+                POP     D3, XY3
+                LOADI   D0, #ERR_IO
+                SEC
+                RET
+
+.dl_walk_eoc:
+                ; Chain ended before sec_off — the name simply isn't in this
+                ; directory. Same meaning to the caller as the root $00
+                ; sentinel: ERR_NOTFOUND.
+                POP     D1, XY3                 ; discard sec_off [W]
+                POP     XY0, XY3                ; restore name
+                POP     D3, XY3
+                LOADI   D0, #ERR_NOTFOUND
+                SEC
+                RET
+
+
+; ============================================================================
+; _DirSecToAbs — resolve a directory sec_off to an absolute volume sector
+;
+;   Cluster-aware. DIR_WALK_CLU selects the directory:
+;     0   = root region  -> VOL_ROOT_START + sec_off
+;     >=2 = subdir        -> walk the FAT chain sec_off links, then
+;                            _ClusterToSector on the resulting cluster.
+;
+;   In:    D1  = sec_off
+;          XY2 = volume slot ptr
+;          D3  = drive index
+;   Out:   C=0 with D0 = absolute sector
+;          C=1 with D0 = ERR_NOMORE   sec_off is past end-of-dir (chain EOC)
+;          C=1 with D0 = ERR_IO       FAT read failed / corrupt link
+;   Clobbers: D0, X0, X1, flags
+;   Preserves: D1, D2, D3, Y0, Y1, XY2, XY3
+;
+; D1 (sec_off) is preserved so the caller can reuse it for the cookie /
+; write-back. The chain walk needs a scratch counter + cluster; both are
+; kept on the stack across _FATGetEntry (which clobbers D0/D1/D2/X0/X1),
+; and D1/D2 are restored before return.
+; ============================================================================
+_DirSecToAbs:
+                LOADZ   D0, [#DIR_WALK_CLU]
+                CMP     D0, #0
+                BNE     .dsa_subdir
+
+                ; ----- root region -----
+                ; Bound: sec_off < ceil(root_entries / 16). Past the end is
+                ; reported as ERR_NOMORE (same as a subdir chain hitting EOC),
+                ; so callers get one uniform "no more sectors" signal.
+                LOADD   D0, [XY2+#VOL_ROOT_ENTRIES]
+                ADD     D0, #15
+                SHR4    D0                      ; D0 = root_sectors
+                CMP     D1, D0
+                BHS     .dsa_root_end
+                LOADD   D0, [XY2+#VOL_ROOT_START]
+                ADD     D0, D1                  ; D0 = absolute sector
+                ; NOTE: ADD sets carry on overflow; RETCC here would be a
+                ; flag bug (it returns on C=0, but ADD just clobbered C).
+                ; Force success carry explicitly.
+                CLC
+                RET
+
+.dsa_root_end:
+                LOADI   D0, #ERR_NOMORE
+                SEC
+                RET
+
+                ; ----- subdir: walk chain sec_off links -----
+.dsa_subdir:
+                PUSH    D1, XY3                 ; [a] save sec_off (preserve for caller)
+                PUSH    D2, XY3                 ; [b] save D2 (preserve for caller)
+                ; D1 = remaining steps (= sec_off); D2 = current cluster.
+                LOADZ   D2, [#DIR_WALK_CLU]
+.dsa_walk:
+                CMP     D1, #0
+                BEQ     .dsa_walk_done
+                PUSH    D1, XY3                 ; [c] counter across the call
+                MOVE    D0, D2
+                CALLR   _FATGetEntry             ; D0 = next/EOC; clobbers D1,D2,X0,X1
+                POP     D1, XY3                 ; [c]
+                BCS     .dsa_io                  ; FAT read error
+                CMP     D0, #FAT_BAD
+                BEQ     .dsa_io                  ; corrupt link -> ERR_IO
+                CMP     D0, #FAT_EOC_MIN
+                BHS     .dsa_eoc                 ; chain ends before sec_off
+                MOVE    D2, D0                   ; advance cluster
+                SUB     D1, #1
+                BRA     .dsa_walk
+.dsa_walk_done:
+                MOVE    D0, D2                   ; target cluster
+                CALLR   _ClusterToSector         ; D0 = abs sector; preserves D2,D3,XY*
+                BCS     .dsa_io                  ; defensive (cluster<2 == corrupt)
+                POP     D2, XY3                 ; [b] restore D2
+                POP     D1, XY3                 ; [a] restore sec_off
+                CLC                              ; explicit success (POPs are
+                RET                              ;   flag-transparent; be sure)
+
+.dsa_io:
+                POP     D2, XY3                 ; [b]
+                POP     D1, XY3                 ; [a]
+                LOADI   D0, #ERR_IO
+                SEC
+                RET
+
+.dsa_eoc:
+                POP     D2, XY3                 ; [b]
+                POP     D1, XY3                 ; [a]
+                LOADI   D0, #ERR_NOMORE
+                SEC
+                RET
+
+
+; ============================================================================
+; _DirGrowChain — append one fresh, zeroed cluster to a subdirectory.
+;
+;   Walks the chain at DIR_WALK_CLU to its tail, allocates a new cluster
+;   (EOC), links the tail to it, then zero-fills the new cluster's sector so
+;   every entry reads as DIR_FREE_END ($00). Used by _DirFindRun / _DirCreate
+;   when a subdir create runs off the end of the directory chain.
+;
+;   SUBDIRS ONLY — caller must have verified DIR_WALK_CLU != 0 (the fixed root
+;   region cannot grow).
+;
+;   In:    DIR_WALK_CLU = directory start cluster (>= 2)
+;          XY2 = volume slot ptr,   D3 = drive index
+;   Out:   C=0 success (chain is now one cluster longer; new sector zeroed).
+;          C=1 with D0 = ERR_NOSPACE (volume full) / ERR_IO / ERR_READONLY.
+;   Clobbers: D0, D1, D2, X0, X1, flags.   Preserves: D3, XY2, XY3.
+;
+;   Uses NO slot scratch — the tail and new-cluster numbers live on the stack.
+;   The grow is invoked from inside _DirFindRun (called by _DirCreateRun), which
+;   has live metadata in slot+$3A/$3B/$3C (notably the LFN checksum at $3A).
+;   Touching slot scratch here would corrupt that and yield ERR_NOTFOUND on the
+;   subsequent long-name lookup.
+; ============================================================================
+_DirGrowChain:
+                ; --- 1. walk to the tail cluster --------------------------
+                LOADZ   D2, [#DIR_WALK_CLU]      ; D2 = cur
+.dgc_walk:
+                MOVE    D0, D2
+                PUSH    D2, XY3                  ; preserve cur across the FAT read
+                CALLR   _FATGetEntry             ; D0 = FAT[cur]; clobbers D1,D2,X0,X1
+                POP     D2, XY3                  ; D2 = cur
+                BCS     .dgc_err                 ; D0 = ERR_IO
+                CMP     D0, #FAT_BAD
+                BEQ     .dgc_io                  ; corrupt link
+                CMP     D0, #FAT_EOC_MIN
+                BHS     .dgc_tail                ; D0 >= EOC -> cur (D2) is the tail
+                MOVE    D2, D0                   ; advance to next cluster
+                BRA     .dgc_walk
+.dgc_tail:
+                ; D2 = tail cluster.
+                ; --- 1b. clear the end-of-dir sentinel in the tail --------
+                ; Once we append a cluster, this tail is no longer the final
+                ; cluster, so it must contain no $00 (DIR_FREE_END) entry — a
+                ; $00 here would make traversal (lookup, dirent) stop before
+                ; reaching the new cluster. Rewrite every $00 first-byte to
+                ; $E5 (DIR_FREE_REUSABLE), which scanners skip. The 8.3 grow
+                ; path only grows a full tail, so this is a no-op there.
+                PUSH    D2, XY3                  ; [tail]
+                MOVE    D0, D2
+                CALLR   _ClusterToSector         ; D0 = tail abs sector
+                BCS     .dgc_err_pop1
+                PUSH    D0, XY3                  ; [tail][tsec]
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                CALLR   _VolBlockRead            ; tail sector -> FS_BUF_SECTOR
+                BCS     .dgc_err_pop2
+                LOADI   Y1, #$00                 ; scan 16 entries
+                LOADI   X1, #FS_BUF_SECTOR
+                LOADI   D1, #16
+.dgc_fill:
+                LOADB   D0, [XY1]
+                AND     D0, #$FF
+                CMP     D0, #DIR_FREE_END        ; $00 = never-used
+                BNE     .dgc_fill_next
+                LOADI   D0, #DIR_FREE_REUSABLE   ; $E5 = deleted/reusable (skipped)
+                STOREB  D0, [XY1]
+.dgc_fill_next:
+                ADD     X1, #32                  ; next 32-byte entry
+                SUB     D1, #1
+                BNE     .dgc_fill
+                POP     D0, XY3                  ; [tail] ; D0 = tsec
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                CALLR   _VolBlockWrite           ; write the de-sentinelled tail back
+                BCS     .dgc_err_pop1            ; ERR_IO/READONLY -> discard [tail]
+
+                ; --- 2. allocate a new cluster (returns EOC) --------------
+                CALLR   _AllocCluster            ; D0 = newclu; C=1 ERR_NOSPACE
+                BCS     .dgc_err_pop1            ; full -> discard [tail]
+                POP     D1, XY3                  ; D1 = tail   (stack: empty)
+                PUSH    D0, XY3                  ; [newclu]
+                MOVE    D0, D1                   ; D0 = tail
+                POP     D1, XY3                  ; D1 = newclu (stack: empty)
+                PUSH    D1, XY3                  ; [newclu]    (keep for sector zero)
+                ; --- 3. link FAT[tail] = newclu ---------------------------
+                CALLR   _FATSetEntry             ; FAT[tail]=newclu (D0=tail, D1=newclu)
+                BCS     .dgc_err_pop1            ; ERR_IO/READONLY -> discard [newclu]
+                ; --- 4. zero the new cluster's sector and write it --------
+                CALLR   _ZeroBuffer              ; FS_BUF_SECTOR = 0 (keeps stack/XY3)
+                POP     D0, XY3                  ; D0 = newclu (stack: empty)
+                CALLR   _ClusterToSector         ; D0 = abs sector; preserves XY*,D2,D3
+                BCS     .dgc_err                 ; (defensive: cluster < 2)
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR        ; XY0 = source buffer
+                CALLR   _VolBlockWrite           ; D0 = sector, XY0 = buf, XY2 = slot
+                BCS     .dgc_err                 ; ERR_IO / ERR_READONLY
+                CLC
+                RET
+
+.dgc_err_pop2:
+                POP     D1, XY3                  ; discard [tsec]
+.dgc_err_pop1:
+                POP     D1, XY3                  ; discard the one saved cluster number
+                SEC
+                RET
+.dgc_io:
+                LOADI   D0, #ERR_IO
+.dgc_err:
+                SEC
+                RET
+
+
+; ============================================================================
+; _DirInitCluster — write the '.' and '..' entries into a fresh dir cluster
+;
+;   Lays down exactly two 32-byte directory entries at the start of the
+;   given (already-allocated, EOC-marked) cluster, the rest zero-filled:
+;     entry 0  "."   attr=DIR, first_cluster = selfclu
+;     entry 1  ".."  attr=DIR, first_cluster = parentclu  (0 if parent is
+;                                                           the root region)
+;   Then writes the sector to disk via _VolBlockWrite.
+;
+;   FAT '.'/'..' names are plain 8.3, never LFN: "."  -> "."+10 spaces,
+;   ".." -> ".."+9 spaces. Date/time from _GetDate/_GetTime.
+;
+;   In:    D0  = self cluster   (the new directory's own cluster, >=2)
+;          D1  = parent cluster (0 = parent is the hardware root region)
+;          XY2 = volume slot ptr
+;          D3  = drive index
+;   Out:   C=0 success
+;          C=1 with D0 = ERR_IO / ERR_READONLY  on write failure
+;          C=1 with D0 = ERR_INVALID            self cluster < 2
+;   Clobbers: D0, D1, D2, X0, X1, flags
+;   Preserves: D3, XY2, XY3
+;
+;   Self/parent clusters are stashed in the slot reserved area $30..$33
+;   (same scratch _DirCreate / _FormatVolume use; no temporal overlap).
+; ============================================================================
+_DirInitCluster:
+                PUSH    D3, XY3
+
+                ; Stash self (D0) + parent (D1) in slot+$30 / slot+$32.
+                MOVE    X1, X2
+                ADD     X1, #$30
+                MOVE    Y1, Y2                  ; XY1 = slot + $30
+                STORED  D0, [XY1+#0]            ; self cluster
+                STORED  D1, [XY1+#2]            ; parent cluster
+
+                ; Compute target sector for self cluster (need it before we
+                ; clobber things; _ClusterToSector preserves D2/D3/XY*).
+                ; D0 still = self cluster here.
+                CALLR   _ClusterToSector         ; D0 = abs sector
+                BCS     .dic_inval               ; self < 2 -> ERR_INVALID
+                ; Stash the sector at slot+$34.
+                MOVE    X1, X2
+                ADD     X1, #$34
+                MOVE    Y1, Y2
+                STORED  D0, [XY1+#0]            ; abs sector
+
+                ; Zero the whole sector buffer.
+                CALLR   _ZeroBuffer              ; FS_BUF_SECTOR = 0; preserves D2,D3,XY2,XY3
+
+                ; --- entry 0 : "." -----------------------------------------
+                ; Name: '.' then 10 spaces.
+                LOADI   Y1, #$00
+                LOADI   X1, #FS_BUF_SECTOR       ; XY1 -> entry 0, byte 0
+                LOADI   D0, #'.'
+                STOREB  D0, [XY1]+               ; name[0] = '.'
+                LOADI   D0, #' '
+                LOADI   D2, #10
+.dic_dot_pad:
+                STOREB  D0, [XY1]+
+                SUB     D2, #1
+                BNE     .dic_dot_pad
+                ; XY1 now at entry0 + 11 = DIR_ATTR.
+                LOADI   D0, #DIR_ATTR_DIRECTORY
+                STOREB  D0, [XY1]+               ; attr ; XY1 -> +$0C
+                CALLR   _DicFillMeta             ; fills +$0C..+$19, sets cluster/size
+                ; On return XY1 -> entry0 + $1A; write self cluster + zero size.
+                MOVE    X1, X2
+                ADD     X1, #$30
+                MOVE    Y1, Y2
+                LOADD   D0, [XY1+#0]             ; self cluster
+                LOADI   Y1, #$00
+                LOADI   X1, #FS_BUF_SECTOR
+                ADD     X1, #$1A                 ; entry0 + DIR_FIRST_CLUSTER_LO
+                STORED  D0, [XY1]                ; first cluster lo
+                ADD     X1, #2
+                LOADI   D0, #0
+                STORED  D0, [XY1]                ; size lo
+                ADD     X1, #2
+                STORED  D0, [XY1]                ; size hi
+
+                ; --- entry 1 : ".." ----------------------------------------
+                LOADI   Y1, #$00
+                LOADI   X1, #FS_BUF_SECTOR
+                ADD     X1, #32                  ; entry 1, byte 0
+                LOADI   D0, #'.'
+                STOREB  D0, [XY1]+               ; name[0] = '.'
+                STOREB  D0, [XY1]+               ; name[1] = '.'
+                LOADI   D0, #' '
+                LOADI   D2, #9
+.dic_dd_pad:
+                STOREB  D0, [XY1]+
+                SUB     D2, #1
+                BNE     .dic_dd_pad
+                ; XY1 -> entry1 + 11 = DIR_ATTR.
+                LOADI   D0, #DIR_ATTR_DIRECTORY
+                STOREB  D0, [XY1]+
+                CALLR   _DicFillMeta
+                ; parent cluster + zero size at entry1 + $1A.
+                MOVE    X1, X2
+                ADD     X1, #$32
+                MOVE    Y1, Y2
+                LOADD   D0, [XY1+#0]             ; parent cluster (0 = root)
+                LOADI   Y1, #$00
+                LOADI   X1, #FS_BUF_SECTOR
+                ADD     X1, #32
+                ADD     X1, #$1A                 ; entry1 + DIR_FIRST_CLUSTER_LO
+                STORED  D0, [XY1]
+                ADD     X1, #2
+                LOADI   D0, #0
+                STORED  D0, [XY1]
+                ADD     X1, #2
+                STORED  D0, [XY1]
+
+                ; --- write the sector back ---------------------------------
+                MOVE    X1, X2
+                ADD     X1, #$34
+                MOVE    Y1, Y2
+                LOADD   D0, [XY1+#0]             ; abs sector
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                CALLR   _VolBlockWrite
+                BCS     .dic_err                 ; D0 = ERR_IO / ERR_READONLY
+
+                ; The dir cache may have held a different sector; this write
+                ; bypassed _DirNextRaw, so drop the cache to be safe.
+                CALLR   _DirCacheInvalidate
+
+                LOADI   D0, #ERR_OK
+                CLC
+                POP     D3, XY3
+                RET
+
+.dic_inval:
+                LOADI   D0, #ERR_INVALID
+                POP     D3, XY3
+                SEC
+                RET
+
+.dic_err:
+                ; D0 already = ERR_IO / ERR_READONLY, C=1.
+                POP     D3, XY3
+                RET
+
+
+; ============================================================================
+; _DicFillMeta — fill dirent metadata bytes +$0C..+$19 (NT/time/date)
+;
+;   Internal helper for _DirInitCluster. On entry XY1 points at the
+;   attribute byte + 1 (i.e. dirent + $0C). Writes:
+;     +$0C NT-reserved = 0, +$0D create-tenths = 0
+;     +$0E create-time, +$10 create-date, +$12 access-date
+;     +$14 first-cluster-hi = 0
+;     +$16 write-time, +$18 write-date
+;   Leaves XY1 -> dirent + $1A (DIR_FIRST_CLUSTER_LO). Caller writes the
+;   cluster + size words.
+;
+;   In:    XY1 = dirent + $0C
+;   Out:   XY1 = dirent + $1A
+;   Clobbers: D0, X1, flags
+;   Preserves: D1, D2, D3, Y1, XY2, XY3
+; ============================================================================
+_DicFillMeta:
+                LOADI   D0, #0
+                STOREB  D0, [XY1]+               ; +$0C NT-reserved
+                STOREB  D0, [XY1]+               ; +$0D create-tenths
+                CALLR   _GetTime
+                STORED  D0, [XY1]                ; +$0E create-time
+                ADD     X1, #2
+                CALLR   _GetDate
+                STORED  D0, [XY1]                ; +$10 create-date
+                ADD     X1, #2
+                STORED  D0, [XY1]                ; +$12 access-date (= create-date)
+                ADD     X1, #2
+                LOADI   D0, #0
+                STORED  D0, [XY1]                ; +$14 first-cluster-hi = 0
+                ADD     X1, #2
+                CALLR   _GetTime
+                STORED  D0, [XY1]                ; +$16 write-time
+                ADD     X1, #2
+                CALLR   _GetDate
+                STORED  D0, [XY1]                ; +$18 write-date
+                ADD     X1, #2                   ; XY1 -> +$1A
+                RET
 
 
 ; ============================================================================
@@ -827,16 +1431,18 @@ _DirCreate:
                 LOADI   D1, #0                  ; sec_off
 
 .dc_sec_loop:
-                ; Bound check.
-                LOADD   D0, [XY2+#VOL_ROOT_ENTRIES]
-                ADD     D0, #15
-                SHR4    D0
-                CMP     D1, D0
-                BHS     .dc_nospace
-
-                ; Read sector.
-                LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1
+                ; Resolve sec_off -> absolute sector (root or subdir chain).
+                CALLR   _DirSecToAbs
+                BCS     .dc_offend              ; off the end -> grow subdir or ENOSPACE
+                                                ; for create purposes; ERR_IO
+                                                ; also lands here -> see note.
+                ; NOTE: _DirSecToAbs returns ERR_NOMORE past end-of-dir and
+                ; ERR_IO on a FAT fault. For a root dir, the original code
+                ; treated "ran off the end" as ERR_NOSPACE; we preserve that
+                ; by mapping both the chain-end and the root bound here.
+                ; A genuine ERR_IO is rare and also surfaces as no-space to
+                ; the caller; acceptable for Phase-16 mkdir (subdir growth,
+                ; which would distinguish them, is a later change).
                 PUSH    D1, XY3                 ; save sec_off
                 LOADI   Y0, #$00
                 LOADI   X0, #FS_BUF_SECTOR
@@ -881,16 +1487,121 @@ _DirCreate:
                 ; --- Save sec_off (ent_idx not needed past this point) ---
                 PUSH    D1, XY3
 
+                ; Format the 32-byte short entry (name + metadata) in place.
+                ; XY0 = name, XY1 = entry addr, XY2 = slot (meta at slot+$30).
+                CALLR   _DicFormatShortEntry
+
+                ; --- Write the modified sector back -----------------------
+                POP     D1, XY3                 ; restore sec_off
+                CALLR   _DirSecToAbs            ; D0 = absolute sector (D1 preserved)
+                BCS     .dc_io_err              ; (shouldn't fail — sector was just read)
+
+                ; Stash the absolute sector before _VolBlockWrite, which
+                ; clobbers D0/D1/D2. We reuse it for the cache identity below
+                ; instead of re-calling _DirSecToAbs — _VolBlockWrite destroys
+                ; D1 (sec_off), so a second resolve would walk a garbage
+                ; sec_off and (for the root) trip the bound -> ERR_NOMORE.
+                PUSH    D0, XY3                 ; [S] absolute sector
+
+                LOADI   Y0, #$00
+                LOADI   X0, #FS_BUF_SECTOR
+                CALLR   _VolBlockWrite
+                BCS     .dc_io_err_pops         ; D0 = ERR_IO or ERR_READONLY
+
+                ; Part 22: update dir cache identity. Reuse [S], NOT a fresh
+                ; _DirSecToAbs (D1 is now garbage from _VolBlockWrite).
+                POP     D0, XY3                 ; [S] absolute sector
+                STOREZ  D0, [#DIR_CACHE_SECTOR]
+                STOREZB D3, [#DIR_CACHE_DRIVE]
+
+                ; Invalidate dirent iteration cache — file create may shift
+                ; later entries' indices, so any cached "I was at index N
+                ; cookie X" assumption is no longer safe.
+                LOADI   D0, #$FFFF
+                STOREZ  D0, [#DIRENT_LAST_COOKIE]
+
+                LOADI   D0, #ERR_OK
+                CLC
+                POP     XY0, XY3                ; restore name
+                POP     D3, XY3
+                RET
+
+.dc_io_err_pop1:
+                ; Used after the per-sector PUSH but before per-entry pushes.
+                ; Stack: sec_off, name_ptr, D3.
+                POP     D1, XY3                 ; discard sec_off
+                ; fall through to .dc_io_err
+
+.dc_offend:
+                ; _DirSecToAbs ran off the end. Subdir + end-of-chain
+                ; (ERR_NOMORE) -> grow one cluster and retry the same sec_off;
+                ; root region or a real ERR_IO -> ENOSPACE (as before).
+                CMP     D0, #ERR_NOMORE
+                BNE     .dc_nospace
+                LOADZ   D0, [#DIR_WALK_CLU]
+                CMP     D0, #0
+                BEQ     .dc_nospace             ; root region cannot grow
+                PUSH    D1, XY3                 ; save sec_off across the grow
+                CALLR   _DirGrowChain
+                POP     D1, XY3
+                BCS     .dc_grow_fail
+                BRA     .dc_sec_loop            ; retry; sec_off now in the new cluster
+.dc_grow_fail:
+                ; D0 = grow error. Unwind entry pushes (name_ptr, D3), return it.
+                POP     XY0, XY3
+                POP     D3, XY3
+                SEC
+                RET
+
+.dc_nospace:
+                ; Stack: name_ptr, D3.
+                POP     XY0, XY3
+                POP     D3, XY3
+                LOADI   D0, #ERR_NOSPACE
+                RETCS
+
+.dc_io_err:
+                ; D0 already = ERR_IO or ERR_READONLY from _VolBlockRead/Write,
+                ; C=1. Just unwind and return.
+                POP     XY0, XY3
+                POP     D3, XY3
+                RET
+
+.dc_io_err_pops:
+                ; Write-back failure with [S] (absolute sector) still on the
+                ; stack: [S, name_ptr, D3]. Discard [S] into D1 (POP is flag-
+                ; transparent; D0 keeps the error code), then unwind. C=1
+                ; already from _VolBlockWrite.
+                POP     D1, XY3                 ; discard [S]
+                POP     XY0, XY3                ; name
+                POP     D3, XY3
+                RET
+
+
+
+
+; ============================================================================
+; _DicFormatShortEntry — write a 32-byte 8.3 short directory entry at [XY1].
+;
+;   Factored out of _DirCreate so the LFN run writer (_DirCreateRun) shares the
+;   exact same short-entry layout. Copies the 11-byte name from XY0, then the
+;   attr / NT-reserved / create+access+write time & date / first-cluster / size
+;   fields, reading attr/cluster/size from the slot stash at slot+$30..$35.
+;
+;   In:    XY0 = 11-byte name source   XY1 = dest entry addr (in FS_BUF_SECTOR)
+;          XY2 = slot (meta stash at slot+$30 attr, +$32 cluster, +$34 size)
+;   Out:   32 bytes written at the original [XY1]; XY1 walked to entry+32.
+;   Clobbers: D0, D2, X0, X1, flags.   Preserves: D1, D3, XY2, XY3.
+; ============================================================================
+_DicFormatShortEntry:
                 ; --- Copy 11 name bytes from XY0 to XY1 -------------------
                 ; XY1 walks forward through the dirent.
                 LOADI   D0, #11
-.dc_name_copy:
-                LOADB   D2, [XY0]
-                STOREB  D2, [XY1]
-                ADD     X0, #1
-                ADD     X1, #1
+.dfs_name_copy:
+                LOADB   D2, [XY0]+
+                STOREB  D2, [XY1]+
                 SUB     D0, #1
-                BNE     .dc_name_copy
+                BNE     .dfs_name_copy
 
                 ; XY1 now = entry + 11 = +DIR_ATTR.
                 ; --- Reload caller's attr/cluster/size from slot stash ---
@@ -952,54 +1663,28 @@ _DirCreate:
                 ADD     X1, #2
                 LOADI   D0, #0
                 STORED  D0, [XY1]
-
-                ; --- Write the modified sector back -----------------------
-                POP     D1, XY3                 ; restore sec_off
-                LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1                  ; absolute sector
-
-                LOADI   Y0, #$00
-                LOADI   X0, #FS_BUF_SECTOR
-                CALLR   _VolBlockWrite
-                BCS     .dc_io_err              ; D0 = ERR_IO or ERR_READONLY
-
-                ; Part 22: update dir cache identity. _VolBlockWrite
-                ; clobbered D0 (status code), so recompute the sector #.
-                LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1
-                STOREZ  D0, [#DIR_CACHE_SECTOR]
-                STOREZB D3, [#DIR_CACHE_DRIVE]
-
-                ; Invalidate dirent iteration cache — file create may shift
-                ; later entries' indices, so any cached "I was at index N
-                ; cookie X" assumption is no longer safe.
-                LOADI   D0, #$FFFF
-                STOREZ  D0, [#DIRENT_LAST_COOKIE]
-
-                LOADI   D0, #ERR_OK
-                CLC
-                POP     XY0, XY3                ; restore name
-                POP     D3, XY3
                 RET
 
-.dc_io_err_pop1:
-                ; Used after the per-sector PUSH but before per-entry pushes.
-                ; Stack: sec_off, name_ptr, D3.
-                POP     D1, XY3                 ; discard sec_off
-                ; fall through to .dc_io_err
 
-.dc_nospace:
-                ; Stack: name_ptr, D3.
-                POP     XY0, XY3
-                POP     D3, XY3
-                LOADI   D0, #ERR_NOSPACE
-                RETCS
 
-.dc_io_err:
-                ; D0 already = ERR_IO or ERR_READONLY from _VolBlockRead/Write,
-                ; C=1. Just unwind and return.
-                POP     XY0, XY3
-                POP     D3, XY3
+
+; ============================================================================
+; _DcrEntryAddr — XY1 = FS_BUF_SECTOR + (ent_idx + k) * 32  (entry address).
+;   In:  D0 = k.   Reads ent_idx from slot+$3E.   XY2 = slot.
+;   Out: XY1 = entry address.   Clobbers D0, D1, X1, Y1.   Preserves D2, D3.
+; ============================================================================
+_DcrEntryAddr:
+                MOVE    X1, X2
+                ADD     X1, #$3E
+                MOVE    Y1, Y2
+                LOADB   D1, [XY1]
+                AND     D1, #$FF                ; ent_idx
+                ADD     D0, D1                  ; slot index = ent_idx + k
+                SHL4    D0
+                SHL     D0                      ; * 32
+                ADD     D0, #FS_BUF_SECTOR
+                LOADI   Y1, #$00
+                MOVE    X1, D0
                 RET
 
 
@@ -1047,20 +1732,30 @@ _DirDelete:
                 LOADI   D0, #DIR_FREE_REUSABLE
                 STOREB  D0, [XY1]
 
-                ; Write sector back.
-                LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1                  ; absolute sector
+                ; Write sector back. The entry lives in DIR_WALK_CLU's
+                ; directory (root region if 0, else a subdir cluster chain),
+                ; NOT necessarily the root — so map sec_off -> absolute via
+                ; _DirSecToAbs, exactly as _DirCreate does. (Bug 16 Jun 2026:
+                ; this used VOL_ROOT_START + sec_off unconditionally, so a
+                ; subdir delete stamped the modified subdir sector on top of
+                ; the ROOT directory — wiping root and orphaning entries.)
+                ; D1 = sec_off here. _DirSecToAbs takes sec_off in D1 and
+                ; preserves D2/D3/XY*.
+                CALLR   _DirSecToAbs            ; D0 = absolute sector
+                BCS     .dd_io_err              ; (shouldn't fail — just read)
+
+                ; _VolBlockWrite clobbers D0/D1/D2; stash the abs sector to
+                ; reuse for the cache identity (a second _DirSecToAbs would
+                ; see a garbage sec_off and could trip the root bound).
+                PUSH    D0, XY3                 ; [S] absolute sector
 
                 LOADI   Y0, #$00
                 LOADI   X0, #FS_BUF_SECTOR
                 CALLR   _VolBlockWrite
-                BCS     .dd_io_err              ; D0 = ERR_IO or ERR_READONLY
+                BCS     .dd_io_err_pops         ; D0 = ERR_IO or ERR_READONLY
 
-                ; Part 22: update dir cache identity (FS_BUF_SECTOR is now
-                ; this dir sector with the deletion applied). _VolBlockWrite
-                ; clobbered D0; recompute.
-                LOADD   D0, [XY2+#VOL_ROOT_START]
-                ADD     D0, D1
+                ; Part 22: update dir cache identity. Reuse [S].
+                POP     D0, XY3                 ; [S] absolute sector
                 STOREZ  D0, [#DIR_CACHE_SECTOR]
                 STOREZB D3, [#DIR_CACHE_DRIVE]
 
@@ -1076,8 +1771,16 @@ _DirDelete:
                 RET
 
 .dd_io_err:
-                ; D0 already set by _VolBlockWrite, C=1.
+                ; D0 already set by _VolBlockWrite/_DirSecToAbs, C=1.
                 POP     XY0, XY3
+                RET
+
+.dd_io_err_pops:
+                ; Write-back failure with [S] (abs sector) still on the stack:
+                ; [S, name]. Discard [S] into D1 (POP is flag-transparent;
+                ; D0 keeps the error code), then unwind. C=1 already.
+                POP     D1, XY3                 ; discard [S]
+                POP     XY0, XY3                ; name
                 RET
 
 .dd_err:
@@ -1086,19 +1789,6 @@ _DirDelete:
                 RET
 
 
-; ============================================================================
-; _DirCacheInvalidate — drop the dir-buffer cache (Part 22)
-;
-;   Used by anything that writes to FS_BUF_SECTOR with sector data that's
-;   NOT a root-directory sector (or a different drive's root). Examples:
-;   _TryMount reading a BPB, _DirLookup reading directory entries on a
-;   different drive, sys_read reading file data, _DirInsert / _DirDelete
-;   after their sector-write.
-;
-;   In:    none
-;   Out:   DIR_CACHE_SECTOR = $FFFF
-;   Clobbers: D0
-; ============================================================================
 _DirCacheInvalidate:
                 LOADI   D0, #FAT_CACHE_INVALID
                 STOREZ  D0, [#DIR_CACHE_SECTOR]
@@ -1108,3 +1798,7 @@ _DirCacheInvalidate:
 ; ============================================================================
 ; End of kos_fs_dir.asm
 ; ============================================================================
+
+
+
+

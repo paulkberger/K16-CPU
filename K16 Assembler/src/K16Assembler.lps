@@ -8,7 +8,7 @@
       <Unit>
         <Filename Value="K16Assembler.lpr"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="3"/>
+        <EditorIndex Value="2"/>
         <CursorPos Y="32"/>
         <UsageCount Value="200"/>
         <Loaded Value="True"/>
@@ -20,8 +20,8 @@
         <HasResources Value="True"/>
         <ResourceBaseClass Value="Form"/>
         <UnitName Value="Main"/>
-        <TopLine Value="403"/>
-        <CursorPos X="5" Y="448"/>
+        <TopLine Value="185"/>
+        <CursorPos X="44" Y="225"/>
         <UsageCount Value="200"/>
         <Loaded Value="True"/>
         <LoadedDesigner Value="True"/>
@@ -29,9 +29,10 @@
       <Unit>
         <Filename Value="K16_Assembler.pas"/>
         <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="1"/>
-        <TopLine Value="3432"/>
-        <CursorPos X="5" Y="3478"/>
+        <TopLine Value="3728"/>
+        <CursorPos X="5" Y="3779"/>
         <UsageCount Value="200"/>
         <Loaded Value="True"/>
       </Unit>
@@ -98,7 +99,7 @@
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="-1"/>
         <TopLine Value="224"/>
-        <CursorPos X="5" Y="270"/>
+        <CursorPos X="5" Y="272"/>
         <UsageCount Value="200"/>
       </Unit>
       <Unit>
@@ -114,25 +115,24 @@
         <Filename Value="K16_Encoder_Jump.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="-1"/>
-        <TopLine Value="169"/>
+        <TopLine Value="157"/>
         <CursorPos X="5" Y="215"/>
         <UsageCount Value="200"/>
       </Unit>
       <Unit>
         <Filename Value="K16_Encoder_LEA.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="5"/>
-        <TopLine Value="365"/>
-        <CursorPos X="5" Y="414"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="363"/>
+        <CursorPos X="5" Y="410"/>
         <UsageCount Value="200"/>
-        <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="K16_Encoder_Load.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="-1"/>
-        <TopLine Value="828"/>
-        <CursorPos X="5" Y="874"/>
+        <TopLine Value="842"/>
+        <CursorPos X="5" Y="890"/>
         <UsageCount Value="200"/>
       </Unit>
       <Unit>
@@ -165,8 +165,8 @@
         <Filename Value="K16_Encoder_Store.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="-1"/>
-        <TopLine Value="744"/>
-        <CursorPos X="5" Y="790"/>
+        <TopLine Value="758"/>
+        <CursorPos X="5" Y="806"/>
         <UsageCount Value="200"/>
       </Unit>
       <Unit>
@@ -180,11 +180,10 @@
       <Unit>
         <Filename Value="K16_Parser.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="4"/>
-        <TopLine Value="1936"/>
-        <CursorPos X="5" Y="1982"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="1977"/>
+        <CursorPos X="5" Y="2024"/>
         <UsageCount Value="200"/>
-        <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="k16_encoder_trapret.pas"/>
@@ -193,165 +192,152 @@
         <EditorIndex Value="-1"/>
         <TopLine Value="221"/>
         <CursorPos X="5" Y="267"/>
-        <UsageCount Value="131"/>
+        <UsageCount Value="205"/>
       </Unit>
       <Unit>
-        <Filename Value="C:\lazarus\fpc\3.2.2\source\packages\rtl-generics\src\generics.collections.pas"/>
-        <UnitName Value="Generics.Collections"/>
+        <Filename Value="k16_encoder_stream.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="K16_Encoder_Stream"/>
         <EditorIndex Value="-1"/>
-        <TopLine Value="1163"/>
-        <CursorPos X="20" Y="1186"/>
-        <UsageCount Value="4"/>
+        <TopLine Value="124"/>
+        <CursorPos X="5" Y="172"/>
+        <UsageCount Value="152"/>
       </Unit>
       <Unit>
         <Filename Value="C:\lazarus\lcl\include\customform.inc"/>
         <EditorIndex Value="-1"/>
         <TopLine Value="901"/>
         <CursorPos Y="924"/>
-        <UsageCount Value="14"/>
+        <UsageCount Value="1"/>
       </Unit>
       <Unit>
         <Filename Value="K16_Listing.pas"/>
-        <IsVisibleTab Value="True"/>
-        <EditorIndex Value="2"/>
-        <TopLine Value="800"/>
-        <CursorPos X="5" Y="846"/>
-        <UsageCount Value="12"/>
+        <EditorIndex Value="3"/>
+        <TopLine Value="818"/>
+        <CursorPos X="5" Y="865"/>
+        <UsageCount Value="11"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="..\K16 Emulator\K16EmuCLI.lpr"/>
+        <Filename Value="K16_Regions.pas"/>
         <EditorIndex Value="-1"/>
-        <UsageCount Value="4"/>
-      </Unit>
-      <Unit>
-        <Filename Value="C:\lazarus\components\synedit\allsynedit.pas"/>
-        <EditorIndex Value="-1"/>
-        <CursorPos X="50" Y="34"/>
-        <UsageCount Value="4"/>
-      </Unit>
-      <Unit>
-        <Filename Value="K16_SynEditHighlighter.pas"/>
-        <EditorIndex Value="-1"/>
-        <TopLine Value="168"/>
-        <CursorPos X="5" Y="775"/>
-        <UsageCount Value="13"/>
-      </Unit>
-      <Unit>
-        <Filename Value="K16_SynListingHighlighter.pas"/>
-        <EditorIndex Value="-1"/>
-        <TopLine Value="861"/>
-        <CursorPos X="5" Y="910"/>
-        <UsageCount Value="9"/>
-      </Unit>
-      <Unit>
-        <Filename Value="K16_PseudoShift.pas"/>
-        <EditorIndex Value="-1"/>
-        <TopLine Value="283"/>
-        <CursorPos X="5" Y="329"/>
-        <UsageCount Value="12"/>
+        <TopLine Value="457"/>
+        <CursorPos X="5" Y="504"/>
+        <UsageCount Value="50"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="24">
+    <JumpHistory HistoryIndex="27">
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="602" Column="24" TopLine="587"/>
+        <Caret Line="245" TopLine="228"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="640" Column="5" TopLine="591"/>
-      </Position>
-      <Position>
-        <Filename Value="main.pas"/>
-        <Caret Line="639" Column="5" TopLine="594"/>
-      </Position>
-      <Position>
-        <Filename Value="main.pas"/>
-        <Caret Line="638" Column="5" TopLine="593"/>
-      </Position>
-      <Position>
-        <Filename Value="main.pas"/>
-        <Caret Line="637" Column="5" TopLine="592"/>
-      </Position>
-      <Position>
-        <Filename Value="main.pas"/>
-        <Caret Line="636" Column="5" TopLine="591"/>
-      </Position>
-      <Position>
-        <Filename Value="main.pas"/>
-        <Caret Line="613" Column="41" TopLine="591"/>
+        <Caret Line="246" TopLine="229"/>
       </Position>
       <Position>
         <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="2958" Column="34" TopLine="2934"/>
-      </Position>
-      <Position>
-        <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3103" Column="39" TopLine="3083"/>
-      </Position>
-      <Position>
-        <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3286" Column="24" TopLine="3271"/>
+        <Caret Line="3600" Column="24" TopLine="3587"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="213" Column="48" TopLine="213"/>
+        <Caret Line="243" Column="77" TopLine="231"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="214" Column="48" TopLine="214"/>
+        <Caret Line="16" Column="33"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="215" Column="48" TopLine="215"/>
+        <Caret Line="75" Column="13" TopLine="37"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="214" Column="48" TopLine="214"/>
+        <Caret Line="114" Column="24" TopLine="76"/>
       </Position>
       <Position>
         <Filename Value="main.pas"/>
-        <Caret Line="230" Column="42" TopLine="214"/>
+        <Caret Line="144" Column="14" TopLine="105"/>
       </Position>
       <Position>
-        <Filename Value="K16_Encoder_LEA.pas"/>
-        <Caret Line="356" Column="35" TopLine="333"/>
+        <Filename Value="main.pas"/>
+        <Caret Line="145" Column="48" TopLine="106"/>
       </Position>
       <Position>
-        <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3215" Column="26" TopLine="3198"/>
+        <Filename Value="main.pas"/>
+        <Caret Line="171" Column="63" TopLine="132"/>
       </Position>
       <Position>
-        <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3290" Column="5" TopLine="3244"/>
+        <Filename Value="main.pas"/>
+        <Caret Line="212" Column="29" TopLine="173"/>
       </Position>
       <Position>
-        <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3270" Column="22" TopLine="3244"/>
-      </Position>
-      <Position>
-        <Filename Value="K16_Parser.pas"/>
-        <Caret Line="1961" Column="27" TopLine="1934"/>
+        <Filename Value="main.pas"/>
+        <Caret Line="226" Column="31" TopLine="185"/>
       </Position>
       <Position>
         <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3431" Column="15" TopLine="3418"/>
+        <Caret Line="3317" Column="29" TopLine="3294"/>
       </Position>
       <Position>
         <Filename Value="K16_Assembler.pas"/>
-        <Caret Line="3443" Column="21" TopLine="3429"/>
+        <Caret Line="3633" Column="27" TopLine="3606"/>
+      </Position>
+      <Position>
+        <Filename Value="K16_Assembler.pas"/>
+        <Caret Line="103" Column="28" TopLine="56"/>
+      </Position>
+      <Position>
+        <Filename Value="K16_Assembler.pas"/>
+        <Caret Line="3628" Column="14" TopLine="3606"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="198" Column="21" TopLine="185"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="461" Column="5" TopLine="415"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="75" Column="13" TopLine="52"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="114" Column="24" TopLine="76"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="144" Column="14" TopLine="105"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="145" Column="48" TopLine="106"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="171" Column="63" TopLine="132"/>
+      </Position>
+      <Position>
+        <Filename Value="main.pas"/>
+        <Caret Line="212" Column="29" TopLine="173"/>
+      </Position>
+      <Position>
+        <Filename Value="K16_Assembler.pas"/>
+        <Caret Line="3653" Column="27" TopLine="3640"/>
+      </Position>
+      <Position>
+        <Filename Value="K16_Assembler.pas"/>
+        <Caret Line="3741" Column="30" TopLine="3728"/>
       </Position>
       <Position>
         <Filename Value="K16_Listing.pas"/>
-        <Caret Line="778" Column="28" TopLine="749"/>
+        <Caret Line="819" Column="40" TopLine="797"/>
       </Position>
       <Position>
-        <Filename Value="K16_Listing.pas"/>
-        <Caret Line="783" Column="47" TopLine="774"/>
-      </Position>
-      <Position>
-        <Filename Value="K16_Listing.pas"/>
-        <Caret Line="809" Column="25" TopLine="797"/>
+        <Filename Value="K16_Assembler.pas"/>
+        <Caret Line="3745" Column="22" TopLine="3732"/>
       </Position>
     </JumpHistory>
     <RunParams>

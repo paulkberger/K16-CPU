@@ -6,7 +6,7 @@ interface
 
 uses
   SysUtils, StrUtils,
-  K16_Parser, K16_Encoder_Base;
+  K16_Parser, K16_Encoder_Base, K16_Encoder_Stream;
 
 type
   TK16LoadEncoder = class(TK16EncoderBase, IK16Encoder)
@@ -306,6 +306,22 @@ begin
   Result.HasImmediate := False;
   Result.Immediate := 0;
   Result.CanonicalMnemonic := ResolvedMnemonic;
+
+  // =========================================================================
+  // POST-INCREMENT STREAM FORM -> opcode $02 (delegate to stateless encoder)
+  //   LOADD Dn,[XYn]+ [, #stride]   /   LOADB Dn,[XYn]+ [, #stride]
+  // =========================================================================
+  if (SameText(ResolvedMnemonic, 'LOADD') or SameText(ResolvedMnemonic, 'LOADB'))
+     and (Length(Instr.Operands) >= 2) then
+  begin
+    TempMemRef := TMemoryRef.Parse(Instr.Operands[1]);
+    if TempMemRef.PostIncrement then
+    begin
+      Result := EncodeStream(Instr, True, SameText(ResolvedMnemonic, 'LOADB'),
+                             SymbolResolver, ErrorReporter, WarningReporter);
+      Exit;
+    end;
+  end;
 
   // =========================================================================
   // LOADXY HANDLING - Mode 10: Load XY pair from [XY]

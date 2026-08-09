@@ -2,7 +2,29 @@
 ; kos_fs.asm — k/OS Phase 16: top-level filesystem code
 ; ============================================================================
 ; Date:    18 May 2026
-; Status:  Phase 16 + Part 24 + Part 25 + Part 34
+; Status:  Phase 16 + Part 24 + Part 25 + Part 34 + sys_mkdir
+;
+; Revision: r14 — 17 June 2026 — Part 47: mkdir/rmdir LFN-aware. sys_mkdir
+;             dup-check _DirLookup->_DirLookupLong; leaf link now
+;             _GenShortName + needs_lfn branch (_DirCreateRun for a
+;             long dir name, else _DirCreate), carrying attr=DIR/
+;             cluster=newclu. _RemoveDir lookup->_DirLookupLong and
+;             _DirDelete->_DirDeleteRun (whole-run). Directory
+;             cluster '.'/'..' contents unchanged (8.3).
+; Revision: r13 — 16 June 2026 — subdir support: sys_mkdir (TRAP #69) added
+;             at end of file. Path-string ABI (XY0 = "X:NAME"), matching
+;             sys_unlink: _ParsePath -> drive + 8.3 name; read-only pre-
+;             flight via VOL_BLOCKWRITE_PTR (not VOL_READONLY); dup-check
+;             via _DirLookup -> _AllocCluster -> _DirInitCluster (writes
+;             '.'/'..' with '..'=0 for the root parent) -> _DirCreate link;
+;             _FreeCluster rollback if init/link fails. newclu held on the
+;             stack (not slot scratch) to dodge the VOL_RESERVED_3 "$36
+;             looks free" hazard. Non-leaf DINT / EINT-gated exit per
+;             sys_format.
+;             NOTE: sys_mkdir CALLRs _ParsePath/_SlotForDrive (kos_fs_fd.asm)
+;             and _DirLookup/_DirCreate/_DirInitCluster (kos_fs_dir.asm),
+;             .INCLUDEd AFTER this file. If the assembler reports a CALLR
+;             displacement out of range, switch that call to CALL16.
 ;
 ; Revision: r12 — 18 May 2026 — Part 34 polish: _VolFreeClusters now hoists
 ;             the loop bound out of the per-iteration body. Previously it
@@ -224,10 +246,16 @@ _InitFS:
                 LOADI   D2, #192                ; word count
                 LOADI   D0, #0
 .zero_loop:
-                STORED  D0, [XY1]
-                ADD     X1, #2
+                STORED  D0, [XY1]+
                 SUB     D2, #1
                 BNE     .zero_loop
+
+                ; --- Default subdir-walk state to "root region" (0). The
+                ; cluster-aware dir routines fall through to the original
+                ; root-region path whenever DIR_WALK_CLU = 0; callers that
+                ; walk a subdir set it, then restore 0.
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
 
                 ; --- Install backend function pointers
                 ; Each pointer is stored as two 16-bit words:
@@ -286,6 +314,38 @@ _InitFS:
 
                 LOADI   D0, #FS_DRIVE_B
                 CALLR   _TryMount
+
+                ; --- Auto-format B: if it didn't mount ---------------------
+                ; Cold boot: the RAM disk is zeroed RAM with no BPB, so the
+                ; mount above fails. Format it here (formatting re-mounts it)
+                ; so B: is present BEFORE _SeedAssigns runs and RAM: seeds.
+                ; Warm boot: already mounted -> skipped. Non-fatal on failure
+                ; (B: stays unmounted). The _RawPuts trace is cleared by kosh's
+                ; splash but survives on the raw terminal if kosh never paints.
+                ; (Moved here from _P2Main so RAM-disk readiness is part of FS
+                ; init and the boot seed works cold as well as warm.)
+                LOADI   Y0, #$00
+                LOADI   X0, #VOL_SLOT_B
+                LOADB   D0, [XY0+#VOL_PRESENT]
+                CMP     D0, #0
+                BNE     .initfs_b_ready
+                LOADI   Y0, #>boot_format_msg
+                LOADI   X0, #<boot_format_msg
+                CALL24  _RawPuts
+                LOADI   D0, #FS_DRIVE_B
+                LOADI   Y0, #>boot_ramdisk_label
+                LOADI   X0, #<boot_ramdisk_label
+                CALL24  _FormatVolume
+                BCS     .initfs_b_fmterr
+                LOADI   Y0, #>boot_format_ok
+                LOADI   X0, #<boot_format_ok
+                CALL24  _RawPuts
+                BRA     .initfs_b_ready
+.initfs_b_fmterr:
+                LOADI   Y0, #>boot_format_err
+                LOADI   X0, #<boot_format_err
+                CALL24  _RawPuts
+.initfs_b_ready:
 
                 ; Host bays C..F: only probe on EMU. On Digital the disk
                 ; controller doesn't exist; reads/writes to $DA0000 are
@@ -547,6 +607,12 @@ _TryMount:
                 LOADI   D1, #0
                 STORED  D1, [XY2+#VOL_TOTAL_CLUSTERS+2]
 
+                ; Free-cluster cache starts stale; first sys_diskfree walks
+                ; and populates it. (D1 still = 0 here.) Offset > IMM5, so
+                ; use mode-01 D-indexed access (D0 free after the store above).
+                LOADI   D0, #VOL_FREE_VALID
+                STORED  D1, [XY2+D0]            ; VOL_FREE_VALID := 0
+
                 ; Cache k/OS read-only flag (BPB byte at $25).
                 LOADZB  D0, [#FS_BUF_SECTOR + BPB_KOS_FLAGS]
                 AND     D0, #BPB_KOS_RDONLY
@@ -561,10 +627,8 @@ _TryMount:
                 LEA     XY1, XY2+D1             ; XY1 = slot + VOL_LABEL
                 LOADI   D2, #11
 .label_loop:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                ADD     X0, #1
-                ADD     X1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D2, #1
                 BNE     .label_loop
 
@@ -629,10 +693,8 @@ _TryMount:
                 LEA     XY1, XY2+D1             ; XY1 = slot + VOL_LABEL
                 LOADI   D2, #11
 .label_copy_loop:
-                LOADB   D0, [XY0]
-                STOREB  D0, [XY1]
-                ADD     X0, #1
-                ADD     X1, #1
+                LOADB   D0, [XY0]+
+                STOREB  D0, [XY1]+
                 SUB     D2, #1
                 BNE     .label_copy_loop
                 BRA     .label_scan_done
@@ -774,8 +836,7 @@ _ZeroBuffer:
                 LOADI   D0, #0
                 LOADI   D1, #256                ; word count
 .zb_loop:
-                STORED  D0, [XY0]
-                ADD     X0, #2
+                STORED  D0, [XY0]+
                 SUB     D1, #1
                 BNE     .zb_loop
                 RETCC
@@ -1240,10 +1301,8 @@ _FormatVolume:
                 LOADI   X0, #FS_BUF_SECTOR + BPB_VOLUME_LABEL
                 LOADI   D0, #11
 .fv_label_copy:
-                LOADB   D2, [XY1]
-                STOREB  D2, [XY0]
-                ADD     X1, #1
-                ADD     X0, #1
+                LOADB   D2, [XY1]+
+                STOREB  D2, [XY0]+
                 SUB     D0, #1
                 BNE     .fv_label_copy
 
@@ -1743,9 +1802,22 @@ _AllocCluster:
                 CALLR   _FATSetEntry
                 BCS     .ac_set_err
 
+                ; Maintain free-cluster cache (-1) if live. D0 holds the
+                ; cluster (return value); D1/D2 are scratch (clobber set).
+                ; Offsets > IMM5 → mode-01 D-indexed [XY2+D2].
+                LOADI   D2, #VOL_FREE_VALID
+                LOADD   D1, [XY2+D2]
+                CMP     D1, #0
+                BEQ.S   .ac_nocache
+                LOADI   D2, #VOL_FREE_CLUSTERS
+                LOADD   D1, [XY2+D2]
+                SUB     D1, #1
+                STORED  D1, [XY2+D2]
+.ac_nocache:
                 ; Restore cluster as return value.
                 POP     D0, XY3                 ; D0 = cluster
-                RETCC
+                CLC                             ; SUB left C=1 (no borrow); success = C=0
+                RET
 
 .ac_set_err:
                 ; _FATSetEntry failed. D0 holds its error code (C=1).
@@ -1778,8 +1850,13 @@ _AllocCluster:
 ;          D3  = drive index
 ;   Out:   C=0 success
 ;          C=1 with D0 = ERR_IO on failure
-;   Clobbers: D0, X0, X1, flags
-;   Preserves: D1, D2, D3, XY2, XY3
+;   Clobbers: D0, D1, X0, X1, flags
+;   Preserves: D2, D3, XY2, XY3
+;
+;   (D1 is clobbered — the body does LOADI D1,#FAT_FREE for _FATSetEntry.
+;   The header previously claimed "Preserves: D1" but never did; callers
+;   that keep a cross-call value do so in D2, which IS preserved. Comment
+;   corrected Part 48.)
 ;
 ;   Bug fix 11 May 2026: previously claimed to preserve D2 but
 ;   _FATSetEntry's body clobbers D2 (uses it to hold the FAT byte
@@ -1800,6 +1877,27 @@ _FreeCluster:
                 CALLR   _FATSetEntry
                 ; C set by _FATSetEntry; flag-transparent POP follows.
                 POP     D2, XY3
+                BCS     .fc_ret                 ; failed → leave cache, preserve C=1 (plain: success span >31B)
+
+                ; Maintain free-cluster cache (+1) if live. Save D0/D1 (both
+                ; dead post-call) so the routine's register footprint is
+                ; unchanged; D0 = offset, D1 = value. Offsets > IMM5 →
+                ; mode-01 D-indexed. XY2 read-only.
+                PUSH    D0, XY3                 ; flag-transparent
+                PUSH    D1, XY3
+                LOADI   D0, #VOL_FREE_VALID
+                LOADD   D1, [XY2+D0]
+                CMP     D1, #0
+                BEQ.S   .fc_nocache
+                LOADI   D0, #VOL_FREE_CLUSTERS
+                LOADD   D1, [XY2+D0]
+                ADD     D1, #1
+                STORED  D1, [XY2+D0]
+.fc_nocache:
+                POP     D1, XY3                 ; flag-transparent
+                POP     D0, XY3
+                CLC                             ; success
+.fc_ret:
                 RET
 
 
@@ -1907,16 +2005,35 @@ sys_diskfree:
                 PUSH    D3, XY3
                 PUSH    XY0, XY3
                 PUSH    XY1, XY3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
 
                 ; Resolve drive → XY2.
                 MOVE    D3, D0                  ; D3 = drive idx (for _FATGetEntry)
                 CALL24  _SlotForDrive           ; cross-file call (kos_fs_fd.asm)
                 BCS     .sdf_err
 
-                ; Walk the FAT counting free clusters.
+                ; Free count: cache hit (O(1)), or walk-and-populate.
+                ; Cache is maintained incrementally by _AllocCluster (-1) and
+                ; _FreeCluster (+1); a full walk runs only once per
+                ; boot/mount/format (when VOL_FREE_VALID = 0). Slot offsets
+                ; > IMM5 → mode-01 D-indexed [XY2+D1].
+                LOADI   D1, #VOL_FREE_VALID
+                LOADD   D0, [XY2+D1]
+                CMP     D0, #0
+                BEQ     .sdf_walk
+                LOADI   D1, #VOL_FREE_CLUSTERS
+                LOADD   D0, [XY2+D1]                    ; hit
+                BRA.S   .sdf_have_free
+.sdf_walk:
                 CALL24  _VolFreeClusters
                 BCS     .sdf_err
-                ; D0 = free clusters.
+                LOADI   D1, #VOL_FREE_CLUSTERS
+                STORED  D0, [XY2+D1]                    ; populate (D0 = free count)
+                LOADI   D1, #VOL_FREE_VALID
+                LOADI   D2, #1
+                STORED  D2, [XY2+D1]                    ; mark cache live
+.sdf_have_free:
+                ; D0 = free clusters (cached or freshly walked).
 
                 ; Stage D1 (total) and D2 (cluster size) from XY2.
                 ; Don't trash D0 — it's our return value.
@@ -1957,6 +2074,7 @@ sys_diskfree:
                 POP     SR, XY3                 ; restore C flag
 
                 ; Restore callee-saved XY1, XY0, D3 (reverse order of PUSHes).
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
                 POP     XY1, XY3
                 POP     XY0, XY3
                 POP     D3, XY3
@@ -2074,11 +2192,15 @@ _ClusterToSector:
 .cts_add_data_start:
                 LOADD   D1, [XY2+#VOL_DATA_START]
                 ADD     D0, D1                  ; D0 = data_start + (cluster - 2)
-                RETCC
+                ; ADD clobbers carry; RETCC would leak ERR_INVALID on an
+                ; address-overflow carry. Force success carry explicitly.
+                CLC
+                RET
 
 .cts_invalid:
                 LOADI   D0, #ERR_INVALID
-                RETCS
+                SEC
+                RET
 
 
 ; ============================================================================
@@ -2115,9 +2237,20 @@ sys_format:
                 PUSH    D2, XY3
                 PUSH    XY1, XY3                    ; Part 36: V2 ABI
                 PUSH    D1, XY3                     ; Part 36 r2
+                PUSH    D3, XY3                     ; named drives v2: hold drive in D3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+                MOVE    D3, D0                      ; D3 = drive (survives _FormatVolume)
 
                 CALLR   _FormatVolume
                 ; D0 / C already set by _FormatVolume.
+                ; Named drives v2: on success, dirty this drive's path-mounts.
+                BCS     .sf_noinval
+                PUSH    D0, XY3                     ; save return code
+                MOVE    D0, D3                      ; drive
+                CALLR   _AssignInvalidateDrive
+                POP     D0, XY3                     ; restore return code
+                CLC                                 ; success (C=0)
+.sf_noinval:
 
                 ; Gate EINT on KERNEL_STATE (gotcha 4.6).
                 ; Part 36: stash D0 (return) across the gate; D1 is now
@@ -2138,6 +2271,8 @@ sys_format:
                 POP     SR, XY3
 
                 ; Restore callee-saved D1, XY1, D2 (POP doesn't disturb flags).
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+                POP     D3, XY3                     ; named drives v2
                 POP     D1, XY3                     ; Part 36 r2
                 POP     XY1, XY3                    ; Part 36: V2 ABI
                 POP     D2, XY3
@@ -2145,5 +2280,523 @@ sys_format:
 
 
 ; ============================================================================
-; End of kos_fs.asm (Pieces 1+2+3 + Phase 19 sys_format)
+; sys_mkdir — TRAP #69 — create a directory (resolve-aware, nested)
+;
+;   Creates a directory named by the LAST component of the path, inside the
+;   directory named by the parent components — resolved via _ResolveParent.
+;   So "B:FOO/BAR" creates BAR inside FOO; "BAR" (relative) creates BAR in
+;   the caller's CWD; "B:BAR" creates BAR in B:'s root.
+;
+;   In:    XY0 = nul-terminated path
+;          D0  = CWD drive index (for relative paths)
+;          D1  = CWD cluster     (for relative paths; 0 = root)
+;   Out:   C=0 success
+;          C=1 with D0 = ERR_BADPATH / ERR_BADDRIVE / ERR_NOTFOUND /
+;                        ERR_NOTDIR / ERR_READONLY / ERR_EXISTS /
+;                        ERR_NOSPACE / ERR_IO
+;   Clobbers: D0, XY0
+;   Preserves: D1, D2, D3, XY1, XY2, XY3   (V2 ABI)
+;
+;   Non-leaf: DINT / EINT-gated exit per sys_format.
+;
+;   Sequence:
+;     1. _ResolveParent    path -> drive, parent cluster; leaf in RV_FATNAME
+;     2. _SlotForDrive     drive -> XY2
+;     2a. read-only pre-flight (VOL_BLOCKWRITE_PTR null = r/o)
+;     3. DIR_WALK_CLU = parent cluster
+;     4. _DirLookup leaf   dup-check -> ERR_EXISTS if found
+;     5. _AllocCluster     -> newclu (EOC)
+;     6. _DirInitCluster(newclu, parent=parent cluster)   '.' and '..'
+;     7. _DirCreate leaf -> newclu, attr=DIR, size=0  (in DIR_WALK_CLU=parent)
+;        on failure: _FreeCluster(newclu) rollback
+; ============================================================================
+sys_mkdir:
+                DINT
+
+                PUSH    D1, XY3
+                PUSH    D2, XY3
+                PUSH    D3, XY3
+                PUSH    XY1, XY3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+
+                ; --- 1. resolve parent -> drive (D0), parent clu (D1);
+                ;        leaf 11-byte name lands in RV_FATNAME.
+                ; _ResolveParent: XY0=path, D0=start drive, D1=start clu.
+                CALLR   _ResolveParent
+                BCS     .mkd_err                ; BADPATH/BADDRIVE/NOTFOUND/NOTDIR/IO
+                ; D0 = drive, D1 = parent cluster.
+                MOVE    D3, D0                  ; D3 = drive (for dir routines)
+                STOREZ  D1, [#MKD_PARENT_CL]    ; stash parent cluster
+
+                ; --- 2. drive -> slot -------------------------------------
+                MOVE    D0, D3
+                CALLR   _SlotForDrive          ; D0=drive -> XY2
+                BCS     .mkd_err                ; ERR_BADDRIVE
+
+                ; --- 2a. read-only pre-flight -----------------------------
+                LOADD   D0, [XY2+#VOL_BLOCKWRITE_PTR]
+                LOADI   D1, #VOL_BLOCKWRITE_PTR+2
+                LOADD   D1, [XY2+D1]
+                OR      D0, D1
+                BNE.S   .mkd_writable
+                LOADI   D0, #ERR_READONLY
+                BRA     .mkd_err
+.mkd_writable:
+
+                ; --- 3. operate inside the parent cluster -----------------
+                LOADZ   D0, [#MKD_PARENT_CL]    ; parent cluster
+                STOREZ  D0, [#DIR_WALK_CLU]
+
+                ; --- 4. duplicate check (long-aware) ----------------------
+                ; Part 47: _DirLookupLong matches a long dir name (RV_COMP) or
+                ; 8.3 (RV_FATNAME when RV_SAVE_PAD=1).
+                CALLR   _DirLookupLong
+                BCC     .mkd_exists             ; found => already exists
+                CMP     D0, #ERR_NOTFOUND
+                BNE     .mkd_err                ; ERR_IO etc. -> propagate
+
+                ; --- 5. allocate the new directory's cluster -------------
+                CALLR   _AllocCluster          ; -> D0 = newclu (EOC); C=1 on fail
+                BCS     .mkd_err                ; ERR_NOSPACE / ERR_IO
+                ; Hold newclu on the stack — unambiguous across the
+                ; _DirInitCluster / _DirCreate calls below, both of which use
+                ; the slot scratch area ($30..$34) themselves. (Slot scratch
+                ; would *happen* to survive, but the stack is collision-proof
+                ; — cf. Gotcha 4.25 "looks free" hazard.)
+                PUSH    D0, XY3                 ; [N] newclu
+
+                ; --- 6. write '.' and '..' into the new cluster ----------
+                ; _DirInitCluster: D0 = self, D1 = parent, XY2, D3.
+                ; D0 already = newclu from _AllocCluster. Parent '..' = the
+                ; resolved parent cluster (0 if parent is the root region).
+                LOADZ   D1, [#MKD_PARENT_CL]    ; parent cluster
+                CALLR   _DirInitCluster
+                BCS     .mkd_free_and_err       ; init failed -> free cluster
+
+                ; --- 7. link the leaf into the parent directory ----------
+                ; Re-assert DIR_WALK_CLU = parent (defensive; nothing between
+                ; step 3 and here resets it today, but make it explicit).
+                LOADZ   D0, [#MKD_PARENT_CL]
+                STOREZ  D0, [#DIR_WALK_CLU]
+                ; Part 47: long-aware. Generate the 8.3 short name from the long
+                ; leaf (RV_COMP); needs_lfn selects the LFN-run vs plain-short
+                ; path (same shape as _CreateEmptyEntry). The held newclu [N]
+                ; survives _GenShortName (stack, not slot scratch).
+                LOADI   Y0, #$00
+                LOADI   X0, #RV_COMP
+                CALLR   _GenShortName           ; -> LFN_SHORT, D0 = needs_lfn
+                BCS     .mkd_free_and_err       ; ERR_IO / ERR_NOSPACE
+                CMP     D0, #0
+                BNE     .mkd_lfn
+
+                ; --- plain 8.3 directory entry ----------------------------
+                LOADI   Y0, #$00
+                LOADI   X0, #LFN_SHORT          ; generated 8.3 name
+                POP     D1, XY3                 ; [N] newclu -> D1 (first cluster)
+                PUSH    D1, XY3                 ; [N] re-push for rollback/exit
+                LOADI   D0, #DIR_ATTR_DIRECTORY ; D0 = attr
+                LOADI   D2, #0                  ; D2 = size = 0
+                CALLR   _DirCreate
+                BCS     .mkd_free_and_err       ; NOSPACE/IO -> roll back cluster
+                BRA     .mkd_linked
+
+.mkd_lfn:
+                ; --- LFN run for a long directory name --------------------
+                CALLR   _CopyCompToLfnAsm       ; RV_COMP -> LFN_ASM, LFN_ASM_LEN
+                LOADI   Y0, #$00
+                LOADI   X0, #LFN_SHORT
+                POP     D1, XY3                 ; [N] newclu -> D1 (first cluster)
+                PUSH    D1, XY3                 ; [N] re-push for rollback/exit
+                LOADI   D0, #DIR_ATTR_DIRECTORY ; D0 = attr
+                LOADI   D2, #0                  ; D2 = size = 0
+                CALLR   _DirCreateRun
+                BCS     .mkd_free_and_err       ; NOSPACE/IO -> roll back cluster
+
+.mkd_linked:
+                ; success — discard the held newclu
+                POP     D1, XY3                 ; [N] drop
+                LOADI   D0, #ERR_OK
+                CLC
+                BRA     .mkd_exit
+
+.mkd_free_and_err:
+                ; Entry: D0 = error code (from the failed callee, C=1);
+                ;        stack top = [N] newclu.
+                ; Free newclu, preserving the error code. newclu is under the
+                ; saved err on the stack, so juggle: stack [E][N] -> pull both
+                ; -> D0=err, D1=newclu -> re-save err -> free(D0=newclu) ->
+                ; restore err.
+                PUSH    D0, XY3                 ; [E] err ; stack [E][N]
+                POP     D0, XY3                 ; D0 = err          ; stack [N]
+                POP     D1, XY3                 ; D1 = newclu       ; stack []
+                PUSH    D0, XY3                 ; [E] re-save err   ; stack [E]
+                MOVE    D0, D1                  ; D0 = newclu
+                CALLR   _FreeCluster           ; preserves D3, XY2, XY3
+                POP     D0, XY3                 ; restore err code  ; stack []
+                SEC
+                BRA     .mkd_exit
+
+.mkd_exists:
+                LOADI   D0, #ERR_EXISTS
+                SEC
+                BRA     .mkd_exit
+
+.mkd_err:
+                ; D0 / C already set by the failing callee.
+                ; fall through
+
+.mkd_exit:
+                ; Restore DIR_WALK_CLU to the root default (0). It is already
+                ; 0 here, but make the contract explicit and robust against
+                ; future callers that set it non-zero before us.
+                PUSH    D0, XY3                 ; save return code across the store
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                POP     D0, XY3
+
+                ; Gate EINT on KERNEL_STATE (gotcha 4.6). PUSH SR preserves
+                ; the result carry across the CMP; POP SR restores C/Z/N/V
+                ; (IE is hardware-managed, gotcha 2.5).
+                PUSH    SR, XY3
+                PUSH    D0, XY3
+                LOADZ   D0, [#KERNEL_STATE]
+                LOW     D0
+                CMP     D0, #KERN_STATE_RUN
+                POP     D0, XY3
+                BNE.S   .mkd_skip_eint
+                EINT
+.mkd_skip_eint:
+                POP     SR, XY3
+
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+                POP     XY1, XY3
+                POP     D3, XY3
+                POP     D2, XY3
+                POP     D1, XY3
+                RET
+
+
+; ============================================================================
+; sys_resolve — TRAP #70 — resolve a path to (drive, cluster, attr)
+;
+;   Stateless. The caller supplies its CWD context (start drive + cluster)
+;   for relative/rooted paths; an "X:" prefix overrides the drive and starts
+;   at that drive's root.
+;
+;   In:    XY0 = nul-terminated path (caller page)
+;          D0  = start drive index (CWD drive)
+;          D1  = start cluster     (CWD cluster; 0 = root)
+;   Out:   C=0: D0 = drive, D1 = cluster, D2 = attr of final entry
+;          C=1: D0 = ERR_BADPATH/BADDRIVE/NOTFOUND/NOTDIR/INVALID/IO
+;   Clobbers: D0, D1, D2
+;   Preserves: D3, XY1, XY2, XY3   (V2 ABI)
+;
+;   Non-leaf: DINT / EINT-gated exit per sys_format.
+; ============================================================================
+sys_resolve:
+                DINT
+                PUSH    D3, XY3
+                PUSH    XY1, XY3
+                PUSH    XY2, XY3
+
+                CALLR   _Resolve               ; D0=drive,D1=clu,D2=attr / C,err
+
+                POP     XY2, XY3
+                POP     XY1, XY3
+                PUSH    SR, XY3
+                PUSH    D0, XY3
+                LOADZ   D0, [#KERNEL_STATE]
+                LOW     D0
+                CMP     D0, #KERN_STATE_RUN
+                POP     D0, XY3
+                BNE.S   .sr_skip_eint
+                EINT
+.sr_skip_eint:
+                POP     SR, XY3
+                POP     D3, XY3
+                RET
+
+
+; ============================================================================
+; sys_pwd — TRAP #71 — reconstruct a path string from (drive, cluster)
+;
+;   In:    D0  = drive index
+;          D1  = cluster (0 = root)
+;          XY0 = dest buffer (caller page; >= ~80 bytes)
+;   Out:   C=0 with dest = "X:/..."\0
+;          C=1 with D0 = ERR_IO / ERR_INVALID / ERR_BADDRIVE
+;   Clobbers: D0
+;   Preserves: D1, D2, D3, XY1, XY2, XY3   (V2 ABI)
+;
+;   Non-leaf: DINT / EINT-gated exit.
+; ============================================================================
+sys_pwd:
+                DINT
+                PUSH    D1, XY3
+                PUSH    D2, XY3
+                PUSH    D3, XY3
+                PUSH    XY1, XY3
+                PUSH    XY2, XY3
+
+                CALLR   _BuildPath             ; writes dest; C,err
+
+                POP     XY2, XY3
+                POP     XY1, XY3
+                PUSH    SR, XY3
+                PUSH    D0, XY3
+                LOADZ   D0, [#KERNEL_STATE]
+                LOW     D0
+                CMP     D0, #KERN_STATE_RUN
+                POP     D0, XY3
+                BNE.S   .pwd_skip_eint
+                EINT
+.pwd_skip_eint:
+                POP     SR, XY3
+                POP     D3, XY3
+                POP     D2, XY3
+                POP     D1, XY3
+                RET
+
+
+; ============================================================================
+; sys_rmdir — TRAP #72 — remove an empty directory
+;
+;   Resolve-aware (nested) like sys_mkdir. The target must be a directory
+;   and must be empty (only '.' and '..' present). Refuses '.'/'..' as the
+;   leaf and refuses the drive root.
+;
+;   In:    XY0 = nul-terminated path
+;          D0  = CWD drive index (for relative paths)
+;          D1  = CWD cluster     (for relative paths; 0 = root)
+;   Out:   C=0 success
+;          C=1 with D0 = ERR_BADPATH / ERR_BADDRIVE / ERR_NOTFOUND /
+;                        ERR_NOTDIR / ERR_NOTEMPTY / ERR_READONLY /
+;                        ERR_INVALID / ERR_IO
+;   Clobbers: D0, XY0
+;   Preserves: D1, D2, D3, XY1, XY2, XY3   (V2 ABI)
+;
+;   Non-leaf: DINT / EINT-gated exit per sys_format.
+; ============================================================================
+sys_rmdir:
+                DINT
+                PUSH    D1, XY3
+                PUSH    D2, XY3
+                PUSH    D3, XY3
+                PUSH    XY1, XY3
+                PUSH    XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+
+                CALLR   _RemoveDir              ; D0/C set
+
+                POP     XY2, XY3                    ; Part 25: XY2 is the Pascal frame pointer
+                POP     XY1, XY3
+                PUSH    SR, XY3
+                PUSH    D0, XY3
+                LOADZ   D0, [#KERNEL_STATE]
+                LOW     D0
+                CMP     D0, #KERN_STATE_RUN
+                POP     D0, XY3
+                BNE.S   .srd_skip_eint
+                EINT
+.srd_skip_eint:
+                POP     SR, XY3
+                POP     D3, XY3
+                POP     D2, XY3
+                POP     D1, XY3
+                RET
+
+
+; ============================================================================
+; _RemoveDir — kernel-internal: remove an empty directory by path
+;
+;   Algorithm:
+;     1. _ResolveParent      path -> drive, parent clu; leaf -> RV_FATNAME
+;     2. _SlotForDrive       drive -> XY2 ; read-only pre-flight
+;     3. DIR_WALK_CLU=parent; _DirLookup leaf -> cookie (entry in FS_BUF)
+;     4. Read attr + first cluster of the leaf entry
+;        - attr must be DIRECTORY        else ERR_NOTDIR
+;        - first cluster must be >= 2     else ERR_INVALID (corrupt/root)
+;     5. _DirIsEmpty(leaf cluster)        else ERR_NOTEMPTY
+;     6. _FATFreeChain(leaf cluster) + _FATFlush
+;     7. DIR_WALK_CLU=parent; _DirDelete leaf from the parent
+;
+;   In:    XY0 = path, D0 = CWD drive, D1 = CWD cluster
+;   Out:   C=0 / C=1 D0=ERR_*
+;   Clobbers: D0..D3, XY0, XY1   (XY2/XY3 preserved)
+; ============================================================================
+_RemoveDir:
+                PUSH    XY2, XY3
+
+                ; --- 1. resolve parent + leaf -----------------------------
+                CALLR   _ResolveParent
+                BCS     .rd_err_pop             ; BADPATH/BADDRIVE/NOTFOUND/NOTDIR/IO
+                MOVE    D3, D0                  ; D3 = drive
+                STOREZ  D1, [#MKD_PARENT_CL]    ; parent cluster
+
+                ; --- 2. drive -> slot -------------------------------------
+                MOVE    D0, D3
+                CALLR   _SlotForDrive          ; D0=drive -> XY2
+                BCS     .rd_err_pop             ; ERR_BADDRIVE
+
+                ; --- 2a. read-only pre-flight -----------------------------
+                LOADD   D0, [XY2+#VOL_BLOCKWRITE_PTR]
+                LOADI   D1, #VOL_BLOCKWRITE_PTR+2
+                LOADD   D1, [XY2+D1]
+                OR      D0, D1
+                BNE.S   .rd_writable
+                LOADI   D0, #ERR_READONLY
+                BRA     .rd_err_pop
+.rd_writable:
+
+                ; --- 3. lookup the leaf in the parent ---------------------
+                LOADZ   D0, [#MKD_PARENT_CL]
+                STOREZ  D0, [#DIR_WALK_CLU]
+                ; Part 47: long-aware (finds long-named directories).
+                CALLR   _DirLookupLong
+                BCS     .rd_err_pop             ; ERR_NOTFOUND / ERR_IO
+
+                ; --- 4. read attr + first cluster of the matched entry ----
+                ; entry_addr = FS_BUF_SECTOR + (cookie & $0F)*32
+                MOVE    D1, D0
+                AND     D1, #$0F
+                SHL4    D1
+                SHL     D1
+                ADD     D1, #FS_BUF_SECTOR
+                LOADI   Y0, #$00
+                MOVE    X0, D1
+                ; attr
+                LOADB   D0, [XY0+#DIR_ATTR]
+                AND     D0, #DIR_ATTR_DIRECTORY
+                BNE.S   .rd_is_dir
+                LOADI   D0, #ERR_NOTDIR
+                BRA     .rd_err_pop
+.rd_is_dir:
+                ; first cluster (stash for emptiness + free)
+                LOADD   D0, [XY0+#DIR_FIRST_CLUSTER_LO]
+                STOREZ  D0, [#FD_NAMEBUF2]      ; reuse fd scratch (low word)
+                ; refuse a cluster < 2 (corrupt, or somehow the root)
+                CMP     D0, #2
+                BHS.S   .rd_clu_ok
+                LOADI   D0, #ERR_INVALID
+                BRA     .rd_err_pop
+.rd_clu_ok:
+
+                ; --- 5. emptiness check -----------------------------------
+                LOADZ   D0, [#FD_NAMEBUF2]      ; leaf cluster
+                CALLR   _DirIsEmpty             ; C=0 empty / C=1 D0=ERR_NOTEMPTY/IO
+                BCS     .rd_err_pop
+
+                ; --- 6. free the dir's cluster chain + flush --------------
+                LOADZ   D0, [#FD_NAMEBUF2]
+                CALLR   _FATFreeChain
+                BCS     .rd_err_pop             ; ERR_IO
+                ; named drives v2: mark assigns pointing at this freed dir
+                ; cluster dirty, so a later NAME: resolve fails cleanly.
+                MOVE    D0, D3                  ; drive (D3 preserved by the chain)
+                LOADZ   D1, [#FD_NAMEBUF2]      ; freed leaf cluster
+                CALLR   _AssignInvalidate       ; preserves XY2, XY3
+                CALLR   _FATFlush
+                BCS     .rd_err_pop             ; ERR_IO
+
+                ; --- 7. delete the leaf entry from the parent -------------
+                ; Part 47: whole-run delete ($E5 a long-named dir's LFN
+                ; fragments + short entry); RV_COMP=leaf survived steps 5-6.
+                LOADZ   D0, [#MKD_PARENT_CL]
+                STOREZ  D0, [#DIR_WALK_CLU]
+                CALLR   _DirDeleteRun
+                BCS     .rd_err_pop
+
+                ; reset DIR_WALK_CLU and succeed.
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                POP     XY2, XY3
+                CLC
+                RET
+
+.rd_err_pop:
+                ; D0 already set, C=1. Reset DIR_WALK_CLU, unwind.
+                PUSH    D0, XY3
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                POP     D0, XY3
+                POP     XY2, XY3
+                SEC
+                RET
+
+
+; ============================================================================
+; _DirIsEmpty — true if a directory cluster contains only '.' and '..'
+;
+;   Walks the directory's entries. Any live entry whose name does not start
+;   with '.' (i.e. a real file or subdir) makes it non-empty. Deleted ($E5)
+;   and LFN/volume entries are ignored; the $00 sentinel ends the scan.
+;
+;   In:    D0  = directory cluster (>= 2)
+;          XY2 = volume slot ptr
+;          D3  = drive index
+;   Out:   C=0 if empty
+;          C=1 with D0 = ERR_NOTEMPTY  if a real entry is present
+;                       ERR_IO         on read failure
+;   Clobbers: D0, D1, D2, X0, X1, Y0, Y1, flags
+;   Preserves: D3, XY2, XY3
+; ============================================================================
+_DirIsEmpty:
+                STOREZ  D0, [#DIR_WALK_CLU]     ; iterate this cluster
+                LOADI   D0, #0                  ; cookie
+.die_loop:
+                LOADI   Y1, #$00
+                LOADI   X1, #RV_DIRENT_RAW
+                CALLR   _DirNextRaw
+                BCS     .die_nomore             ; ERR_NOMORE -> empty; ERR_IO -> err
+                PUSH    D0, XY3                 ; save next cookie
+                LOADI   Y0, #$00
+                LOADI   X0, #RV_DIRENT_RAW
+                LOADB   D1, [XY0]               ; first name byte
+                AND     D1, #$FF
+                CMP     D1, #DIR_FREE_END
+                BEQ     .die_empty_pop          ; $00 -> end -> empty
+                CMP     D1, #DIR_FREE_REUSABLE
+                BEQ     .die_next               ; deleted -> ignore
+                CMP     D1, #'.'
+                BEQ     .die_next               ; '.' or '..' -> ignore
+                ; attr filter: LFN / volume label don't count as real entries
+                LOADB   D1, [XY0+#DIR_ATTR]
+                AND     D1, #$FF
+                CMP     D1, #DIR_ATTR_LFN
+                BEQ     .die_next
+                MOVE    D2, D1
+                AND     D2, #DIR_ATTR_VOLUME_LABEL
+                BNE     .die_next
+                ; A real, live entry -> not empty.
+                POP     D0, XY3                 ; discard cookie
+                LOADI   D0, #ERR_NOTEMPTY
+                SEC
+                RET
+.die_next:
+                POP     D0, XY3                 ; D0 = next cookie
+                BRA     .die_loop
+.die_empty_pop:
+                POP     D0, XY3                 ; discard cookie
+.die_empty:
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                CLC
+                RET
+.die_nomore:
+                ; D0 = ERR_NOMORE (clean end -> empty) or ERR_IO.
+                CMP     D0, #ERR_NOMORE
+                BNE.S   .die_io
+                BRA     .die_empty
+.die_io:
+                ; ERR_IO: reset DIR_WALK_CLU, propagate.
+                PUSH    D0, XY3
+                LOADI   D0, #0
+                STOREZ  D0, [#DIR_WALK_CLU]
+                POP     D0, XY3
+                SEC
+                RET
+
+
+; ============================================================================
+; End of kos_fs.asm (Pieces 1+2+3 + Phase 19 sys_format + sys_mkdir
+;                    + path resolver sys_resolve / sys_pwd + sys_rmdir)
 ; ============================================================================
