@@ -12,16 +12,16 @@ This page is the home for the K16 manuals. Select a document to read it here in 
 
 ## Processor
 
-- [K16 Reference Manual](K16_Reference_Manual_v3_16.md) — the ISA: instruction set, addressing modes, registers, flags, timing, and the assembler.
+- [K16 Reference Manual](K16_Reference_Manual_v3_21.md) — the ISA: instruction set, addressing modes, registers, flags, timing, and the assembler.
 
 ## Operating system
 
-- [k/OS Reference Manual](K16%20OS/Docs/kOS_Reference_Manual_v0_24.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
-- [k/OS Filesystem Reference](K16%20OS/kfs/kOS_FS_Reference_v1_14.md) — the VFAT/LFN filesystem, directory layout, and disk on-media format.
+- [k/OS Reference Manual](K16%20OS/Docs/kOS_Reference_Manual_v0_37.md) — kernel, syscalls, scheduling, `kosh` shell, and the OS programming model.
+- [k/OS Filesystem Reference](K16%20OS/kfs/kOS_FS_Reference_v1_21.md) — the VFAT/LFN filesystem, directory layout, and disk on-media format.
 
 ## Libraries and graphics
 
-- [KLIB Reference](K16%20OS/klib/kOS_KLIB_Reference_v1_6.md) — the shared library jump table and its routines.
+- [KLIB Reference](K16%20OS/klib/kOS_KLIB_Reference_v1_7.md) — the shared library jump table and its routines.
 - [KGFX Reference](KGFX_Reference.md) — the graphics library: regions, fonts, drawing, and scrolling. **(not uploaded yet)** 
 
 ## Languages
