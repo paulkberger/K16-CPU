@@ -14,6 +14,7 @@ const esc=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 let running=false, fast=true, gfxActive=false, scaleLabel="1x";
 let lastVidMode=-1;   // tracks Core.videoMode to auto-switch term<->gfx on change
 let gfxRes="\u2014", gfxScale=1;   // graphics resolution + integer display scale (for status)
+let gfxNudgeX=0, gfxNudgeY=0;      // device-grid origin correction applied by sizeGfx (CSS px)
 // Size the graphics canvas to an integer multiple of the mode's native res that
 // fits the wrap, so pixels stay square (matches the old emu's per-mode canvas).
 function sizeGfx(){
@@ -52,6 +53,25 @@ function sizeGfx(){
     cssW=sw*k; cssH=sh*k;
   }
   c.style.width=cssW+"px"; c.style.height=cssH+"px";
+  // Device-grid origin snap. The CSS SIZE above can be an exact device-pixel
+  // count (device mode is, by construction) yet still render soft, because the
+  // centred left/top edge can land on a FRACTIONAL device pixel -- the wrap is
+  // e.g. 1280.7 CSS wide, so a centred 853.33 canvas starts at 320.5 device px
+  // and the compositor resamples the whole surface. Nudge the element by up to
+  // half a device pixel so its origin sits on a whole device pixel.
+  //   position:relative + left/top -- NOT margin (under justify-content:center a
+  //   margin re-centres, moving the box only half the nudge), and NOT transform
+  //   (promotes the canvas to its own composited layer, which can reintroduce
+  //   filtering). Zero first so the rect is read UNCORRECTED; that read also
+  //   forces the reflow that picks up the CSS size just set.
+  // Fixes the blur in device mode outright. In integer mode at fractional dpr it
+  // removes this resample, but the native->backing upscale there is still a
+  // fractional whole-pixel-per-source ratio, so pixels stay uneven by design.
+  c.style.position="relative"; c.style.left="0px"; c.style.top="0px";
+  const r=c.getBoundingClientRect();
+  gfxNudgeX=(Math.round(r.left*dpr)-r.left*dpr)/dpr;
+  gfxNudgeY=(Math.round(r.top *dpr)-r.top *dpr)/dpr;
+  c.style.left=gfxNudgeX+"px"; c.style.top=gfxNudgeY+"px";
   gfxRes = active ? (sw+"\u00d7"+sh) : "\u2014";
   gfxScale = Math.round((cssW/sw)*100)/100;          // actual displayed CSS scale
 }
@@ -119,7 +139,16 @@ function layoutScreen(){
   // viewport — on tablets (821..1279px, still the non-mobile path) forcing 1280
   // overflowed the page and scrolled the left edge off. Clamp to availW; the gfx
   // canvas scales to fit and the 80-col terminal needs far less than this.
-  const w = Math.min(NW*scale, availW), minH = NH*scale;
+  // Bezel: widen the wrap past native so the gfx canvas has black either side
+  // rather than sitting flush. It MUST come from a wider container, not a
+  // narrower canvas -- padding #gfxwrap instead would drop sizeGfx's ww below
+  // native, floor the integer multiple to 0 and drop it into the fractional
+  // fallback (soft image). Unconditional (not graphics-tab-only) so the
+  // right-hand panels don't shift on tab switch. Clamped to availW, so it
+  // degrades to a thinner bezel, then to the old flush behaviour, on narrow
+  // viewports.
+  const GUTTER = 24;
+  const w = Math.min(NW*scale + 2*GUTTER, availW), minH = NH*scale;
   let h = minH;
   if(sideBySide){ h = Math.max(minH, window.innerHeight - 176); }  // grow to window height
   // .screenwrap is box-sizing:border-box with a 0.5px border, so style.width=w
@@ -137,6 +166,13 @@ function layoutScreen(){
 window.addEventListener("resize", ()=>{ layoutScreen(); renderTerm(); renderDisasm(); sizeGfx(); });
 
 const vt=(typeof VT100!=="undefined") ? new VT100(80,25) : null;  // VT100 engine (host paints it)
+// DSR replies (ESC[6n cursor-position report) go back into the key ring so a
+// program can read the terminal size it just queried. Core resolves at call time.
+if(vt) vt.onReply = (str)=>{ for(const ch of str) Core.queueKey(ch.charCodeAt(0) & 0xFF); };
+// Part 15: expose live terminal geometry to the core as (cols<<8)|rows for the
+// TERM_SIZE MMIO read. Pull-model: read at MMIO-read time so it always reflects
+// the current vt.rows (renderTerm keeps it in step with the window).
+if(vt) Core.termGeomProvider = ()=> (((vt.cols & 0xFF) << 8) | (vt.rows & 0xFF));
 window.__vt=vt; let _cw=0;
 const LH=17/14;  // line-height ratio: 17px row box at the 14px base font (34px at 2x)
 let termDirty=true;   // rebuild the terminal document only when content/rows change
@@ -146,14 +182,44 @@ let termDirty=true;   // rebuild the terminal document only when content/rows ch
 function pumpTTY(){ if(!vt) return; const b=Core.tty(); if(!b.length) return;
   for(let i=0;i<b.length;i++) vt.write(b[i]); termDirty=true; }
 
+// Authentic VGA/EGA colours placed at ANSI index positions. The kernel's
+// _AttrToSGR already did the VGA->ANSI bit-swap, so terminal cells are
+// ANSI-ordered; these are the framebuffer's EGA values reordered 1<->4, 3<->6,
+// 9<->12, 11<->14 so terminal and framebuffer agree on colour.
+const TERM_ANSI=[
+  "#000000","#AA0000","#00AA00","#AA5500","#0000AA","#AA00AA","#00AAAA","#AAAAAA",
+  "#555555","#FF5555","#55FF55","#FFFF55","#5555FF","#FF55FF","#55FFFF","#FFFFFF"
+];
+let termColour=false;   // true when the 'colour' terminal palette is active
+
+// 16-colour path. The engine defaults (fg 0 = default fg, bg 7 = default bg)
+// are the light-on-dark default pair, NOT literal black/white: fg 0 -> light
+// grey, bg 7 -> black (container shows through). Every other index is literal.
+function cellStyleColour(cell){
+  let fg=cell.fg, bg=cell.bg;
+  const defFg = (fg===0);                               // engine default fg, not literal black
+  if(cell.bold && fg<8) fg+=8;                          // bold -> bright fg
+  let inkC   = defFg ? (cell.bold ? "#FFFFFF" : "#D6D6D6") : TERM_ANSI[fg];
+  let paperC = (bg===7) ? "#000000" : TERM_ANSI[bg];    // default bg -> black
+  let ink, paper;
+  if(cell.rev){ ink=paperC; paper=inkC; }               // reverse: swap fg/bg
+  else        { ink=inkC;   paper=paperC; }
+  const bgOut = (paper==="#000000") ? "" : paper;       // black -> let container show
+  const css="color:"+ink+(bgOut?(";background:"+bgOut):"")+";";
+  return { css, key:ink+"|"+bgOut };
+}
+
 // Map an engine cell (fg/bg byte indices + bold/rev) onto the monochrome
 // phosphor scheme. Palette indices collapse to dim / normal / bright shades.
 function cellStyle(cell){
+  if(termColour) return cellStyleColour(cell);
   let ink, paper="", w="";
   if(cell.fg===8) ink="var(--tdim)";                       // ESC[90m dim
   else if(cell.bold || cell.fg>=9){ ink="var(--thi)"; w="font-weight:700;"; }  // bold/bright
   else ink="var(--tfg)";                                   // default / normal
-  if(cell.bg!==7) paper="var(--tdim)";                     // any non-default bg -> faint block
+  // bg 7 = engine default paper, bg 0 = literal black - both are the dark end
+  // of the phosphor ramp. Only bg 1..6 are real coloured blocks.
+  if(cell.bg!==7 && cell.bg!==0) paper="var(--tdim)";
   if(cell.rev){ ink="var(--term-bg)"; paper="var(--tfg)"; }
   const css="color:"+ink+(paper?(";background:"+paper):"")+";"+w;
   return { css, key:ink+"|"+paper+"|"+w };
@@ -609,7 +675,9 @@ $("tab-isa").onclick=()=>selectTab("isa");
       "canvas "+cw+"\u00d7"+ch+" \u00b7 native "+sw+"\u00d7"+sh+"\n"+
       "wrap "+r1(ww)+"\u00d7"+r1(wh)+" \u00b7 fit W"+r3(fx)+"/H"+r3(fy)+"\n"+
       "scale \u00d7"+r3(cssK)+" css / \u00d7"+r3(devK)+" dev \u00b7 "+gfxScaleMode+"\n"+
-      "dpr "+r3(dpr)+" \u2192 dev "+Math.round(cw*dpr)+"\u00d7"+Math.round(ch*dpr)+FOOT);
+      "dpr "+r3(dpr)+" \u2192 dev "+Math.round(cw*dpr)+"\u00d7"+Math.round(ch*dpr)+"\n"+
+      "origin "+r3(gr?gr.left*dpr:0)+"/"+r3(gr?gr.top*dpr:0)+" dev \u00b7 snap "+
+        r3(gfxNudgeX)+"/"+r3(gfxNudgeY)+" css"+FOOT);
   });
 })();
 
@@ -891,10 +959,10 @@ $("ref-find-next").onclick=()=>stepFind(1);
 
 
 const TERM={
-  green:{bg:"#0b1410",fg:"#4ee08a",dim:"#2e9d63",hi:"#79f2a6",glow:"0 0 3px rgba(78,224,138,.4)",flat:false,
+  green:{bg:"#0b1410",fg:"#3cc47c",dim:"#268a56",hi:"#79f2a6",glow:"0 0 3px rgba(60,196,124,.35)",flat:false,
          head:"#1d9e75",hbg:"rgba(29,158,117,.15)",hbd:"rgba(29,158,117,.42)",ctl:"#1d9e75",
          sbThumb:"#9cc7b0",sbHover:"#4ee08a",sbTrack:"rgba(255,255,255,.05)"},
-  amber:{bg:"#160f04",fg:"#ffb000",dim:"#b37b00",hi:"#ffd166",glow:"0 0 3px rgba(255,176,0,.4)",flat:false,
+  amber:{bg:"#160f04",fg:"#d99400",dim:"#966600",hi:"#ffd166",glow:"0 0 3px rgba(217,148,0,.35)",flat:false,
          head:"#b5730a",hbg:"rgba(181,115,10,.16)",hbd:"rgba(181,115,10,.42)",ctl:"#c2740f",
          sbThumb:"#e0c48f",sbHover:"#ffb000",sbTrack:"rgba(255,255,255,.05)"},
   white:{bg:"#000000",fg:"#e6e6e6",dim:"#8a8a8a",hi:"#ffffff",glow:"none",flat:true,
@@ -902,15 +970,24 @@ const TERM={
          sbThumb:"#707070",sbHover:"#a0a0a0",sbTrack:"rgba(255,255,255,.05)"},
   paper:{bg:"#f2f2ea",fg:"#1a1a18",dim:"#6b6b66",hi:"#000000",glow:"none",flat:true,
          head:"#4c83b8",hbg:"rgba(76,131,184,.16)",hbd:"rgba(76,131,184,.42)",ctl:"#2f6fd0",
-         sbThumb:"rgba(20,20,16,.22)",sbHover:"#6b6b66",sbTrack:"transparent"}
+         sbThumb:"rgba(20,20,16,.22)",sbHover:"#6b6b66",sbTrack:"transparent"},
+  colour:{bg:"#000000",fg:"#e6e6e6",dim:"#8a8a8a",hi:"#ffffff",glow:"none",flat:true,
+         head:"#5790c2",hbg:"rgba(87,144,194,.16)",hbd:"rgba(87,144,194,.42)",ctl:"#3b82f6",
+         sbThumb:"#707070",sbHover:"#a0a0a0",sbTrack:"rgba(255,255,255,.05)"}
 };
-function setTermTheme(n){ const t=TERM[n]||TERM.green; const r=document.querySelector(".machine").style;
+function setTermTheme(n){ const t=TERM[n]||TERM.colour; const r=document.querySelector(".machine").style;
+  termColour=(n==="colour"); termDirty=true;
   r.setProperty("--tbg",t.bg); r.setProperty("--tfg",t.fg); r.setProperty("--tdim",t.dim);
   r.setProperty("--thi",t.hi); r.setProperty("--tglow",t.glow);
   r.setProperty("--head",t.head); r.setProperty("--headbg",t.hbg); r.setProperty("--headbord",t.hbd);
   r.setProperty("--sbt-thumb",t.sbThumb); r.setProperty("--sbt-hover",t.sbHover); r.setProperty("--sbt-track",t.sbTrack);
   r.setProperty("--ctl",t.ctl); $("term").classList.toggle("flat",t.flat); }
 $("set-term").onchange=e=>{ setTermTheme(e.target.value); saveIni(); };
+(function(){ const sel=$("set-term");
+  if(sel && !sel.querySelector('option[value="colour"]')){
+    const o=document.createElement("option"); o.value="colour"; o.textContent="Colour (16)"; sel.appendChild(o); }
+  if(sel) sel.value="colour";        // default palette; a saved INI palette= overrides via applyIni
+})();
 
 function setSpeedMode(f){ fast=f;
   $("spd-fast").classList.toggle("on",f); $("spd-mhz").classList.toggle("on",!f);
@@ -999,6 +1076,32 @@ async function loadUploads(){ try{ const d=await activeDir(false); uploads=[];
     uploads.push({name:n,size:fl.size,bytes:new Uint8Array(await fl.arrayBuffer())}); } } }catch(e){ uploads=[]; }
   syncLoadFiles(); }
 
+/* Incremental re-scan of the active folder: pick up files added/changed/removed
+   externally (e.g. a freshly rebuilt kedit dropped in the linked dir) without
+   re-linking or rebooting. Only re-reads bytes for entries whose size/mtime
+   changed, and only re-syncs the host mirror + list when something actually
+   moved, so it's cheap enough to poll. */
+let _refreshing=false;
+async function refreshUploads(){
+  if(_refreshing) return; _refreshing=true;
+  try{
+    const d=await activeDir(false); const seen=new Set(); let changed=false;
+    for await (const [n,h] of d.entries()){
+      if(h.kind!=="file") continue; seen.add(n);
+      const fl=await h.getFile(); const ex=uploads.find(u=>u.name===n);
+      if(ex && ex.size===fl.size && ex._mtime===fl.lastModified) continue;   // unchanged
+      const bytes=new Uint8Array(await fl.arrayBuffer());
+      if(ex){ ex.size=fl.size; ex.bytes=bytes; ex._mtime=fl.lastModified; }
+      else uploads.push({name:n,size:fl.size,bytes,_mtime:fl.lastModified});
+      changed=true;
+    }
+    const before=uploads.length; uploads=uploads.filter(u=>seen.has(u.name));
+    if(uploads.length!==before) changed=true;
+    if(changed){ syncLoadFiles(); renderFiles(); }
+  }catch(e){ /* dir gone / no permission — ignore */ }
+  finally{ _refreshing=false; }
+}
+
 /* persist the linked directory handle across sessions (IndexedDB) */
 function idbHandle(method,key,val){ return new Promise((res,rej)=>{
   const o=indexedDB.open("k16",1);
@@ -1040,7 +1143,7 @@ async function restoreLink(){ try{ const h=await idbHandle("get","uploads"); if(
   }catch(e){} }
 
 function openFiles(){ $("settings-pop").hidden=true; $("b-gear").classList.remove("active"); closeDrives();
-  $("files-pop").hidden=false; $("b-files").classList.add("active"); renderFiles(); updateFolderLabel(); }
+  $("files-pop").hidden=false; $("b-files").classList.add("active"); renderFiles(); updateFolderLabel(); refreshUploads(); }
 function closeFiles(){ $("files-pop").hidden=true; $("b-files").classList.remove("active"); }
 $("b-files").onclick=(e)=>{ e.stopPropagation(); $("files-pop").hidden?openFiles():closeFiles(); };
 $("fx-add").onclick=()=>$("fx-file").click();
@@ -1057,6 +1160,13 @@ $("files-pop").addEventListener("click",e=>e.stopPropagation());
 })();
 document.addEventListener("click",(e)=>{ const p=$("files-pop");
   if(!p.hidden && !p.contains(e.target) && !e.target.closest("#b-files")) closeFiles(); });
+
+/* Keep `load` current: re-scan a linked folder on tab focus and on a light
+   interval, so externally dropped files appear without re-linking/rebooting.
+   Both are no-ops unless a folder is linked (OPFS storage only changes via the
+   UI, which already syncs). */
+window.addEventListener("focus", ()=>{ if(linkedDir) refreshUploads(); });
+setInterval(()=>{ if(linkedDir && document.hasFocus()) refreshUploads(); }, 2000);
 
 /* ---- Drives: ROM/RAM intrinsic; C-F user drives in the OPFS bay ---- */
 /* The host (Core) owns the catalogue + bay bindings (the state k/OS sees).
@@ -1345,7 +1455,7 @@ window.addEventListener("keydown",e=>{
     e.preventDefault(); running?$("b-pause").onclick():$("b-run").onclick(); } });
 
 async function startup(){
-  if(vt) vt.reset(); setTermTheme("green"); layoutScreen(); refreshAll(); renderLog(); alignLegend(); renderStrip();
+  if(vt) vt.reset(); setTermTheme("colour"); layoutScreen(); refreshAll(); renderLog(); alignLegend(); renderStrip();
   await bootPersist();              // restore INI mounts + load OPFS catalogue -> host catalogue
   Core.setTrace(disUpdate);         // gate before-PC history recording to the checkbox
   bindPersistedMounts(mounted);     // bind persisted [mounts] into host bays BEFORE k/OS boots

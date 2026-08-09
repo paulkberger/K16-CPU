@@ -248,10 +248,17 @@
       c.xySet(sp, (c.xyGet(sp) + 2) & ADDR_MASK);
     }
 
-    execPOPD(d) {             // discard one word
+    // $07 mode 3 is PUSHI -- "PUSH #imm16, XYs" (Reference Manual s6.12:
+    // "$07 mode 11 is not a POP -- it is PUSH #imm (PUSHI), since POP has no
+    // immediate form"). It was previously wired to a one-word "discard"
+    // handler, which got the stack direction backwards AND consumed no
+    // immediate, so the immediate word was then executed as an instruction.
+    // Shape deliberately mirrors execPUSH_Single.
+    execPUSHI(d) {            // push imm16
       const c = this.cpu;
       const sp = (d.operand >> 1) & 3;
-      c.xySet(sp, (c.xyGet(sp) + 2) & ADDR_MASK);
+      c.xySet(sp, (c.xyGet(sp) - 2) & ADDR_MASK);
+      this.mem.writeWord(c.xyGet(sp), d.imm16);
     }
 
     // ====================================================================
@@ -685,7 +692,7 @@
       set(0x07, 0, this.execPOP_Single);
       set(0x07, 1, this.execPOP_Group);
       set(0x07, 2, this.execPOP_XY);
-      set(0x07, 3, this.execPOPD);
+      set(0x07, 3, this.execPUSHI);      // PUSH #imm16, XYs -- NOT a pop
 
       // $02 STREAM
       set(0x02, 0, this.execLOADD_Post);

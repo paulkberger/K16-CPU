@@ -11,6 +11,7 @@
 //
 // Boot mirrors frm_main.LoadAndReset order:
 //   1. ROM disk (A:) bytes -> RAM at $FC0000   (read directly by k/OS _BlockReadROM)
+//  1b. system/ramdisk set  -> host memory      (Part 61; served to `load ramdisk/x`)
 //   2. kernel ROM .hex      -> $FE/$FF          (entry forced to $FF0000)
 //   3. reset; caller auto-runs
 // A clean public boot is ROM + RAM only: bays C..F start empty (no media).
@@ -27,7 +28,7 @@
 
   const {
     ADDR_MASK, RESET_VEC, FB_BASE_DEFAULT,
-    KBD_ADDR, TERM_ADDR
+    KBD_ADDR, TERM_ADDR, TERM_SIZE
   } = T;
 
   // ---- Disk MMIO (port of emu_disk.pas constants) -------------------------
@@ -36,6 +37,7 @@
   const DSK_LBA_LO   = 0xDA0006, DSK_LBA_HI = 0xDA0008;
   const DSK_BUF_LO   = 0xDA000A, DSK_BUF_HI = 0xDA000C;
   const DSK_SECCOUNT = 0xDA000E, DSK_RESULT = 0xDA0010, DSK_FLAGS = 0xDA0012;
+  const DSK_SIZE_HI  = 0xDA0014;   // FOPEN file-size high word (Part 26)
   const DSK_HOST_CMD = 0xDA0016;
 
   const CMD_NONE=0, CMD_READ=1, CMD_WRITE=2, CMD_IDENT=3,
@@ -48,7 +50,11 @@
         // Part 25 r6 host-file load surface (port of emu_disk). One file open at
         // a time; `load` reads from the web's uploads/ folder (== FPC LoadFolder).
         HOST_CMD_FOPEN=0x0008, HOST_CMD_FREAD=0x0009, HOST_CMD_FCLOSE=0x000A;
-  const HOST_FILE_MAX = 0x10000;   // 64 KB cap (one k/OS page) — matches FPC
+  // 16 MB — matches k/OS's 24-bit FD_POSITION. This is a sanity bound, not a
+  // transfer limit: FREAD streams to EOF regardless. It was 0x10000 until
+  // Part 26, because the k/OS fd layer wrapped its position silently above
+  // 64 KB and this cap was the only thing turning that into a clean refusal.
+  const HOST_FILE_MAX = 0x1000000;
 
   const RES_OK=0x0000, RES_NO_MEDIA=0x0001, RES_BAD_LBA=0x0002,
         RES_RO=0x0003, RES_IO_ERR=0x0004, RES_BUSY=0x0005, RES_FULL=0x0006,
@@ -58,12 +64,31 @@
   const SECTOR_SIZE = 512, MAX_DRIVES = 4;
   const MAX_NAME_LEN = 15, MIN_DISK_SECTORS = 64, LIST_BUF_BYTES = 256;
 
+  // FOPEN accepts an optional folder prefix, so its wire name is longer than a
+  // bare filename. SEPARATE constant on purpose: MAX_NAME_LEN also clamps
+  // _writeStr, and HOST_CMD_BAYNAME writes that back into a kernel buffer the
+  // ABI only guarantees as 16 bytes — raising MAX_NAME_LEN would overrun it.
+  // The filename AFTER the prefix is still checked against MAX_NAME_LEN.
+  const MAX_LOADPATH_LEN = 63;
+  const RAMDISK_PREFIX   = 'ramdisk/';    // lower-case; match is case-folded
+
   // ---- ROM-disk preload (A:) ----------------------------------------------
   const ROMDISK_BASE = 0xFC0000, ROMDISK_SIZE = 131072;
 
   // Default served paths (Caddy: case-sensitive).
   const SYS_HEX     = 'system/kos_boot.hex';
   const SYS_ROMDISK = 'system/ROMDISK.KOS';
+
+  // Part 61: site-bundled files served to `load ramdisk/<name>`.
+  //
+  // boot.ksh IS the manifest. A:STARTUP.KSH is a frozen three-line bootstrap
+  // that loads and runs it; boot.ksh then names every file in its own
+  // `load ramdisk/<name>` lines. Deriving the fetch set from those lines keeps
+  // one host-side source of truth — adding a file means one new line in
+  // boot.ksh and nothing else. (A separate index would have to be kept in
+  // step with it by hand, and would silently rot when it wasn't.)
+  const SYS_RAMDISK_DIR  = 'system/ramdisk/';
+  const SYS_RAMDISK_BOOT = 'boot.ksh';
 
   // ---- Keyboard ring (port of emu_io_gui FKbdBuf) -------------------------
   const KBD_BUF_SIZE = 16384, KBD_BUF_MASK = KBD_BUF_SIZE - 1;
@@ -124,7 +149,7 @@
       // Disk controller register file (port of emu_disk var block).
       this._dsk = {
         drive: 0, lbaLo: 0, lbaHi: 0, bufLo: 0, bufHi: 0,
-        seccount: 1, result: RES_OK, flags: 0
+        seccount: 1, sizeHi: 0, result: RES_OK, flags: 0
       };
       // Bays: each null (empty) or { name, data:Uint8Array, ro, changed, dirty }.
       this._bays = [null, null, null, null];
@@ -150,6 +175,10 @@
       this._loadFiles = [];
       this._loadOpen  = null;
 
+      // Part 61: second load set, fetched from the site in boot() and reached
+      // via the "ramdisk/" FOPEN prefix. Same element shape as _loadFiles.
+      this._ramdiskFiles = [];
+
       // Framebuffer palettes + offscreen scratch.
       this._palVga     = buildVgaPalette();
       this._palRainbow = buildRainbowPalette();
@@ -162,6 +191,11 @@
       this._m.io = this;
 
       this.BASE = RESET_VEC;
+
+      // Terminal geometry provider (Part 15): webemu sets this to return the
+      // live vt100 size as (cols<<8)|rows for the TERM_SIZE MMIO read. Null
+      // until wired -> readIO falls back to an 80x25 default.
+      this.termGeomProvider = null;
     }
 
     // ======================================================================
@@ -170,6 +204,8 @@
     readIO(addr) {
       if (addr >= DSK_BASE && addr <= DSK_TOP) return this._diskReadIO(addr);
       if (addr === KBD_ADDR) return this._kbdPoll();
+      if (addr === TERM_SIZE)                          // Part 15: live term geometry
+        return this.termGeomProvider ? (this.termGeomProvider() & 0xFFFF) : ((80 << 8) | 25);
       return 0;
     }
 
@@ -247,7 +283,15 @@
         if (u === 'P') return [0x10];                       // Ctrl-P = prev
         if (u >= '1' && u <= '9') return [0x80 + (u.charCodeAt(0) - 0x30)];
         if (u === '0') return [0x8A];
-        return null;   // Ctrl-A/C/V and other Ctrl-combos: leave to the browser
+        // Any other Ctrl-letter -> its control byte (Ctrl-A=1 .. Ctrl-Z=26), so
+        // k/OS programs (e.g. the text editor) can bind Ctrl keys. feedKeyToCore
+        // preventDefaults, suppressing the browser's own Ctrl-S/O/F/... while the
+        // emulator has focus. Ctrl-A and Ctrl-C/X/V (with a selection) are taken
+        // by the terminal's clipboard handler upstream, so they don't reach here.
+        // Browser-reserved combos (Ctrl-W close tab, Ctrl-T new tab, Ctrl-N new
+        // window) can't be suppressed and won't arrive — don't bind commands to them.
+        if (u.length === 1 && u >= 'A' && u <= 'Z') return [u.charCodeAt(0) & 0x1F];
+        return null;   // non-letter Ctrl-combos: leave to the browser
       }
 
       if (!ctrl && !alt && !meta && k.length === 1) {
@@ -274,6 +318,7 @@
         case DSK_BUF_LO:   return d.bufLo;
         case DSK_BUF_HI:   return d.bufHi;
         case DSK_SECCOUNT: return d.seccount;
+        case DSK_SIZE_HI:  return d.sizeHi;
         case DSK_RESULT:   return d.result;
         case DSK_FLAGS:    return d.flags;
         default:           return 0;
@@ -453,23 +498,52 @@
       return this._loadFiles.map(e => ({ name: e.name, size: e.data.length }));
     }
 
-    // FOPEN: case-insensitive basename lookup in the load set. Returns a result
-    // code; on RES_OK, size = file length (<= 64 KB). Mirrors FPC HostFOpen:
+    // Part 61: the site-bundled ramdisk set. Normally filled by boot(); exposed
+    // so a front-end can override or inspect it.
+    ramdiskFilesSet(list) {
+      this._ramdiskFiles = (list || [])
+        .filter(e => e && e.name && e.data)
+        .map(e => ({ name: String(e.name), data: e.data }));
+    }
+    ramdiskFiles() {
+      return this._ramdiskFiles.map(e => ({ name: e.name, size: e.data.length }));
+    }
+
+    // FOPEN: case-insensitive basename lookup in a load set. Returns a result
+    // code; on RES_OK, size = file length (up to HOST_FILE_MAX).
+    //
+    // Part 61 — an optional single "ramdisk/" prefix selects the site-bundled
+    // set instead of the uploads set:
+    //     load zork.com           -> uploads folder
+    //     load ramdisk/zork.com   -> system/ramdisk folder
+    // The prefix is stripped FIRST and what remains is validated exactly as a
+    // bare filename — still no '/', '\', ':' or '..', still capped at
+    // MAX_NAME_LEN. One fixed prefix, no path walking, so traversal stays
+    // impossible without any path-normalisation logic.
+    //
     // RES_BUSY (already open) / RES_BAD_NAME (empty / >15 / path chars) /
-    // RES_NOT_FOUND / RES_FULL (>64 KB).
+    // RES_NOT_FOUND / RES_FULL (> 16 MB).
     hostFOpen(name) {
       if (this._loadOpen) return { res: RES_BUSY, size: 0 };
       name = (name || '').trim();
+
+      let set = this._loadFiles, where = '';
+      if (name.slice(0, RAMDISK_PREFIX.length).toLowerCase() === RAMDISK_PREFIX) {
+        name = name.slice(RAMDISK_PREFIX.length);
+        set  = this._ramdiskFiles;
+        where = RAMDISK_PREFIX;
+      }
+
       if (name === '' || name.length > MAX_NAME_LEN) return { res: RES_BAD_NAME, size: 0 };
       if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 ||
           name.indexOf(':') >= 0 || name.indexOf('..') >= 0)
         return { res: RES_BAD_NAME, size: 0 };
       const key = name.toUpperCase();
-      const e = this._loadFiles.find(f => f.name.toUpperCase() === key);
+      const e = set.find(f => f.name.toUpperCase() === key);
       if (!e) return { res: RES_NOT_FOUND, size: 0 };
       if (e.data.length > HOST_FILE_MAX) return { res: RES_FULL, size: 0 };
       this._loadOpen = { name: e.name, data: e.data, pos: 0 };
-      this._log('[disk] FOPEN ' + e.name + ' (' + e.data.length + ' bytes)');
+      this._log('[disk] FOPEN ' + where + e.name + ' (' + e.data.length + ' bytes)');
       return { res: RES_OK, size: e.data.length };
     }
     // FREAD: copy up to maxBytes from the open cursor into K16 RAM at dest.
@@ -562,12 +636,19 @@
     }
 
     // FOPEN: filename in BUF (verbatim, extension kept — no _normaliseName).
-    // On RES_OK, SECCOUNT = file size in bytes.
+    // On RES_OK, SECCOUNT = size low word and DSK_SIZE_HI = size high word.
+    // Both are written together and only on RES_OK, so a stale high word from
+    // a previous open can never pair with a fresh low one.
     _doHostFOpen() {
       const d = this._dsk;
-      const r = this.hostFOpen(this._readStr(this._curBufAddr(), MAX_NAME_LEN));
+      // MAX_LOADPATH_LEN, not MAX_NAME_LEN: the wire name may carry a folder
+      // prefix, and _readStr truncates silently at its cap.
+      const r = this.hostFOpen(this._readStr(this._curBufAddr(), MAX_LOADPATH_LEN));
       d.result = r.res;
-      if (r.res === RES_OK) d.seccount = r.size & 0xFFFF;
+      if (r.res === RES_OK) {
+        d.seccount = r.size & 0xFFFF;
+        d.sizeHi   = (r.size >>> 16) & 0xFFFF;
+      }
     }
     // FREAD: up to SECCOUNT bytes -> BUF; SECCOUNT updated to bytes read (0=EOF).
     _doHostFRead() {
@@ -632,6 +713,69 @@
       return true;
     }
 
+    // Fetch the site-bundled system/ramdisk set (Part 61).
+    //
+    // boot.ksh is fetched first and doubles as the manifest: every
+    // `load ramdisk/<name>` line in it names a file to prefetch. boot.ksh
+    // itself is in the set too, because A:STARTUP.KSH loads it the same way.
+    //
+    // The set has to be complete before the CPU starts — FOPEN is synchronous
+    // MMIO and cannot await — which is why this is a boot-time prefetch rather
+    // than a lazy fetch on first open.
+    //
+    // Parsing is deliberately loose. Comment lines, `b:`, and anything else in
+    // the script simply don't match and are skipped. A line the regex misses is
+    // not prefetched and its `load` reports ERR_NOTFOUND at run time — the same
+    // failure a genuinely absent file gives, so nothing fails silently wrong.
+    //
+    // Failure is non-fatal and per-file: a missing entry just isn't in the set.
+    // r.ok is checked explicitly because fetch() only rejects on network
+    // failure — an unchecked 404 would hand the server's error page to
+    // arrayBuffer() and stage HTML as file content.
+    async loadRamdiskBundle(bootName, dirUrl) {
+      bootName = bootName || SYS_RAMDISK_BOOT;
+      dirUrl   = dirUrl   || SYS_RAMDISK_DIR;
+
+      const fetchOne = async (nm) => {
+        const rf = await fetch(dirUrl + nm, { cache: 'no-cache' });
+        if (!rf.ok) throw new Error('HTTP ' + rf.status);
+        return new Uint8Array(await rf.arrayBuffer());
+      };
+
+      try {
+        const boot = await fetchOne(bootName);
+        const out = [{ name: bootName, data: boot }];
+        let total = boot.length;
+
+        // Derive the rest from boot.ksh's own load lines. The capture stops at
+        // the first whitespace, so a trailing `-f` parses fine.
+        const text = new TextDecoder('latin1').decode(boot);
+        const seen = new Set([bootName.toUpperCase()]);
+        for (const line of text.split(/\r?\n/)) {
+          const m = /^\s*load\s+ramdisk\/(\S+)/i.exec(line);
+          if (!m) continue;
+          const nm = m[1];
+          if (seen.has(nm.toUpperCase())) continue;   // dedupe repeated lines
+          seen.add(nm.toUpperCase());
+          try {
+            const b = await fetchOne(nm);
+            out.push({ name: nm, data: b });
+            total += b.length;
+          } catch (e) {
+            this._log('[disk] ramdisk/' + nm + ' fetch failed: ' + e.message);
+          }
+        }
+
+        this._ramdiskFiles = out;
+        this._log('[disk] ramdisk bundle: ' + out.length +
+                  (out.length === 1 ? ' file, ' : ' files, ') +
+                  (total / 1024).toFixed(1) + ' KB');
+      } catch (e) {
+        this._ramdiskFiles = [];
+        this._log('[disk] ramdisk bundle unavailable: ' + e.message);
+      }
+    }
+
     // Fetch + stage both system images, then reset. Browser-only (uses fetch).
     // Returns the loadHex info object. Caller decides whether to auto-run.
     async boot(opts) {
@@ -656,6 +800,12 @@
       } catch (e) {
         this._log('[disk] A: fetch failed: ' + e.message);
       }
+
+      // 1b. Site-bundled system/ramdisk set (Part 61). Fetched here, inside
+      //     boot(), so it is staged before reset() and long before kosh's boot
+      //     cascade runs A:STARTUP.KSH — FOPEN is synchronous MMIO and cannot
+      //     await, so the set has to be complete before the CPU starts.
+      await this.loadRamdiskBundle(opts.ramdiskBootName, opts.ramdiskDirUrl);
 
       // 2. Kernel ROM .hex -> $FE/$FF.
       let info = { ok: false, bytes: 0, records: 0, eof: false, minA: 0, maxA: 0 };
@@ -845,11 +995,67 @@
       }
 
       octx.putImageData(img, 0, 0);
-      // Native -> device backing, nearest-neighbour (smoothing off). Aspect is
-      // preserved: the CSS size sizeGfx set is sw*k by sh*k, so devW/devH carry
-      // the same ratio as sw/sh and the blit never stretches.
-      ctx.imageSmoothingEnabled = false;
+      // Native -> device backing. Aspect is preserved: the CSS size sizeGfx set
+      // is sw*k by sh*k, so devW/devH carry the same ratio as sw/sh and the blit
+      // never stretches.
+      this._blitScaled(ctx, off, sw, sh, W, H);
+    }
+
+    // Native -> backing blit, picking the path that keeps source pixels most even.
+    //   whole-number upscale : nearest. Every source pixel becomes an exact
+    //     k x k block -> pixel-perfect. Device scale mode always lands here by
+    //     construction, and integer mode does too at whole-number dpr.
+    //   fractional upscale   : nearest-prescale to the NEXT whole multiple, then
+    //     filter down. A direct nearest blit at (say) 1.5 gives source pixels
+    //     alternating 1 and 2 device px wide -- sharp but visibly uneven, which
+    //     is what small 1bpp text shows as fuzz. Going 1280 -> 2560 nearest ->
+    //     1920 filtered gives every source pixel a uniform 1.5 device px with
+    //     only a thin blend seam. Costs one extra drawImage; the per-pixel decode
+    //     loop above is unchanged.
+    //   downscale            : filtered. Nearest here DROPS whole source rows and
+    //     columns, which is worse than a soft image.
+    _blitScaled(ctx, off, sw, sh, W, H) {
+      const CAP = 8192, EPS = 1e-6;
+      const ratio = W / sw;
+      const whole = ratio >= 1 - EPS && Math.abs(ratio - Math.round(ratio)) < EPS;
+      if (whole) {
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(off, 0, 0, sw, sh, 0, 0, W, H);
+        return 'nearest';
+      }
+      if (ratio > 1) {
+        const k = Math.ceil(ratio - EPS), pw = sw * k, ph = sh * k;
+        if (pw <= CAP && ph <= CAP) {
+          const pre = this._ensurePre(pw, ph);
+          const pctx = pre.getContext('2d');
+          if (pctx) {
+            pctx.imageSmoothingEnabled = false;
+            pctx.drawImage(off, 0, 0, sw, sh, 0, 0, pw, ph);
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(pre, 0, 0, pw, ph, 0, 0, W, H);
+            return 'prescale' + k;
+          }
+        }
+        ctx.imageSmoothingEnabled = false;                  // no prescale surface
+        ctx.drawImage(off, 0, 0, sw, sh, 0, 0, W, H);
+        return 'nearest';
+      }
+      ctx.imageSmoothingEnabled = true;
       ctx.drawImage(off, 0, 0, sw, sh, 0, 0, W, H);
+      return 'filtered';
+    }
+
+    // Prescale surface for the fractional-upscale path. Deliberately NOT sharing
+    // _off's fields: _off holds native res, this holds a whole multiple of it, and
+    // one cache would thrash between the two every frame.
+    _ensurePre(w, h) {
+      if (this._pre && this._preW === w && this._preH === h) return this._pre;
+      const c = (typeof document !== 'undefined' && document.createElement)
+        ? document.createElement('canvas')
+        : { width: w, height: h, getContext() { return null; } };
+      c.width = w; c.height = h;
+      this._pre = c; this._preW = w; this._preH = h;
+      return c;
     }
 
     _ensureOff(w, h) {

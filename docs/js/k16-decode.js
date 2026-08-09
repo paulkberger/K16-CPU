@@ -65,6 +65,7 @@
       case 0x11: return mode === 1 || mode === 3;        // Bcc long / BRA.L
       case 0x12: return mode === 0 || mode === 1;        // JMP24 / JMP16
       case 0x13: return mode === 0 || mode === 1 || mode === 2; // CALL 24/16/R
+      case 0x07: return mode === 3;                      // PUSHI: PUSH #imm16, XYs
       case 0x03: return mode === 2;                      // LEA PC-relative
       case 0x14: case 0x15: return mode === 2;           // LOADD/LOADB [PC+imm16]
       case 0x16: case 0x17: return mode === 1 || mode === 2; // LOADX/LOADY imm16 / [PC+imm16]

@@ -29,6 +29,7 @@
   function VT100(cols, rows, scrollback, maxRows) {
     this.cols = cols || 80;
     this.rows = rows || 25;
+    this.onReply = null;   // host wires this to inject a reply into the key ring (DSR)
     this.scrollback = (scrollback == null) ? SCROLLBACK_LINES : scrollback;
     this.maxRows = Math.max(this.rows, maxRows || 240);  // visible rows may grow up to this
     this._alloc();
@@ -170,11 +171,11 @@
         switch (this._P(0, 0)) {
           case 0:
             this._blankVisRange(this.curY, this.curX, this.cols - 1);
-            for (r = this.curY + 1; r < this.rows; r++) this._blankRingRow(this._ring(r));
+            for (r = this.curY + 1; r < this.rows; r++) this._blankVisRange(r, 0, this.cols - 1);
             break;
           case 1:
             this._blankVisRange(this.curY, 0, this.curX);
-            for (r = 0; r < this.curY; r++) this._blankRingRow(this._ring(r));
+            for (r = 0; r < this.curY; r++) this._blankVisRange(r, 0, this.cols - 1);
             break;
           case 2:  // ESC[2J — clear screen. VT100 keeps scrollback on 2J, but the
             // WebEMU renders the whole document (history + screen) into one
@@ -219,6 +220,14 @@
       case 's': this.savedX = this.curX; this.savedY = this.curY; break;
       case 'u': this.curX = this.savedX; this.curY = this.savedY; break;
       case 'm': this._doSGR(); break;
+      case 'n':
+        // DSR — Device Status Report. Param 6 = report cursor position as
+        // ESC [ <row> ; <col> R (1-based). A program parks the cursor at
+        // ESC[999;999H first (clamped to the grid) then reads this back to
+        // learn the terminal size. Delivered to the key ring via onReply.
+        if (this._P(0, 0) === 6 && this.onReply)
+          this.onReply('\x1b[' + (this.curY + 1) + ';' + (this.curX + 1) + 'R');
+        break;
     }
   };
 

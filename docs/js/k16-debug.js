@@ -126,7 +126,7 @@
       case 0x07:
         if (mode === 1) return 'POP D123, ' + xyN(sp);
         if (mode === 2) return 'POP ' + xyN(dXY) + ', ' + xyN(sp);
-        if (mode === 3) return 'POPD ' + xyN(sp);
+        if (mode === 3) return 'PUSH #$' + h4(imm16) + ', ' + xyN(sp);   // PUSHI
         return 'POP ' + rf4(rd) + ', ' + xyN(sp);
 
       // $08..$0E ALU

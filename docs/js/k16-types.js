@@ -21,6 +21,7 @@
 
     // I/O range $D80000..$DFFFFF
     IO_BASE: 0xD80000, IO_TOP: 0xDFFFFF,
+    TERM_SIZE: 0xDB0000,  // terminal geometry (word read): (cols<<8)|rows - Part 15
     VID_PAGE: 0xDC0000,   // FB base page register (word, zero-extended)
     VID_MODE: 0xDD0000,   // video mode register (word)
     KBD_ADDR: 0xDE0000,   // keyboard input (word read)
