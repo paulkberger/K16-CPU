@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K16 Opcode Decode Grid</title>
+<link rel="stylesheet" href="isa/k16-isa.css">
+<style>
+  /* Base design tokens mirrored from k16-webemu.css so the standalone page
+     matches WebEMU exactly without loading the emulator's full stylesheet.
+     Inside WebEMU these come from its own :root and this block is not used. */
+  :root{
+    --bg:#f3f3ef; --surface:#ffffff;
+    --hair:rgba(20,20,16,0.12); --hair2:rgba(20,20,16,0.22);
+    --ink:#1a1a18; --muted:#6b6b66; --faint:#97978f;
+    --accent:#1d9e75; --accent-d:#0f6e56; --warn:#ba7517;
+    --mono:"SF Mono","JetBrains Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#1c1c1a; --surface:#252522;
+      --hair:rgba(255,255,255,0.12); --hair2:rgba(255,255,255,0.20);
+      --ink:#ececdf; --muted:#a3a39a; --faint:#73736b;
+    }
+  }
+  html,body{height:100%;margin:0;background:var(--bg)}
+  /* a centred frame so the standalone page reads as a document, not full-bleed */
+  .isa-page{max-width:1180px;margin:0 auto;min-height:100%}
+  .isa-page .isa{height:auto;min-height:100%}
+</style>
+</head>
+<body>
+  <div class="isa-page"><div data-isa></div></div>
+
+  <script src="isa/k16-isa-data.js"></script>
+  <script src="isa/k16-isa-detail.js"></script>
+  <script src="isa/k16-isa-grid.js"></script>
+</body>
+</html>

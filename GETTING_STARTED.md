@@ -1,18 +1,56 @@
 # Getting the K16 CPU up and running
 
-You can run the K16 CPU in two ways.
+You can run the K16 CPU in two ways. The easiest is **WebEMU** — it runs in your browser with nothing to install.[^emu]
 
-## Option 1 — Hardware emulation with Digital (H. Neemann)
+## Option 1 — WebEMU (run it in your browser, nothing to install)
+
+WebEMU runs the K16 entirely in your browser — no download, no setup. It boots straight into k/OS with the ROMDISK (Forth + BASIC) and a RAMDISK already loaded.
+
+**Launch it here: https://paulkberger.github.io/K16-CPU/**
+
+Speed depends on the host — expect roughly 50–350 MHz. (The native TTL target is 10–16 MHz, so even in the browser it runs far faster than real hardware.)
+
+The front panel gives you Run, Pause, Step, Reset (CPU back to the reset vector, memory intact) and Boot (cold reload of the system images). The toolbar also has Load (side-load an Intel HEX build, e.g. a fresh k/OS), plus Files and Drives panels and Settings.
+
+Once it boots you'll be at the B: RAMDISK prompt — skip to **Playing with k/OS** below; everything there works the same.
+
+## Option 2 — Hardware emulation with Digital (H. Neemann)
 
 A working simulation of the K16 CPU's electronics (TTL chips, ROMs, RAM, etc.). If you want to check out the actual K16 hardware and watch it run k/OS and friends, this is the way to go — but be aware it is slow. The CPU under Digital has an effective clock speed of about 15 kHz, so booting k/OS takes a minute or two.
 
 The ROMs included contain k/OS, a ROMDISK with Forth and BASIC, and a RAMDISK.
 
-## Option 2 — Software emulation with the K16 Emulator
+---
 
-The K16 Emulator (Emu) emulates the K16 CPU in software and includes a VT100-compatible terminal interface and bit-mapped graphics. It runs far faster than Digital — anything from 1 MHz to around 330 MHz. (The target speed for a TTL build of the K16 is 10–16 MHz.)
+## Playing with k/OS
 
-Emu includes a ROMDISK preloaded with Forth and BASIC, a RAMDISK, and can mount standard FAT16 disks. It also includes a LOAD command for easily transferring K16 `.com` files from the host computer to k/OS.
+Under WebEMU and Digital you should be sitting at the B: drive prompt — this is the built-in RAMDISK. Type the following:
+
+```
+k/OS shell
+kosh v1.01 - type 'help'
+B:/$ a:
+A:/$ ls
+  A:/
+  BASIC25.COM                       10354
+  FORTH30.COM                       5972
+  mandelbrot.com                    312
+  gui128f.com                       53458
+  cube5.com                         1522
+  kosh.com                          19214
+  6  files      88KB used
+  0  dirs       36KB free
+A:/$ run cube5.com &
+[bg 2]
+A:/$ ps
+  TID PTID NAME     ST FG GFX PAGE BLOCKS BYTES  TICKS
+  0   0    idle     R  -  -   $00  0      0      2052
+  1   0    kosh     R  *  -   $02  1      6400   5
+  2   1    cube5    R  -  M2  $03  0      0      380
+A:/$
+```
+
+cube5 is now running in the background. Press **Ctrl+Right Arrow** to switch to it (or **Ctrl+N**, or **Ctrl+1**). You can run multiple copies of kosh, Forth, and BASIC and switch between them.
 
 ---
 
@@ -45,7 +83,33 @@ It is **important** that these files are located in the same directory as **K16 
 
 ---
 
-## Running under the K16 Emulator
+## Running the K16 Assembler
+
+The source for k/OS, K16 Forth, K16 BASIC, and some other K16 assembler code samples are included.
+
+1. Run the assembler.
+2. Click **Open** and select a file (for example, Forth).
+3. Click **Settings** and set:
+   - **Output Directory** — the subdirectory where **K16 CPU.dig** is located, e.g. `C:\K16 CPU\K16 Digital\`.
+   - **k/OS ROM Disk filename** — e.g. `C:\K16 CPU\K16 OS\disks\ROMDISK.KOS`. This is the k/OS ROMDISK image that the assembler bundles in when creating ROMs for Digital.
+   - **Add Lookups** — ticked. This creates and adds the computed LOOKUP opcodes to the ROM images for Digital.
+4. Click **Assemble**. This assembles the file and, if successful, focuses the Listing tab.
+
+The assembler has three output options:
+
+- **Generate ROMs** — creates the binary code, adds the binary image of the additional lookup tables (**LOOKUP_HI_00.bin** and **LOOKUP_LO_00.bin**), adds the ROMDISK image, and creates new ProgramHIGH/LOW ROMs.
+- **Generate Hex File** — creates an Intel HEX file. Load it into WebEMU with the toolbar **Load** button (for example, a fresh k/OS build).
+- **Generate k/OS .COM file** — generates a k/OS `.com` file (for example kosh, forth30, basic25). These executables can then be side-loaded into k/OS via the kosh `LOAD` command.
+
+> **Note:** When assembling k/OS you will need a precompiled **kosh.com**. This is linked in as an `.INCBIN` and allows k/OS to boot automatically into kosh on startup.
+
+> **Note:** The K16 Assembler currently runs only under Windows. A Free Pascal port is planned so it can run under macOS and other platforms. In the meantime you can still open and run the K16 CPU under Digital — and play with Forth, etc. — on macOS.
+
+---
+
+## Legacy: running under the native K16 Emulator
+
+> The native K16 Emulator is being phased out in favour of WebEMU. This section is retained for existing setups.
 
 Edit the **K16EmuIDE.ini** file and update the following entries:
 
@@ -67,56 +131,6 @@ Run **K16Emulator.exe**. You should see the disks loaded as follows:
 [disk] mounted D: DRIVED.KOS  32768 sectors
 ```
 
-Click **Load .HEX** and open **kos_boot.hex**, then click **RUN**.
+Click **Load .HEX** and open **kos_boot.hex**, then click **RUN**. You'll arrive at the same B: RAMDISK prompt described in **Playing with k/OS** above.
 
----
-
-## Playing with k/OS
-
-Under both Digital and Emu you should be sitting at the B: drive prompt — this is the built-in RAMDISK. Type the following:
-
-```
-k/OS shell
-kosh v1.0 - type 'help'
-
-B:$ a:
-A:$ ls
-  A: ROMDISK
-  BASIC25.COM   10354
-  FORTH30.COM   5972
-  2 file(s), 15KB used, 109KB free
-A:$ run forth30.com &
-[bg 2]
-A:$ ps
-  TID PTID NAME     ST FG PAGE BLOCKS BYTES  TICKS
-  0   0    idle     R  -  $00  0      0      1
-  1   0    kosh     R  *  $02  1      6400   778
-  2   1    forth30  R  s  $03  1      6400   72
-A:$
-```
-
-Forth is now running in the background. Press **Ctrl+Right Arrow** to switch to Forth (or **Ctrl+N**, or **Ctrl+1**). You can run multiple copies of kosh, Forth, and BASIC and switch between them.
-
----
-
-## Running the K16 Assembler
-
-The source for k/OS, K16 Forth, K16 BASIC, and some other K16 assembler code samples are included.
-
-1. Run the assembler.
-2. Click **Open** and select a file (for example, Forth).
-3. Click **Settings** and set:
-   - **Output Directory** — the subdirectory where **K16 CPU.dig** is located, e.g. `C:\K16 CPU\K16 Digital\`.
-   - **k/OS ROM Disk filename** — e.g. `C:\K16 CPU\K16 OS\disks\ROMDISK.KOS`. This is the k/OS ROMDISK image that the assembler bundles in when creating ROMs for Digital.
-   - **Add Lookups** — ticked. This creates and adds the computed LOOKUP opcodes to the ROM images for Digital.
-4. Click **Assemble**. This assembles the file and, if successful, focuses the Listing tab.
-
-The assembler has three output options:
-
-- **Generate ROMs** — creates the binary code, adds the binary image of the additional lookup tables (**LOOKUP_HI_00.bin** and **LOOKUP_LO_00.bin**), adds the ROMDISK image, and creates new ProgramHIGH/LOW ROMs.
-- **Generate Hex File** — creates an Intel HEX file to load into the K16 Emulator. k/OS, for example, is saved as a HEX file.
-- **Generate k/OS .COM file** — generates a k/OS `.com` file (for example kosh, forth30, basic25). These executables can then be side-loaded into k/OS via the kosh `LOAD` command (see the Emu uploads directory entry in **K16EmuIDE.ini**).
-
-> **Note:** When assembling k/OS (for either Digital or Emu) you will need a precompiled **kosh.com**. This is linked in as an `.INCBIN` and allows k/OS to boot automatically into kosh on startup.
-
-> **Note:** The K16 Assembler currently runs only under Windows. A Free Pascal port is planned so it can run under macOS and other platforms. In the meantime you can still open and run the K16 CPU under Digital — and play with Forth, etc. — on macOS.
+[^emu]: A native K16 Emulator (Windows, VT100 terminal + bit-mapped graphics) also exists but is being phased out in favour of WebEMU. See **Legacy: running under the native K16 Emulator** at the end of this document.
